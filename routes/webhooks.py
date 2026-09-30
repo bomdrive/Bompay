@@ -76,37 +76,63 @@ async def safehaven_webhook(request: Request):
     data = event.get("data", {})
     eid = data.get("_id") or str(uuid.uuid4())
 
-    # Idempotent store
+    # ── Full payload log — helps debug mismatches ──────────────────────
+    logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} keys={list(data.keys())} "
+                f"acct={data.get('creditAccountNumber')} amt={data.get('amount')} "
+                f"status={data.get('status')!r} responseCode={data.get('responseCode')!r} "
+                f"sessionId={data.get('sessionId')} payRef={data.get('paymentReference')}")
+
+    # Idempotent store — always record every incoming event for audit
     await db.webhooks.update_one({"event_id": eid},
         {"$setOnInsert": {"event_id": eid, "event": event, "event_type": event_type,
                           "received_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
 
     # ── Incoming credit to user virtual account ───────────────────────
-    if event_type in ("account.credit", "virtualAccount.transfer"):
+    # Safe Haven sends eventType="account.credit" OR type="virtualAccount.transfer"
+    credit_events = {"account.credit", "virtualaccount.transfer", "virtualAccount.transfer",
+                     "account_credit", "credit", "wallet.credit"}
+    if event_type.lower() in {e.lower() for e in credit_events}:
         credit_acct_num = data.get("creditAccountNumber")
-        amount = float(data.get("amount", 0))
-        status = data.get("status", "")
-        response_code = data.get("responseCode", "")
+        amount_raw = data.get("amount", 0)
+        try:
+            amount = float(amount_raw)
+        except (TypeError, ValueError):
+            amount = 0.0
+        status = (data.get("status") or "").strip()
+        response_code = (data.get("responseCode") or data.get("responseCode") or "").strip()
         session_id = data.get("sessionId") or data.get("paymentReference") or eid
-        if (status == "Completed" or response_code == "00") and not data.get("isReversed") and amount > 0 and credit_acct_num:
+
+        # Accept "Completed", "completed", "SUCCESS", "success", or responseCode "00"
+        is_success = status.lower() in ("completed", "success", "successful") or response_code == "00"
+
+        logger.info(f"[SH-WEBHOOK] credit branch: acct={credit_acct_num} amt={amount} "
+                    f"is_success={is_success} isReversed={data.get('isReversed')}")
+
+        if is_success and not data.get("isReversed") and amount > 0 and credit_acct_num:
             wallet = await db.wallets.find_one({"sh_account_number": credit_acct_num})
+            logger.info(f"[SH-WEBHOOK] wallet lookup for {credit_acct_num}: found={wallet is not None}")
             if wallet:
                 dup = await db.transactions.find_one({"provider_reference": session_id})
                 if not dup:
                     amt_kobo = int(amount * 100)
                     txn_id = f"TXN{secrets.token_hex(12).upper()}"
-                    debit_name = data.get("debitAccountName", "External Transfer")
+                    # Safe Haven sends either debitAccountName or senderName
+                    debit_name = (data.get("debitAccountName") or data.get("senderName")
+                                  or data.get("debitName") or "External Transfer")
                     narration = data.get("narration") or f"Transfer from {debit_name}"
                     w_before = await get_wallet(wallet["user_id"])
                     bal_before = w_before["available_balance"]
                     await db.transactions.insert_one({
                         "transaction_id": txn_id, "user_id": wallet["user_id"],
                         "type": "WALLET_FUNDING", "direction": "CREDIT", "amount": amt_kobo,
-                        "fee": int(float(data.get("fees", 0)) * 100), "vat": 0, "currency": "NGN",
+                        "fee": int(float(data.get("fees", 0) or data.get("fee", 0)) * 100),
+                        "vat": 0, "currency": "NGN",
                         "status": "COMPLETED", "provider": "SAFEHAVEN",
                         "description": narration,
                         "provider_reference": session_id,
-                        "metadata": {"event_type": event_type, "debit_account": data.get("debitAccountNumber"), "debit_name": debit_name},
+                        "metadata": {"event_type": event_type,
+                                     "debit_account": data.get("debitAccountNumber"),
+                                     "debit_name": debit_name},
                         "balance_before_kobo": bal_before,
                         "balance_after_kobo": bal_before + amt_kobo,
                         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -131,14 +157,26 @@ async def safehaven_webhook(request: Request):
                         "amount": amount, "sender": debit_name, "balance": w["available_balance"] / 100
                     }))
                     asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
+                    logger.info(f"[SH-WEBHOOK] ✅ credited ₦{amount} to user {wallet['user_id']} txn={txn_id}")
+                else:
+                    logger.info(f"[SH-WEBHOOK] duplicate skipped session_id={session_id}")
+            else:
+                logger.warning(f"[SH-WEBHOOK] ⚠️ no wallet found for creditAccountNumber={credit_acct_num!r}")
+        else:
+            logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
+                        f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
 
-    # ── Transfer reversal (Safe Haven reversed an outgoing transfer) ──
-    elif event_type in ("transfer.reversal", "transfer.reversed", "debit.reversal", "account.debit.reversal"):
+    # ── Transfer reversal ─────────────────────────────────────────────
+    elif event_type.lower() in ("transfer.reversal", "transfer.reversed", "debit.reversal",
+                                "account.debit.reversal"):
         await _handle_sh_transfer_reversal(data, eid)
 
-    # ── Transfer failed (async failure after initial accept) ─────────
-    elif event_type in ("transfer.failed", "transfer.declined"):
+    # ── Transfer failed ───────────────────────────────────────────────
+    elif event_type.lower() in ("transfer.failed", "transfer.declined"):
         await _handle_sh_transfer_failure(data, eid)
+
+    else:
+        logger.warning(f"[SH-WEBHOOK] unhandled eventType={event_type!r} — full event: {json.dumps(event)[:500]}")
 
     return {"received": True}
 
