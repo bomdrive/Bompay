@@ -245,8 +245,12 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
         "account_number": acct_num,
     }})
     # Update user's legal name from Safe Haven KYC (BVN/NIN verified name)
+    # Safe Haven prefixes names with the institution e.g. "Bompay / Eliom Uwam" — strip prefix
     if acct_name:
-        parts = acct_name.strip().split()
+        clean_name = acct_name.strip()
+        if " / " in clean_name:
+            clean_name = clean_name.split(" / ", 1)[1].strip()
+        parts = clean_name.split()
         if len(parts) >= 2:
             kyc_first = parts[0].capitalize()
             kyc_last = " ".join(parts[1:]).capitalize()
