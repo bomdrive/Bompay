@@ -10,6 +10,7 @@ import httpx
 import requests as _requests
 from fastapi import APIRouter, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 import csv, io
 from fpdf import FPDF
 
@@ -64,6 +65,84 @@ import ledger as pg_ledger
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+# ─── Guest (unauthenticated) chat endpoints ─────────────────────────────────
+
+class GuestChatStartReq(BaseModel):
+    name: str
+    phone: str
+    message: str
+
+class GuestChatMessageReq(BaseModel):
+    message: str
+
+@router.post("/support/guest-chat/start")
+async def guest_chat_start(req: GuestChatStartReq):
+    """Create a support ticket from an unauthenticated guest visitor."""
+    if not req.name.strip() or not req.phone.strip() or not req.message.strip():
+        raise HTTPException(400, "name, phone, and message are required")
+    ticket_id = f"TICKET-{uuid.uuid4().hex[:10].upper()}"
+    session_token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.support_tickets.insert_one({
+        "ticket_id":     ticket_id,
+        "user_id":       None,
+        "user_type":     "GUEST",
+        "guest_name":    req.name.strip(),
+        "guest_phone":   req.phone.strip(),
+        "subject":       f"Guest enquiry from {req.name.strip()}",
+        "status":        "OPEN",
+        "session_token": session_token,
+        "unread_admin":  1,
+        "unread_user":   0,
+        "created_at":    now,
+        "updated_at":    now,
+    })
+    await db.support_messages.insert_one({
+        "ticket_id":   ticket_id,
+        "sender":      "USER",
+        "sender_name": req.name.strip(),
+        "message":     req.message.strip(),
+        "created_at":  now,
+    })
+    return {"ticket_id": ticket_id, "session_token": session_token}
+
+
+@router.get("/support/guest-chat/{ticket_id}")
+async def guest_chat_get(ticket_id: str, token: str):
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id, "user_type": "GUEST"})
+    if not ticket or ticket.get("session_token") != token:
+        raise HTTPException(403, "Invalid session")
+    msgs = await db.support_messages.find(
+        {"ticket_id": ticket_id}, {"_id": 0}
+    ).sort("created_at", 1).to_list(100)
+    # Mark admin messages as read
+    await db.support_tickets.update_one({"ticket_id": ticket_id}, {"$set": {"unread_user": 0}})
+    return {"messages": msgs, "status": ticket.get("status"), "guest_name": ticket.get("guest_name")}
+
+
+@router.post("/support/guest-chat/{ticket_id}/message")
+async def guest_chat_send(ticket_id: str, req: GuestChatMessageReq, token: str):
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id, "user_type": "GUEST"})
+    if not ticket or ticket.get("session_token") != token:
+        raise HTTPException(403, "Invalid session")
+    if ticket.get("status") == "CLOSED":
+        raise HTTPException(400, "This conversation is closed")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.support_messages.insert_one({
+        "ticket_id":   ticket_id,
+        "sender":      "USER",
+        "sender_name": ticket.get("guest_name", "Guest"),
+        "message":     req.message.strip(),
+        "created_at":  now,
+    })
+    await db.support_tickets.update_one(
+        {"ticket_id": ticket_id},
+        {"$set": {"updated_at": now}, "$inc": {"unread_admin": 1}}
+    )
+    return {"ok": True}
+
 
 @router.post("/support/send")
 async def send_support_message(req: SupportMessageReq, request: Request):
@@ -134,7 +213,15 @@ async def admin_get_tickets(request: Request, page: int = 1, limit: int = 20, st
     if status_filter:
         query["status"] = status_filter
     skip = (page - 1) * limit
-    tickets = await db.support_tickets.find(query, {"_id": 0}).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
+    tickets_raw = await db.support_tickets.find(query, {"_id": 0, "session_token": 0}).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
+    # Surface guest tickets with a clear label
+    tickets = []
+    for t in tickets_raw:
+        if t.get("user_type") == "GUEST":
+            t["display_name"] = f"Guest — {t.get('guest_name', 'Unknown')} ({t.get('guest_phone', '')})"
+        else:
+            t.setdefault("display_name", t.get("user_name", "User"))
+        tickets.append(t)
     total = await db.support_tickets.count_documents(query)
     return {"tickets": tickets, "total": total,
             "open_count": await db.support_tickets.count_documents({"status": "OPEN"})}
@@ -159,12 +246,14 @@ async def admin_reply_ticket(ticket_id: str, req: AdminReplyReq, request: Reques
     msg_id = str(uuid.uuid4())
     await db.support_messages.insert_one({
         "message_id": msg_id, "ticket_id": ticket_id, "user_id": ticket["user_id"],
-        "sender": "admin", "text": req.message.strip(),
+        "sender": "ADMIN", "message": req.message.strip(), "text": req.message.strip(),
+        "sender_name": "Bompay Support",
         "read": False, "created_at": datetime.now(timezone.utc).isoformat()
     })
     await db.support_tickets.update_one({"ticket_id": ticket_id},
         {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$inc": {"unread_user": 1}})
-    await notify(ticket["user_id"], "Support Reply", "You have a new reply from Bompay support.", "info")
+    if ticket.get("user_id"):
+        await notify(ticket["user_id"], "Support Reply", "You have a new reply from Bompay support.", "info")
     return {"message_id": msg_id}
 
 @router.patch("/admin/support/{ticket_id}/close")
