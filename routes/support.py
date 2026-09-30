@@ -1,0 +1,287 @@
+"""Bompay — Support routes."""
+import os, uuid, secrets, logging, time, json, asyncio, hashlib, re
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List
+from pathlib import Path
+from bson import ObjectId
+import bcrypt
+import jwt as pyjwt
+import httpx
+import requests as _requests
+from fastapi import APIRouter, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form
+from fastapi.responses import JSONResponse, StreamingResponse
+import csv, io
+from fpdf import FPDF
+
+from database import db
+from core import (  # noqa: F401,F403,F405
+    # auth
+    hash_password, verify_password, hash_pin, verify_pin_hash,
+    create_access_token, create_refresh_token, get_current_user, get_admin_user,
+    set_auth_cookies, log_login_session,
+    # wallet / ledger
+    gen_account_number, get_wallet, ledger_entry,
+    # notifications
+    notify, audit, send_event_sms, send_event_email, send_event_notification, send_email,
+    send_push_notification,
+    # fraud
+    fraud_check, fraud_check_user, auto_block_user,
+    # providers
+    call_sh, mock_sh, call_cdh, call_pg,
+    get_vas_provider, get_service_provider, get_sms_config,
+    get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
+    # private helpers (explicitly imported)
+    _cloudinary_upload, _cloudinary_delete, _email_html,
+    _send_tier_approval_email, _send_tier_revoke_email,
+    _send_via_sendora, _send_via_bulksms,
+    _get_client_ip, _parse_ua,
+)
+from core import (  # noqa: F401,F403,F405
+    # constants
+    JWT_SECRET, JWT_ALGORITHM, ADMIN_EMAIL, ADMIN_PASSWORD,
+    FRONTEND_URL, WEBHOOK_CRON_SECRET, SAFEHAVEN_BASE_URL, SAFEHAVEN_OWN_BANK_CODE,
+    CDH_BASE_URL, PAIRGATE_BASE_URL,
+    PG_DISCO_SLUGS, PG_BET_SLUGS,
+    CDH_AIRTIME_NETWORK_IDS, CDH_ELECTRICITY_DISCO_IDS, CDH_DATA_PLANS, CDH_CABLE_PLANS,
+    NIGERIAN_BANKS, MOCK_NAMES, CHARGE_CATEGORIES,
+    WEBAUTHN_RP_ID, WEBAUTHN_ORIGIN, WEBAUTHN_RP_NAME,
+    APP_NAME, EMERGENT_LLM_KEY,
+    # webauthn
+    generate_registration_options, verify_registration_response,
+    generate_authentication_options, verify_authentication_response,
+    base64url_to_bytes, options_to_json,
+    AuthenticatorSelectionCriteria, UserVerificationRequirement,
+    ResidentKeyRequirement, AttestationConveyancePreference,
+    AuthenticatorAttachment, PublicKeyCredentialDescriptor,
+    AuthenticatorAttestationResponse, RegistrationCredential,
+    AuthenticatorAssertionResponse, AuthenticationCredential,
+    cloudinary,
+)
+from core import (  # noqa: F401
+    SupportMessageReq, AdminReplyReq, get_savings_config,
+)
+import ledger as pg_ledger
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+@router.post("/support/send")
+async def send_support_message(req: SupportMessageReq, request: Request):
+    user = await get_current_user(request)
+    if not req.message.strip():
+        raise HTTPException(400, "Message cannot be empty")
+    ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN"})
+    if not ticket:
+        ticket_id = str(uuid.uuid4())
+        await db.support_tickets.insert_one({
+            "ticket_id": ticket_id, "user_id": user["_id"],
+            "user_name": f"{user.get('first_name','')} {user.get('last_name','')}".strip(),
+            "user_email": user.get("email", ""), "status": "OPEN",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "unread_admin": 1, "unread_user": 0
+        })
+    else:
+        ticket_id = ticket["ticket_id"]
+        await db.support_tickets.update_one({"ticket_id": ticket_id},
+            {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$inc": {"unread_admin": 1}})
+    msg_id = str(uuid.uuid4())
+    await db.support_messages.insert_one({
+        "message_id": msg_id, "ticket_id": ticket_id, "user_id": user["_id"],
+        "sender": "user", "text": req.message.strip(),
+        "read": False, "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"message_id": msg_id, "ticket_id": ticket_id}
+
+@router.get("/support/messages")
+async def get_support_messages(request: Request):
+    user = await get_current_user(request)
+    ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN"})
+    if not ticket:
+        return {"ticket_id": None, "status": "no_ticket", "messages": [], "unread": 0}
+    msgs = await db.support_messages.find({"ticket_id": ticket["ticket_id"]}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    await db.support_messages.update_many(
+        {"ticket_id": ticket["ticket_id"], "sender": "admin", "read": False}, {"$set": {"read": True}})
+    await db.support_tickets.update_one({"ticket_id": ticket["ticket_id"]}, {"$set": {"unread_user": 0}})
+    return {"ticket_id": ticket["ticket_id"], "status": ticket["status"], "messages": msgs, "unread": 0}
+
+
+# ===== BLOG API =====
+
+@router.get("/support/tickets/{ticket_id}/messages")
+async def get_support_ticket_messages(ticket_id: str, request: Request):
+    """Return messages for a specific ticket belonging to the current user."""
+    user = await get_current_user(request)
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id, "user_id": user["_id"]})
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    msgs = await db.support_messages.find({"ticket_id": ticket_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return {"messages": msgs, "status": ticket.get("status"), "created_at": ticket.get("created_at")}
+
+
+async def get_support_unread(request: Request):
+    user = await get_current_user(request)
+    ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN"})
+    if not ticket:
+        return {"unread": 0}
+    count = await db.support_messages.count_documents({"ticket_id": ticket["ticket_id"], "sender": "admin", "read": False})
+    return {"unread": count}
+
+@router.get("/admin/support")
+async def admin_get_tickets(request: Request, page: int = 1, limit: int = 20, status_filter: str = None):
+    await get_admin_user(request)
+    query = {}
+    if status_filter:
+        query["status"] = status_filter
+    skip = (page - 1) * limit
+    tickets = await db.support_tickets.find(query, {"_id": 0}).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.support_tickets.count_documents(query)
+    return {"tickets": tickets, "total": total,
+            "open_count": await db.support_tickets.count_documents({"status": "OPEN"})}
+
+@router.get("/admin/support/{ticket_id}/messages")
+async def admin_get_ticket_messages(ticket_id: str, request: Request):
+    await get_admin_user(request)
+    msgs = await db.support_messages.find({"ticket_id": ticket_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    await db.support_messages.update_many(
+        {"ticket_id": ticket_id, "sender": "user", "read": False}, {"$set": {"read": True}})
+    await db.support_tickets.update_one({"ticket_id": ticket_id}, {"$set": {"unread_admin": 0}})
+    return {"messages": msgs}
+
+@router.post("/admin/support/{ticket_id}/reply")
+async def admin_reply_ticket(ticket_id: str, req: AdminReplyReq, request: Request):
+    await get_admin_user(request)
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id})
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    if not req.message.strip():
+        raise HTTPException(400, "Reply cannot be empty")
+    msg_id = str(uuid.uuid4())
+    await db.support_messages.insert_one({
+        "message_id": msg_id, "ticket_id": ticket_id, "user_id": ticket["user_id"],
+        "sender": "admin", "text": req.message.strip(),
+        "read": False, "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.support_tickets.update_one({"ticket_id": ticket_id},
+        {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$inc": {"unread_user": 1}})
+    await notify(ticket["user_id"], "Support Reply", "You have a new reply from Bompay support.", "info")
+    return {"message_id": msg_id}
+
+@router.patch("/admin/support/{ticket_id}/close")
+async def admin_close_ticket(ticket_id: str, request: Request):
+    await get_admin_user(request)
+    await db.support_tickets.update_one({"ticket_id": ticket_id},
+        {"$set": {"status": "RESOLVED", "resolved_at": datetime.now(timezone.utc).isoformat()}})
+    return {"status": "RESOLVED"}
+
+# ===== CRON ENDPOINTS =====
+def _verify_cron(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = auth[7:]
+    if not WEBHOOK_CRON_SECRET or not secrets.compare_digest(token.encode(), WEBHOOK_CRON_SECRET.encode()):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+async def _run_auto_save(run_id: str):
+    now = datetime.now(timezone.utc)
+    goals = await db.savings_goals.find({"auto_save": True, "auto_save_amount": {"$gt": 0}, "status": "ACTIVE"}).to_list(2000)
+    cfg = await get_savings_config()
+    for goal in goals:
+        freq = goal.get("auto_save_frequency", "WEEKLY")
+        last_auto = goal.get("last_auto_save")
+        if last_auto:
+            try:
+                last_dt = datetime.fromisoformat(last_auto)
+                days = (now - last_dt).days
+                if (freq == "WEEKLY" and days < 7) or (freq == "MONTHLY" and days < 28):
+                    continue
+            except (ValueError, TypeError):
+                pass
+        amt = goal.get("auto_save_amount", 0)
+        user_id = goal["user_id"]
+        idem = f"autosave-{goal['goal_id']}-{run_id}"
+        if await db.transactions.find_one({"idempotency_key": idem}):
+            continue
+        # ─── Atomic debit ───
+        updated_w = await db.wallets.find_one_and_update(
+            {"user_id": user_id, "available_balance": {"$gte": amt}},
+            {"$inc": {"available_balance": -amt, "ledger_balance": -amt}},
+            return_document=True
+        )
+        if not updated_w:
+            # ─── Defaulter fee ───
+            fee_type = cfg.get("defaulter_fee_type", "FLAT")
+            fee_amt = int(cfg.get("defaulter_fee_amount", 200.0) * 100) if fee_type == "FLAT" \
+                else int(amt * cfg.get("defaulter_fee_percentage", 2.0) / 100)
+            if fee_amt > 0:
+                fee_deducted = await db.wallets.find_one_and_update(
+                    {"user_id": user_id, "available_balance": {"$gte": fee_amt}},
+                    {"$inc": {"available_balance": -fee_amt, "ledger_balance": -fee_amt}},
+                    return_document=True
+                )
+                if fee_deducted:
+                    fee_txn_id = f"TXN{secrets.token_hex(12).upper()}"
+                    await db.transactions.insert_one({
+                        "transaction_id": fee_txn_id, "idempotency_key": f"fee-{idem}",
+                        "user_id": user_id, "type": "SAVINGS_DEFAULTER_FEE", "direction": "DEBIT",
+                        "amount": fee_amt, "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
+                        "provider": "INTERNAL", "description": f"Missed auto-save defaulter fee: {goal['name']}",
+                        "metadata": {"goal_id": goal["goal_id"]},
+                        "created_at": now.isoformat(), "updated_at": now.isoformat()
+                    })
+            await notify(user_id, "Auto-Save Missed", f"Insufficient balance for '{goal['name']}'. Defaulter fee applied.", "warning")
+            continue
+        txn_id = f"TXN{secrets.token_hex(12).upper()}"
+        await db.transactions.insert_one({
+            "transaction_id": txn_id, "idempotency_key": idem, "user_id": user_id,
+            "type": "SAVINGS_CONTRIBUTION", "direction": "DEBIT", "amount": amt,
+            "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
+            "description": f"Auto-save: {goal['name']}", "metadata": {"goal_id": goal["goal_id"], "auto": True},
+            "created_at": now.isoformat(), "updated_at": now.isoformat()
+        })
+        await db.savings_goals.update_one({"goal_id": goal["goal_id"]},
+            {"$inc": {"current_amount": amt}, "$set": {"last_auto_save": now.isoformat()}})
+        # SH sweep
+        try:
+            savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+            sh_dest = (savings_acct or {}).get("sh_account_number", "")
+            wallet_doc = await db.wallets.find_one({"user_id": user_id})
+            user_sh = (wallet_doc or {}).get("sh_account_number", "")
+            if sh_dest and user_sh:
+                await call_sh("POST", "/transfers", body={
+                    "debitAccountNumber": user_sh, "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                    "beneficiaryAccountNumber": sh_dest, "amount": amt / 100,
+                    "saveBeneficiary": False, "narration": f"BOMPAY auto-save {goal['name'][:20]}",
+                    "paymentReference": txn_id
+                })
+        except Exception as e:
+            logger.warning(f"[AutoSave] SH sweep failed: {e}")
+        await notify(user_id, "Auto-Save Complete", f"₦{amt/100:,.2f} auto-saved to '{goal['name']}'.", "success")
+
+async def _run_loan_reminders(run_id: str):
+    now = datetime.now(timezone.utc)
+    loans = await db.loan_applications.find({"status": "DISBURSED", "due_date": {"$exists": True}}).to_list(2000)
+    for loan in loans:
+        due = loan.get("due_date")
+        if not due:
+            continue
+        try:
+            due_dt = datetime.fromisoformat(due)
+            days_left = (due_dt - now).days
+            if 0 <= days_left <= 3:
+                idem = f"loanrem-{loan['loan_id']}-{due[:10]}"
+                if await db.notifications.find_one({"metadata.idempotency_key": idem}):
+                    continue
+                day_word = "today" if days_left == 0 else (f"in {days_left} day{'s' if days_left > 1 else ''}")
+                await db.notifications.insert_one({
+                    "notification_id": str(uuid.uuid4()), "user_id": loan["user_id"],
+                    "title": "Loan Payment Due Soon",
+                    "message": f"Your repayment of ₦{loan.get('monthly_payment',0):,.2f} is due {day_word}.",
+                    "type": "warning", "read": False,
+                    "metadata": {"idempotency_key": idem, "loan_id": loan["loan_id"]},
+                    "created_at": now.isoformat()
+                })
+        except (ValueError, TypeError):
+            continue
+
