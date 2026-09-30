@@ -246,7 +246,7 @@ async def refresh(request: Request, response: Response):
             raise HTTPException(401, "User not found")
         uid = str(user["_id"])
         response.set_cookie("access_token", create_access_token(uid, user["email"]),
-                           httponly=True, secure=True, samesite="none", max_age=3600, path="/")
+                           httponly=True, secure=True, samesite="none", max_age=43200, path="/")
         return {"message": "Token refreshed"}
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(401, "Refresh token expired. Please login again.")

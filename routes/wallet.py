@@ -211,8 +211,9 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
     if not req.otp.strip() or not re.match(r"^\d{4,6}$", req.otp.strip()):
         raise HTTPException(400, "OTP must be 4-6 digits")
     # Build callback URL for Safe Haven webhooks
-    backend_url = os.environ.get("API_BASE_URL", os.environ.get("REACT_APP_BACKEND_URL", ""))
-    callback_url = f"{backend_url}/api/webhooks/safehaven"
+    # Prefer explicit WEBHOOK_BASE_URL (set in Railway/production), then API_BASE_URL
+    _base = (os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("API_BASE_URL") or "").rstrip("/")
+    callback_url = f"{_base}/api/webhooks/safehaven"
     phone = user.get("phone", "")
     if phone and not phone.startswith("+"):
         phone = f"+{phone}"
@@ -252,6 +253,10 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
             await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
                 "first_name": kyc_first, "last_name": kyc_last, "kyc_verified_name": acct_name
             }})
+    # Set KYC Tier 1 verified after virtual account creation
+    await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
+        "kyc_tier": 1, "kyc_status": "VERIFIED"
+    }})
     # Clear KYC temp fields
     await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$unset": {
         "kyc_identity_id": "", "kyc_identity_type": "", "kyc_identity_number": ""

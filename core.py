@@ -226,7 +226,7 @@ def verify_pin_hash(pin: str, encoded_hash: str) -> bool:
 
 def create_access_token(uid: str, email: str) -> str:
     return pyjwt.encode(
-        {"sub": uid, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=1), "type": "access"},
+        {"sub": uid, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=12), "type": "access"},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
@@ -267,7 +267,7 @@ async def get_admin_user(request: Request) -> dict:
 
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
     opts = dict(httponly=True, secure=True, samesite="none", path="/")
-    response.set_cookie("access_token", access_token, max_age=3600, **opts)
+    response.set_cookie("access_token", access_token, max_age=43200, **opts)
     response.set_cookie("refresh_token", refresh_token, max_age=604800, **opts)
 
 # ===== WALLET / LEDGER UTILS =====
@@ -613,9 +613,9 @@ async def mock_sh(path: str, body: dict = None) -> dict:
 
 async def call_sh(method: str, path: str, body: dict = None) -> dict:
     settings = await db.provider_settings.find_one({"provider": "safehaven"})
-    cid = (settings or {}).get("client_id", "")
-    csec = (settings or {}).get("client_secret", "")   # RSA private key PEM
-    issuer = (settings or {}).get("issuer", cid)       # Company URL for JWT iss claim
+    cid  = (settings or {}).get("client_id",     "") or os.environ.get("SAFEHAVEN_CLIENT_ID",     "")
+    csec = (settings or {}).get("client_secret", "") or os.environ.get("SAFEHAVEN_CLIENT_SECRET", "")
+    issuer = (settings or {}).get("issuer", cid)
     base = (settings or {}).get("base_url", SAFEHAVEN_BASE_URL)
 
     # No credentials configured — use simulated responses
@@ -627,6 +627,12 @@ async def call_sh(method: str, path: str, body: dict = None) -> dict:
             # Build RS256-signed JWT client assertion from private key PEM
             now = int(time.time())
             private_key = csec.strip().replace('\r\n', '\n').replace('\r', '\n')
+            # Wrap bare base64 key in PEM headers if not already present
+            if not private_key.startswith("-----"):
+                # Try PKCS#8 first (MIICdw... / MIIEv...), then PKCS#1
+                header = "-----BEGIN PRIVATE KEY-----"
+                footer = "-----END PRIVATE KEY-----"
+                private_key = f"{header}\n{private_key}\n{footer}"
             try:
                 client_assertion = pyjwt.encode(
                     {"iss": issuer, "sub": cid, "aud": base, "iat": now, "exp": now + 300},
