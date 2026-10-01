@@ -30,6 +30,8 @@ from core import (  # noqa: F401,F403,F405
     call_sh, mock_sh, call_cdh, call_pg,
     get_vas_provider, get_service_provider, get_sms_config,
     get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
+    # fee helpers
+    calculate_nip_inward_commission,
     # private helpers (explicitly imported)
     _cloudinary_upload, _cloudinary_delete, _email_html,
     _send_tier_approval_email, _send_tier_revoke_email,
@@ -69,6 +71,31 @@ import ledger as pg_ledger
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+
+async def _track_nip_inward_cost(txn_id: str, user_id: str, amount_ngn: float):
+    """Track NIP Inward Commission cost absorbed by Bompay for nightly auto-balance."""
+    try:
+        cost_ngn = await calculate_nip_inward_commission(amount_ngn)
+        if cost_ngn <= 0:
+            return
+        await db.nip_inward_costs.insert_one({
+            "txn_id": txn_id,
+            "user_id": user_id,
+            "amount_ngn": amount_ngn,
+            "cost_ngn": cost_ngn,
+            "cost_kobo": int(cost_ngn * 100),
+            "status": "PENDING_BALANCE",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        # Flag on the transaction record for user visibility
+        await db.transactions.update_one(
+            {"transaction_id": txn_id},
+            {"$set": {"metadata.nip_inward_cost_kobo": int(cost_ngn * 100)}}
+        )
+        logger.info(f"[NIPInward] tracked ₦{cost_ngn:.2f} cost for txn={txn_id}")
+    except Exception as e:
+        logger.error(f"[NIPInward] failed to track cost for {txn_id}: {e}")
+
 @router.post("/webhooks/safehaven")
 async def safehaven_webhook(request: Request):
     event = await request.json()
@@ -76,16 +103,28 @@ async def safehaven_webhook(request: Request):
     data = event.get("data", {})
     eid = data.get("_id") or str(uuid.uuid4())
 
-    # ── Full payload log — helps debug mismatches ──────────────────────
-    logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} keys={list(data.keys())} "
+    # ── Full payload log ──────────────────────────────────────────────
+    logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} "
                 f"acct={data.get('creditAccountNumber')} amt={data.get('amount')} "
-                f"status={data.get('status')!r} responseCode={data.get('responseCode')!r} "
-                f"sessionId={data.get('sessionId')} payRef={data.get('paymentReference')}")
+                f"status={data.get('status')!r} sessionId={data.get('sessionId')}")
 
-    # Idempotent store — always record every incoming event for audit
+    # ── Idempotent store ──────────────────────────────────────────────
     await db.webhooks.update_one({"event_id": eid},
         {"$setOnInsert": {"event_id": eid, "event": event, "event_type": event_type,
                           "received_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+
+    # ── Forward to production server (Safe Haven callbackUrl still points here) ──
+    prod_url = os.environ.get("WEBHOOK_FORWARD_URL", "")
+    if prod_url:
+        try:
+            async with httpx.AsyncClient(timeout=8) as fwd:
+                fwd_r = await fwd.post(f"{prod_url}/api/webhooks/safehaven",
+                                       json=event,
+                                       headers={"Content-Type": "application/json",
+                                                "X-Forwarded-From": "bompay-preview"})
+                logger.info(f"[SH-WEBHOOK] Forwarded to {prod_url} → {fwd_r.status_code}")
+        except Exception as fe:
+            logger.warning(f"[SH-WEBHOOK] Forward failed: {fe}")
 
     # ── Incoming credit to user virtual account ───────────────────────
     # Safe Haven sends eventType="account.credit" OR type="virtualAccount.transfer"
@@ -157,6 +196,8 @@ async def safehaven_webhook(request: Request):
                         "amount": amount, "sender": debit_name, "balance": w["available_balance"] / 100
                     }))
                     asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
+                    # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
+                    asyncio.create_task(_track_nip_inward_cost(txn_id, wallet["user_id"], amount))
                     logger.info(f"[SH-WEBHOOK] ✅ credited ₦{amount} to user {wallet['user_id']} txn={txn_id}")
                 else:
                     logger.info(f"[SH-WEBHOOK] duplicate skipped session_id={session_id}")

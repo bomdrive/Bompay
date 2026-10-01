@@ -44,6 +44,7 @@ from core import (  # noqa: F401,F403,F405
     PG_DISCO_SLUGS, PG_BET_SLUGS,
     CDH_AIRTIME_NETWORK_IDS, CDH_ELECTRICITY_DISCO_IDS, CDH_DATA_PLANS, CDH_CABLE_PLANS,
     NIGERIAN_BANKS, MOCK_NAMES, CHARGE_CATEGORIES,
+    get_service_bucket_account,
     WEBAUTHN_RP_ID, WEBAUTHN_ORIGIN, WEBAUTHN_RP_NAME,
     APP_NAME, EMERGENT_LLM_KEY,
     # webauthn
@@ -182,23 +183,24 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     })
-    # Try to sweep to LOAN_REPAYMENTS charge account (best-effort, non-fatal)
+    # Try to sweep to LOANS service bucket → falls back to LOAN_REPAYMENTS charge account (best-effort)
     try:
-        repay_acct = await db.charge_accounts.find_one({"category": "LOAN_REPAYMENTS"})
-        sh_charge_acct = (repay_acct or {}).get("sh_account_number", "")
+        sh_repay_dest = await get_service_bucket_account("LOANS", "LOAN_REPAYMENTS")
         sender_w = await db.wallets.find_one({"user_id": user["_id"]})
-        if sh_charge_acct and sender_w and sender_w.get("sh_account_number"):
+        if sh_repay_dest and sender_w and sender_w.get("sh_account_number"):
             await call_sh("POST", "/transfers", body={
                 "debitAccountNumber": sender_w["sh_account_number"],
                 "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": sh_charge_acct,
+                "beneficiaryAccountNumber": sh_repay_dest,
                 "amount": repay_amount,
                 "saveBeneficiary": False,
                 "narration": f"BOMPAY loan repayment {loan_id[:8]}",
                 "paymentReference": txn_id
             })
+        else:
+            logger.info(f"[Loans] No LOANS SH bucket configured — repayment tracked internally only")
     except Exception as e:
-        logger.warning(f"[Loans] LOAN_REPAYMENTS SH sweep failed (non-fatal): {e}")
+        logger.warning(f"[Loans] LOANS SH repayment sweep failed (non-fatal): {e}")
     # Notify
     msg = "Loan fully repaid! Congratulations!" if is_fully_repaid else f"₦{repay_amount:,.2f} repaid. Outstanding: ₦{max(0.0, new_outstanding):,.2f}"
     await notify(user["_id"], "Loan Repayment", msg, "success")

@@ -44,6 +44,7 @@ from core import (  # noqa: F401,F403,F405
     PG_DISCO_SLUGS, PG_BET_SLUGS,
     CDH_AIRTIME_NETWORK_IDS, CDH_ELECTRICITY_DISCO_IDS, CDH_DATA_PLANS, CDH_CABLE_PLANS,
     NIGERIAN_BANKS, MOCK_NAMES, CHARGE_CATEGORIES,
+    get_service_bucket_account,
     WEBAUTHN_RP_ID, WEBAUTHN_ORIGIN, WEBAUTHN_RP_NAME,
     APP_NAME, EMERGENT_LLM_KEY,
     # webauthn
@@ -407,22 +408,26 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
     # Reset consecutive default days
     await db.ajo_members.update_one({"group_id": group_id, "user_id": user["_id"]},
                                     {"$set": {"consecutive_default_days": 0}})
-    # SH sweep of contribution amount (best-effort)
-    savings_cfg = await db.config.find_one({"key": "savings_config"})
-    sh_savings_acct = (savings_cfg or {}).get("value", {}).get("savings_sh_account", "")
-    user_sh = (wallet or {}).get("sh_account_number", "")
-    if sh_savings_acct and user_sh:
-        try:
+    # SH sweep of contribution amount → AJO service bucket (best-effort)
+    try:
+        sh_ajo_acct = await get_service_bucket_account("AJO")
+        if not sh_ajo_acct:
+            savings_cfg = await db.config.find_one({"key": "savings_config"})
+            sh_ajo_acct = (savings_cfg or {}).get("value", {}).get("savings_sh_account", "")
+        user_sh = (wallet or {}).get("sh_account_number", "")
+        if sh_ajo_acct and user_sh:
             await call_sh("POST", "/transfers", body={
                 "debitAccountNumber": user_sh,
                 "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": sh_savings_acct,
+                "beneficiaryAccountNumber": sh_ajo_acct,
                 "amount": group["contribution_amount"], "saveBeneficiary": False,
                 "narration": f"Ajo contribution — {group['name']}",
                 "paymentReference": txn_id
             })
-        except Exception as e:
-            logger.warning(f"[Ajo] SH contribution sweep failed for {txn_id}: {e}")
+        else:
+            logger.info(f"[Ajo] No AJO SH bucket configured — contribution tracked internally only")
+    except Exception as e:
+        logger.warning(f"[Ajo] SH contribution sweep failed for {txn_id}: {e}")
     # ── Sweep contribution fee to AJO_CONTRIBUTION_FEES charge account (best-effort) ──
     if fee_kobo > 0:
         asyncio.create_task(_sweep_ajo_contribution_fee(txn_id, user_sh, fee_kobo, group["name"]))
@@ -612,6 +617,24 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
             for m in members_raw:
                 await notify(m["user_id"], f"Ajo '{group['name']}' — Round {new_round} Starts!", "A new round of contributions has started.", "info")
     await notify(user["_id"], "Ajo Payout Collected!", f"₦{payout['amount']:,.2f} added to your wallet.", "success")
+    # SH sweep: AJO bucket → user's SH account (best-effort)
+    try:
+        sh_ajo_src = await get_service_bucket_account("AJO")
+        user_wallet = await db.wallets.find_one({"user_id": user["_id"]})
+        user_sh = (user_wallet or {}).get("sh_account_number", "")
+        if sh_ajo_src and user_sh:
+            await call_sh("POST", "/transfers", body={
+                "debitAccountNumber": sh_ajo_src,
+                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                "beneficiaryAccountNumber": user_sh,
+                "amount": payout["amount"], "saveBeneficiary": False,
+                "narration": f"Ajo payout — {group['name']}",
+                "paymentReference": txn_id
+            })
+        else:
+            logger.info(f"[Ajo] No AJO SH bucket configured — payout tracked internally only")
+    except Exception as e:
+        logger.warning(f"[Ajo] SH payout sweep failed (wallet already credited): {e}")
     return {"message": f"₦{payout['amount']:,.2f} collected successfully!", "transaction_id": txn_id}
 
 @router.post("/ajo/{group_id}/pay-arrears")

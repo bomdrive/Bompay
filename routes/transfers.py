@@ -60,6 +60,7 @@ from core import (  # noqa: F401,F403,F405
 from core import (  # noqa: F401
     NameEnquiryReq, TransferReq, BompayTransferReq, BaseModel,
     require_virtual_account, verify_transaction_pin, calculate_fee,
+    calculate_stamp_duty,
     get_sh_subaccount_balance, get_nip_fee, _sweep_fee_margin,
     _credit_cashback_bg, _check_referral_bg, _complete_epos_txn_bg,
 )
@@ -156,9 +157,11 @@ async def send_money(req: TransferReq, request: Request):
     if existing:
         return {"transaction_id": existing["transaction_id"], "status": existing["status"]}
     amt = int(req.amount * 100)
-    fee_ngn = await calculate_fee("TRANSFER", req.amount)
+    fee_ngn = await calculate_fee("TRANSFER", req.amount)     # NIP Commission
+    stamp_duty_ngn = await calculate_stamp_duty(req.amount)   # NIP Stamp Duty (0 if ≤10k)
     fee = int(fee_ngn * 100)
-    total = amt + fee
+    stamp_duty = int(stamp_duty_ngn * 100)
+    total = amt + fee + stamp_duty
     w = await get_wallet(user["_id"])
     # Check Bompay wallet balance
     if w["available_balance"] < total:
@@ -180,10 +183,12 @@ async def send_money(req: TransferReq, request: Request):
     await db.transactions.insert_one({
         "transaction_id": txn_id, "idempotency_key": idem, "user_id": user["_id"],
         "type": "BANK_TRANSFER", "direction": "DEBIT", "amount": amt, "fee": fee,
+        "fee_stamp_duty": stamp_duty,
         "vat": 0, "currency": "NGN", "status": "PROCESSING", "provider": "SAFEHAVEN",
         "description": f"Transfer to {req.beneficiary_name}",
         "metadata": {"bank_code": req.bank_code, "account_number": req.account_number,
-                     "beneficiary_name": req.beneficiary_name, "narration": req.narration},
+                     "beneficiary_name": req.beneficiary_name, "narration": req.narration,
+                     "stamp_duty_applied": stamp_duty_ngn > 0},
         "balance_before_kobo": w["available_balance"],
         "balance_after_kobo": w["available_balance"] - total,
         "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()
@@ -709,10 +714,17 @@ async def get_daily_transfer_usage(request: Request):
 async def preview_transfer_fee(amount: float, request: Request):
     """User-facing fee preview for transfer confirmation screen."""
     await get_current_user(request)
-    bompay_fee = await calculate_fee("TRANSFER", amount)
+    bompay_fee = await calculate_fee("TRANSFER", amount)       # NIP Commission
+    stamp_duty = await calculate_stamp_duty(amount)            # NIP Stamp Duty
     sh_fee = await get_nip_fee(amount)
     margin = round(max(bompay_fee - sh_fee, 0.0), 2)
-    return {"amount": amount, "fee": bompay_fee, "total": amount + bompay_fee,
-            "sh_fee": sh_fee, "bompay_margin": margin}
+    return {
+        "amount": amount,
+        "fee": bompay_fee,            # NIP Commission (shown on preview)
+        "stamp_duty": stamp_duty,     # NIP Stamp Duty (shown on preview if > 0)
+        "total": amount + bompay_fee + stamp_duty,
+        "sh_fee": sh_fee,
+        "bompay_margin": margin
+    }
 
 # ===== CDH PLANS & VALIDATION =====

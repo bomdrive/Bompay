@@ -192,7 +192,9 @@ CDH_CABLE_PLANS = {
 }
 
 CHARGE_CATEGORIES = [
-    {"category": "TRANSFER_FEES", "label": "Transfer Fees", "description": "Bank transfer fee collections"},
+    {"category": "TRANSFER_FEES", "label": "NIP Commission (Outward)", "description": "NIP Commission margin on outbound bank transfers"},
+    {"category": "NIP_STAMP_DUTY", "label": "NIP Stamp Duty", "description": "Stamp duty on transfers above ₦10,000"},
+    {"category": "NIP_INWARD_COMMISSION", "label": "NIP Inward Commission", "description": "NIP cost absorbed by Bompay on inward deposits (not charged to customer)"},
     {"category": "BOMPAY_TRANSFER_FEES", "label": "BOMPAY Transfer Fees", "description": "Internal BOMPAY transfer fees"},
     {"category": "SMS_CHARGES", "label": "SMS Charges", "description": "Monthly SMS notification charges"},
     {"category": "LOAN_REPAYMENTS", "label": "Loan Repayments", "description": "Loan repayment collections"},
@@ -1753,6 +1755,65 @@ async def calculate_fee(service: str, amount_ngn: float) -> float:
             return float(tiers[-1]["fee"])
     return 0
 
+
+async def calculate_stamp_duty(amount_ngn: float) -> float:
+    """NIP Stamp Duty: only applies to outward bank transfers above ₦10,000.
+    Admin-configurable as FLAT (default ₦50) or PERCENTAGE."""
+    if amount_ngn <= 10000:
+        return 0.0
+    config = await db.fee_configs.find_one({"service": "NIP_STAMP_DUTY", "is_active": True})
+    if not config:
+        return 50.0  # CBN default: ₦50 flat
+    fee_type = config.get("fee_type", "FLAT")
+    if fee_type == "FLAT":
+        return float(config.get("flat_amount", 50))
+    elif fee_type == "PERCENTAGE":
+        fee = amount_ngn * (config.get("percentage", 0) / 100)
+        min_f = config.get("min_fee", 0)
+        max_f = config.get("max_fee", 0)
+        if max_f > 0:
+            return min(max(min_f, fee), max_f)
+        return max(min_f, fee)
+    return 50.0
+
+
+async def get_service_bucket_account(service: str, fallback_category: str = "") -> str:
+    """Return SH account number for a service bucket.
+    Priority: service_bucket_accounts.{SERVICE} → charge_accounts.{fallback_category}"""
+    svc = await db.service_bucket_accounts.find_one({"service": service.upper(), "is_active": True})
+    if svc and svc.get("sh_account_number"):
+        return svc["sh_account_number"]
+    if fallback_category:
+        charge = await db.charge_accounts.find_one({"category": fallback_category})
+        return (charge or {}).get("sh_account_number", "")
+    return ""
+
+
+async def calculate_nip_inward_commission(amount_ngn: float) -> float:
+    """NIP Inward Commission: absorbed by Bompay (NOT charged to user) on inward deposits.
+    Default tiered: ₦5 for ≤10,000 and ₦50 for >10,000. Admin-configurable."""
+    config = await db.fee_configs.find_one({"service": "NIP_INWARD_COMMISSION", "is_active": True})
+    if not config:
+        return 50.0 if amount_ngn > 10000 else 5.0
+    fee_type = config.get("fee_type", "TIERED")
+    if fee_type == "FLAT":
+        return float(config.get("flat_amount", 5))
+    elif fee_type == "PERCENTAGE":
+        fee = amount_ngn * (config.get("percentage", 0) / 100)
+        min_f = config.get("min_fee", 0)
+        max_f = config.get("max_fee", 0)
+        if max_f > 0:
+            return min(max(min_f, fee), max_f)
+        return max(min_f, fee)
+    elif fee_type == "TIERED":
+        tiers = sorted(config.get("tiers", []), key=lambda t: t["min"])
+        for tier in tiers:
+            if amount_ngn >= tier["min"] and amount_ngn < tier.get("max", float("inf")):
+                return float(tier["fee"])
+        if tiers:
+            return float(tiers[-1]["fee"])
+    return 50.0 if amount_ngn > 10000 else 5.0
+
 # ===== WEBAUTHN HELPERS =====
 def _parse_reg_credential(data: dict) -> RegistrationCredential:
     return RegistrationCredential(
@@ -2270,8 +2331,47 @@ async def _credit_cashback_bg(user_id: str, amount_naira: float, txn_type: str, 
             asyncio.create_task(send_event_notification(user_id, "CASHBACK_EARNED", {
                 "amount": cashback_naira, "service": description
             }))
+        # ── SH sweep: CASHBACK service bucket → user SH (best-effort) ──
+        try:
+            cashback_sh = await get_service_bucket_account("CASHBACK")
+            wallet_doc = await db.wallets.find_one({"user_id": user_id})
+            user_sh = (wallet_doc or {}).get("sh_account_number", "")
+            if cashback_sh and user_sh:
+                await call_sh("POST", "/transfers", body={
+                    "debitAccountNumber": cashback_sh,
+                    "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                    "beneficiaryAccountNumber": user_sh,
+                    "amount": cashback_naira, "saveBeneficiary": False,
+                    "narration": f"BOMPAY cashback {txn_type[:10]}",
+                    "paymentReference": f"CB{secrets.token_hex(10).upper()}"
+                })
+            else:
+                logger.info(f"[Cashback] No SH source configured — cashback tracked internally only")
+        except Exception as sh_e:
+            logger.warning(f"[Cashback] SH sweep failed (cashback balance still updated): {sh_e}")
     except Exception:
         pass
+
+
+async def _sh_referral_sweep(user_id: str, amount_naira: float):
+    """SH sweep: REFERRAL service bucket → user's SH account (best-effort)."""
+    try:
+        referral_sh = await get_service_bucket_account("REFERRAL")
+        wallet_doc = await db.wallets.find_one({"user_id": user_id})
+        user_sh = (wallet_doc or {}).get("sh_account_number", "")
+        if referral_sh and user_sh:
+            await call_sh("POST", "/transfers", body={
+                "debitAccountNumber": referral_sh,
+                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                "beneficiaryAccountNumber": user_sh,
+                "amount": amount_naira, "saveBeneficiary": False,
+                "narration": "BOMPAY referral bonus",
+                "paymentReference": f"REF{secrets.token_hex(10).upper()}"
+            })
+        else:
+            logger.info("[Referral] No REFERRAL SH bucket configured — balance tracked internally only")
+    except Exception as e:
+        logger.warning(f"[Referral] SH sweep failed (balance still updated): {e}")
 
 
 async def _check_referral_bg(user_id: str, amount_naira: float):
@@ -2306,6 +2406,8 @@ async def _check_referral_bg(user_id: str, amount_naira: float):
                 "amount": cfg.get("referral_bonus_referee_naira", 500),
                 "note": f"You joined via a referral code."
             }))
+            # SH sweep: REFERRAL bucket → referee's SH
+            asyncio.create_task(_sh_referral_sweep(user_id, cfg.get("referral_bonus_referee_naira", 500)))
         if referrer_bonus_kobo > 0:
             await db.users.update_one({"_id": ObjectId(referrer["_id"])}, {"$inc": {"referral_balance": referrer_bonus_kobo}})
             await db.referral_history.insert_one({
@@ -2319,6 +2421,8 @@ async def _check_referral_bg(user_id: str, amount_naira: float):
                 "amount": cfg.get("referral_bonus_referrer_naira", 500),
                 "note": f"Your friend {user.get('first_name', '')} just qualified."
             }))
+            # SH sweep: REFERRAL bucket → referrer's SH
+            asyncio.create_task(_sh_referral_sweep(str(referrer["_id"]), cfg.get("referral_bonus_referrer_naira", 500)))
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"referral_credited": True}})
     except Exception:
         pass

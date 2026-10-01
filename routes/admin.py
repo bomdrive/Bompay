@@ -71,6 +71,7 @@ from core import (  # noqa: F401,F403,F405
     AdminStaffReq,
     PromotionReq,
     get_sh_subaccount_balance,
+    get_service_bucket_account,
     ResendSettingsReq,
     CloudinarySettingsReq,
     _run_sms_billing,
@@ -901,7 +902,8 @@ async def admin_approve_loan(loan_id: str, request: Request):
             "amount": monthly, "status": "PENDING",
             "paid_at": None, "paid_amount": None, "defaulter_fee": None
         })
-    disburse_sh_acct = loan_cfg.get("disbursement_sh_account", "")
+    # Disbursement: check LOANS service bucket first, fall back to loan_cfg.disbursement_sh_account
+    disburse_sh_acct = await get_service_bucket_account("LOANS") or loan_cfg.get("disbursement_sh_account", "")
     amt = int(loan["amount"] * 100)
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
     user_id = loan["user_id"]
@@ -2280,6 +2282,25 @@ async def admin_dashboard_full(request: Request):
     kyc_pending = await db.users.count_documents({"kyc_status": {"$in": ["PENDING", "UNDER_REVIEW"]}})
     virtual_accts = await db.wallets.count_documents({"sh_account_number": {"$exists": True, "$ne": ""}})
 
+    # ── All-time totals (accumulation) ──
+    all_time_users = total_users  # already all-time
+    all_time_txn_count = await db.transactions.count_documents({"user_id": {"$ne": "PLATFORM"}})
+    vol_alltime_res = await db.transactions.aggregate([
+        {"$match": {"status": "COMPLETED", "direction": "DEBIT", "user_id": {"$ne": "PLATFORM"}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]).to_list(1)
+    vol_all_time = (vol_alltime_res[0]["total"] / 100) if vol_alltime_res else 0
+    fee_alltime_res = await db.transactions.aggregate([
+        {"$match": {"type": "FEE_INCOME", "status": "COMPLETED"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]).to_list(1)
+    fee_all_time = (fee_alltime_res[0]["total"] / 100) if fee_alltime_res else 0
+    stamp_alltime_res = await db.transactions.aggregate([
+        {"$match": {"fee_stamp_duty": {"$gt": 0}, "status": "COMPLETED"}},
+        {"$group": {"_id": None, "total": {"$sum": "$fee_stamp_duty"}}}
+    ]).to_list(1)
+    stamp_all_time = (stamp_alltime_res[0]["total"] / 100) if stamp_alltime_res else 0
+
     # ── Transaction metrics ──
     txn_today = await db.transactions.count_documents({"created_at": {"$gte": today_start}})
     txn_month = await db.transactions.count_documents({"created_at": {"$gte": month_start}})
@@ -2388,6 +2409,13 @@ async def admin_dashboard_full(request: Request):
     return {
         "users": {"total": total_users, "new_today": new_today, "new_month": new_month, "kyc_pending": kyc_pending, "virtual_accounts": virtual_accts},
         "transactions": {"today_count": txn_today, "month_count": txn_month, "vol_month_ngn": round(vol_month, 2), "vol_today_ngn": round(vol_today, 2), "fee_month_ngn": round(fee_month, 2), "by_type": txn_by_type},
+        "all_time": {
+            "users": all_time_users,
+            "transactions": all_time_txn_count,
+            "volume_ngn": round(vol_all_time, 2),
+            "fee_income_ngn": round(fee_all_time, 2),
+            "stamp_duty_ngn": round(stamp_all_time, 2),
+        },
         "operations": {"active_loans": active_loans, "active_savings": active_savings, "active_ajo": active_ajo, "fraud_open": fraud_open, "open_tickets": open_tickets, "epos_today": epos_today},
         "sms": {"sent_month": sms_sent, "total_month": sms_month, "delivery_rate": sms_rate, "active_provider": active_sms},
         "providers": providers,
@@ -3559,3 +3587,397 @@ async def fix_callback_urls(admin=Depends(get_admin_user)):
                 results.append({"user_id": user_id, "account": acct_num, "sh_id": sh_id, "status": "failed", "error": str(e2)})
 
     return {"callback_url_used": callback_url, "total": len(results), "results": results}
+
+
+# ===== MONEY MOVEMENT REPORT =====
+
+MONEY_MOVEMENT_MAP = {
+    "SAVINGS": {
+        "label": "Savings",
+        "in_types": ["SAVINGS_CONTRIBUTION"],       # money flows INTO bucket
+        "out_types": ["SAVINGS_WITHDRAWAL"],         # money flows OUT of bucket to users
+        "ledger_collection": "savings_goals",
+    },
+    "LOANS": {
+        "label": "Loans",
+        "in_types": ["LOAN_REPAYMENT"],              # money flows INTO bucket (repayments)
+        "out_types": ["LOAN_DISBURSEMENT"],          # money flows OUT of bucket (disbursements)
+        "ledger_collection": "loan_applications",
+    },
+    "AJO": {
+        "label": "Ajo Group",
+        "in_types": ["AJO_CONTRIBUTION"],            # money flows INTO bucket
+        "out_types": ["AJO_PAYOUT"],                 # money flows OUT to turn recipients
+        "ledger_collection": "ajo_groups",
+    },
+    "EPOS": {
+        "label": "e-POS",
+        "in_types": ["EPOS_SETTLEMENT", "EPOS_CHARGE"],
+        "out_types": [],
+        "ledger_collection": None,
+    },
+    "CASHBACK": {
+        "label": "Cashback",
+        "in_types": [],                              # funded externally via SH
+        "out_types": ["CASHBACK_CREDIT"],            # paid out to users
+        "ledger_collection": "cashback_history",
+    },
+    "REFERRAL": {
+        "label": "Referral Bonus",
+        "in_types": [],
+        "out_types": ["REFERRAL_BONUS"],
+        "ledger_collection": "referral_history",
+    },
+    "NIP_INWARD": {
+        "label": "NIP Inward Commission",
+        "in_types": [],
+        "out_types": [],                             # uses nip_inward_costs collection directly
+        "ledger_collection": "nip_inward_costs",
+    },
+}
+
+
+@router.get("/admin/money-movement/report")
+async def money_movement_report(
+    request: Request,
+    period: str = "month",      # today / week / month / all / custom
+    date_from: str = "",
+    date_to: str = "",
+):
+    """Per-service fund flow report: IN (funds going to bucket), OUT (funds paid out to users), Net."""
+    await get_admin_user(request)
+    now = datetime.now(timezone.utc)
+
+    # Build date range
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    elif period == "week":
+        start = now - timedelta(days=7)
+        end = now
+    elif period == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    elif period == "custom" and date_from:
+        try:
+            start = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(date_to.replace("Z", "+00:00")) if date_to else now
+        except Exception:
+            start = now - timedelta(days=30)
+            end = now
+    else:  # "all"
+        start = None
+        end = None
+
+    date_filter: dict = {}
+    if start and end:
+        date_filter = {"created_at": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+
+    results = {}
+
+    for svc_key, cfg in MONEY_MOVEMENT_MAP.items():
+        if svc_key == "NIP_INWARD":
+            # Use nip_inward_costs collection
+            q = {**date_filter}
+            if "created_at" in q:
+                nip_docs = await db.nip_inward_costs.find(q, {"cost_ngn": 1, "status": 1}).to_list(None)
+            else:
+                nip_docs = await db.nip_inward_costs.find({}, {"cost_ngn": 1, "status": 1}).to_list(None)
+            total_cost = round(sum(d.get("cost_ngn", 0) for d in nip_docs), 2)
+            pending_cost = round(sum(d.get("cost_ngn", 0) for d in nip_docs if d.get("status") == "PENDING_BALANCE"), 2)
+            results[svc_key] = {
+                "label": cfg["label"],
+                "in_ngn": 0,
+                "out_ngn": total_cost,
+                "net_ngn": -total_cost,
+                "in_count": 0,
+                "out_count": len(nip_docs),
+                "pending_ngn": pending_cost,
+            }
+            continue
+
+        # IN: transactions of in_types
+        in_ngn = 0
+        in_count = 0
+        if cfg["in_types"]:
+            in_q = {"type": {"$in": cfg["in_types"]}, "status": "COMPLETED", **date_filter}
+            in_agg = await db.transactions.aggregate([
+                {"$match": in_q},
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+            ]).to_list(1)
+            if in_agg:
+                in_ngn = round(in_agg[0]["total"] / 100, 2)
+                in_count = in_agg[0]["count"]
+        else:
+            # Cashback/Referral: read from history collections
+            if svc_key in ("CASHBACK", "REFERRAL"):
+                coll = db.cashback_history if svc_key == "CASHBACK" else db.referral_history
+                hist_q = {**date_filter}
+                hist_agg = await coll.aggregate([
+                    {"$match": hist_q},
+                    {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}, "count": {"$sum": 1}}}
+                ]).to_list(1)
+                if hist_agg:
+                    in_ngn = 0
+                    in_count = 0
+                    # cashback/referral are OUT (paid to users), not in
+                    out_ngn_from_hist = round(hist_agg[0]["total"] / 100, 2)
+                    out_count_from_hist = hist_agg[0]["count"]
+                    results[svc_key] = {
+                        "label": cfg["label"],
+                        "in_ngn": 0,
+                        "out_ngn": out_ngn_from_hist,
+                        "net_ngn": round(-out_ngn_from_hist, 2),
+                        "in_count": 0,
+                        "out_count": out_count_from_hist,
+                    }
+                    continue
+
+        # OUT: transactions of out_types
+        out_ngn = 0
+        out_count = 0
+        if cfg["out_types"]:
+            out_q = {"type": {"$in": cfg["out_types"]}, "status": "COMPLETED", **date_filter}
+            out_agg = await db.transactions.aggregate([
+                {"$match": out_q},
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+            ]).to_list(1)
+            if out_agg:
+                out_ngn = round(out_agg[0]["total"] / 100, 2)
+                out_count = out_agg[0]["count"]
+
+        # Fetch configured account
+        svc_acct = await db.service_bucket_accounts.find_one({"service": svc_key, "is_active": True})
+
+        results[svc_key] = {
+            "label": cfg["label"],
+            "in_ngn": in_ngn,
+            "out_ngn": out_ngn,
+            "net_ngn": round(in_ngn - out_ngn, 2),
+            "in_count": in_count,
+            "out_count": out_count,
+            "account_number": (svc_acct or {}).get("sh_account_number"),
+            "account_name": (svc_acct or {}).get("sh_account_name"),
+        }
+
+    # Grand totals
+    total_in = round(sum(v["in_ngn"] for v in results.values()), 2)
+    total_out = round(sum(v["out_ngn"] for v in results.values()), 2)
+
+    return {
+        "period": period,
+        "date_from": start.isoformat() if start else None,
+        "date_to": end.isoformat() if end else None,
+        "services": results,
+        "totals": {"in_ngn": total_in, "out_ngn": total_out, "net_ngn": round(total_in - total_out, 2)},
+        "generated_at": now.isoformat(),
+    }
+
+@router.get("/admin/nip-inward/report")
+async def nip_inward_report(request: Request, status: str = "all", page: int = 1, limit: int = 50):
+    """Report of NIP Inward Commission costs (Bompay-absorbed). Filter by status: all/PENDING_BALANCE/BALANCED."""
+    await get_admin_user(request)
+    query: dict = {}
+    if status != "all":
+        query["status"] = status.upper()
+    skip = (page - 1) * limit
+    records = await db.nip_inward_costs.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.nip_inward_costs.count_documents(query)
+
+    # Summary aggregation
+    summary_agg = await db.nip_inward_costs.aggregate([
+        {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_ngn": {"$sum": "$cost_ngn"}}}
+    ]).to_list(None)
+    summary = {s["_id"]: {"count": s["count"], "total_ngn": round(s["total_ngn"], 2)} for s in summary_agg}
+
+    pending_total = summary.get("PENDING_BALANCE", {}).get("total_ngn", 0)
+    balanced_total = summary.get("BALANCED", {}).get("total_ngn", 0)
+
+    # Last balance event
+    last_balance = await db.transactions.find_one(
+        {"type": "NIP_INWARD_BALANCE"}, sort=[("created_at", -1)]
+    )
+
+    return {
+        "records": records,
+        "total": total,
+        "page": page,
+        "summary": {
+            "pending_count": summary.get("PENDING_BALANCE", {}).get("count", 0),
+            "pending_ngn": pending_total,
+            "balanced_count": summary.get("BALANCED", {}).get("count", 0),
+            "balanced_ngn": balanced_total,
+        },
+        "last_auto_balance": {
+            "ref": (last_balance or {}).get("transaction_id"),
+            "amount_ngn": (last_balance or {}).get("amount", 0) / 100,
+            "txn_count": (last_balance or {}).get("metadata", {}).get("txn_count", 0),
+            "at": (last_balance or {}).get("created_at"),
+        } if last_balance else None
+    }
+
+
+@router.get("/admin/nip-inward/preview-balance")
+async def nip_inward_preview_balance(request: Request):
+    """Preview all pending NIP Inward costs before executing a manual balance."""
+    await get_admin_user(request)
+    pending = await db.nip_inward_costs.find({"status": "PENDING_BALANCE"}, {"_id": 0}).sort("created_at", 1).to_list(None)
+    total_ngn = round(sum(p.get("cost_ngn", 0) for p in pending), 2)
+
+    # Enrich with user info
+    enriched = []
+    for p in pending:
+        user = await db.users.find_one({"_id": ObjectId(p["user_id"])}, {"first_name": 1, "last_name": 1, "phone": 1}) if p.get("user_id") else None
+        enriched.append({
+            **p,
+            "user_name": f"{(user or {}).get('first_name','')} {(user or {}).get('last_name','')}".strip() if user else "Unknown",
+            "user_phone": (user or {}).get("phone", ""),
+        })
+
+    return {
+        "count": len(pending),
+        "total_ngn": total_ngn,
+        "records": enriched
+    }
+
+
+@router.post("/admin/nip-inward/manual-balance")
+async def nip_inward_manual_balance(request: Request):
+    """Manually trigger NIP Inward balance (same logic as midnight cron)."""
+    await get_admin_user(request)
+    now = datetime.now(timezone.utc)
+
+    pending = await db.nip_inward_costs.find({"status": "PENDING_BALANCE"}).to_list(None)
+    if not pending:
+        return {"message": "No pending NIP inward costs to balance", "count": 0, "total_ngn": 0}
+
+    total_cost_ngn = round(sum(p.get("cost_ngn", 0) for p in pending), 2)
+    txn_ids = [p["txn_id"] for p in pending]
+    sweep_ref = f"NIPINM{int(now.timestamp())}"
+
+    await db.nip_inward_costs.update_many(
+        {"txn_id": {"$in": txn_ids}},
+        {"$set": {"status": "BALANCED", "balance_ref": sweep_ref, "balanced_at": now.isoformat()}}
+    )
+    await db.transactions.insert_one({
+        "transaction_id": sweep_ref,
+        "user_id": "PLATFORM",
+        "type": "NIP_INWARD_BALANCE",
+        "direction": "DEBIT",
+        "amount": int(total_cost_ngn * 100),
+        "fee": 0, "vat": 0,
+        "currency": "NGN",
+        "status": "COMPLETED",
+        "provider": "INTERNAL",
+        "description": f"Manual NIP inward balance — {len(pending)} deposits",
+        "metadata": {"txn_count": len(pending), "triggered_by": "admin_manual"},
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat()
+    })
+    await db.charge_accounts.update_one(
+        {"category": "NIP_INWARD_COMMISSION"},
+        {"$inc": {"total_swept_kobo": int(total_cost_ngn * 100)},
+         "$set": {"last_balanced_at": now.isoformat()}},
+        upsert=False
+    )
+    return {
+        "message": f"Manual balance complete — {len(pending)} records",
+        "count": len(pending),
+        "total_ngn": total_cost_ngn,
+        "reference": sweep_ref
+    }
+
+
+# ===== SERVICE BUCKET ACCOUNTS =====
+
+SERVICE_BUCKET_SERVICES = [
+    {"key": "SAVINGS", "label": "Savings", "description": "Receives savings contributions; returns on liquidation"},
+    {"key": "LOANS", "label": "Loans", "description": "Holds disbursed loan funds; receives repayments"},
+    {"key": "AJO", "label": "Ajo Group", "description": "Holds Ajo rotating savings contributions"},
+    {"key": "EPOS", "label": "e-POS", "description": "Holds ePOS merchant transaction float"},
+    {"key": "CARD", "label": "Card", "description": "Card product float account"},
+    {"key": "FAMILY", "label": "Family", "description": "Family wallet allocations float"},
+    {"key": "CASHBACK", "label": "Cashback", "description": "Source account for cashback payouts to users"},
+    {"key": "REFERRAL", "label": "Referral Bonus", "description": "Source account for referral bonus payouts to users"},
+]
+
+
+@router.get("/admin/service-accounts")
+async def get_service_accounts(request: Request):
+    """Get current service-to-account mappings."""
+    await get_admin_user(request)
+    docs = await db.service_bucket_accounts.find({}, {"_id": 0}).to_list(None)
+    mapping = {d["service"]: d for d in docs}
+    return {
+        "services": [
+            {**s, "account": mapping.get(s["key"])}
+            for s in SERVICE_BUCKET_SERVICES
+        ]
+    }
+
+
+@router.put("/admin/service-accounts/{service}")
+async def set_service_account(service: str, request: Request):
+    """Assign a Safe Haven account to a service bucket."""
+    await get_admin_user(request)
+    body = await request.json()
+    service = service.upper()
+    if service not in {s["key"] for s in SERVICE_BUCKET_SERVICES}:
+        raise HTTPException(400, f"Unknown service: {service}")
+    sh_account_number = (body.get("sh_account_number") or "").strip()
+    sh_account_name = (body.get("sh_account_name") or "").strip()
+    sh_account_id = (body.get("sh_account_id") or "").strip()
+    if not sh_account_number:
+        raise HTTPException(400, "sh_account_number is required")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.service_bucket_accounts.update_one(
+        {"service": service},
+        {"$set": {
+            "service": service,
+            "sh_account_number": sh_account_number,
+            "sh_account_name": sh_account_name,
+            "sh_account_id": sh_account_id,
+            "is_active": True,
+            "updated_at": now
+        }},
+        upsert=True
+    )
+    return {"message": f"{service} account updated", "service": service, "account_number": sh_account_number}
+
+
+@router.delete("/admin/service-accounts/{service}")
+async def clear_service_account(service: str, request: Request):
+    """Remove a service account mapping."""
+    await get_admin_user(request)
+    service = service.upper()
+    await db.service_bucket_accounts.delete_one({"service": service})
+    return {"message": f"{service} account mapping removed"}
+
+
+@router.get("/admin/service-accounts/fetch-sh")
+async def fetch_sh_accounts_for_service(request: Request):
+    """Fetch available Safe Haven accounts for the admin to pick from."""
+    await get_admin_user(request)
+    try:
+        # Try to list platform sub-accounts from Safe Haven API
+        result = await call_sh("GET", "/accounts?page=1&limit=100")
+        accounts_raw = result.get("data", [])
+        if not isinstance(accounts_raw, list):
+            # Some SH versions return {"data": {"data": [...]}}
+            accounts_raw = result.get("data", {}).get("data", []) if isinstance(result.get("data"), dict) else []
+        accounts = [
+            {
+                "account_number": a.get("accountNumber") or a.get("account_number", ""),
+                "account_name": a.get("accountName") or a.get("account_name", ""),
+                "account_id": a.get("_id") or a.get("id", ""),
+                "available_balance": a.get("availableBalance", 0),
+                "type": a.get("type") or a.get("accountType", ""),
+            }
+            for a in accounts_raw if a.get("accountNumber") or a.get("account_number")
+        ]
+        return {"accounts": accounts, "source": "safehaven_api"}
+    except Exception as e:
+        logger.warning(f"[ServiceAccounts] SH fetch failed: {e}")
+        # Fallback: return existing service accounts so admin can at least see what's configured
+        docs = await db.service_bucket_accounts.find({}, {"_id": 0}).to_list(None)
+        return {"accounts": [], "source": "fallback", "error": str(e), "existing": docs}

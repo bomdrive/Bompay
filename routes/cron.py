@@ -532,3 +532,83 @@ async def cron_family_allowances(request: Request, bg: BackgroundTasks):
     run_id = request.headers.get("X-Webhook-Id", str(uuid.uuid4()))
     bg.add_task(_run_family_allowances, run_id)
     return {"accepted": True, "run_id": run_id}
+
+
+# ── NIP Inward Auto-Balance (midnight) ────────────────────────────────────────
+
+@router.post("/cron/nip-inward-balance")
+async def cron_nip_inward_balance(request: Request):
+    """Midnight: aggregate all pending NIP inward costs and record the balance sweep.
+    Updates nip_inward_costs records to BALANCED and notifies admins."""
+    _verify_cron(request)
+    now = datetime.now(timezone.utc)
+
+    pending = await db.nip_inward_costs.find({"status": "PENDING_BALANCE"}).to_list(None)
+    if not pending:
+        return {"message": "No pending NIP inward costs", "count": 0, "total_ngn": 0}
+
+    total_cost_ngn = round(sum(p.get("cost_ngn", 0) for p in pending), 2)
+    txn_ids = [p["txn_id"] for p in pending]
+    sweep_ref = f"NIPIN{int(now.timestamp())}"
+
+    # Mark all as BALANCED
+    await db.nip_inward_costs.update_many(
+        {"txn_id": {"$in": txn_ids}},
+        {"$set": {
+            "status": "BALANCED",
+            "balance_ref": sweep_ref,
+            "balanced_at": now.isoformat()
+        }}
+    )
+
+    # Record the sweep in transactions for audit trail
+    await db.transactions.insert_one({
+        "transaction_id": sweep_ref,
+        "user_id": "PLATFORM",
+        "type": "NIP_INWARD_BALANCE",
+        "direction": "DEBIT",
+        "amount": int(total_cost_ngn * 100),
+        "fee": 0, "vat": 0,
+        "currency": "NGN",
+        "status": "COMPLETED",
+        "provider": "INTERNAL",
+        "description": f"Auto NIP inward commission balance — {len(pending)} deposits",
+        "metadata": {
+            "txn_count": len(pending),
+            "period_start": pending[0].get("created_at", "") if pending else "",
+            "period_end": now.isoformat()
+        },
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat()
+    })
+
+    # Update charge account cumulative
+    await db.charge_accounts.update_one(
+        {"category": "NIP_INWARD_COMMISSION"},
+        {"$inc": {"total_swept_kobo": int(total_cost_ngn * 100)},
+         "$set": {"last_balanced_at": now.isoformat()}},
+        upsert=False
+    )
+
+    # Notify all admins
+    admins = await db.users.find({"role": "admin"}).to_list(10)
+    for au in admins:
+        await db.notifications.insert_one({
+            "notification_id": str(uuid.uuid4()),
+            "user_id": au["_id"],
+            "title": "NIP Inward Auto-Balance Complete",
+            "message": (f"Midnight auto-balance: {len(pending)} deposits totalling "
+                        f"₦{total_cost_ngn:,.2f} in NIP Inward Commission have been balanced. "
+                        f"Ref: {sweep_ref}"),
+            "type": "info",
+            "is_read": False,
+            "created_at": now.isoformat()
+        })
+
+    logger.info(f"[NIPInward] Auto-balanced {len(pending)} records, ₦{total_cost_ngn:.2f}, ref={sweep_ref}")
+    return {
+        "message": "NIP inward balance complete",
+        "count": len(pending),
+        "total_ngn": total_cost_ngn,
+        "reference": sweep_ref
+    }
