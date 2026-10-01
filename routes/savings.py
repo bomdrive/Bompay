@@ -214,10 +214,15 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
     })
     await db.savings_goals.update_one({"goal_id": goal_id}, {"$inc": {"current_amount": amt}})
 
-    # ─── SH sweep: user SH → SAVINGS_PROCEEDS charge account (best-effort) ───
+    # ─── SH sweep: user SH → configured SAVINGS service account (best-effort) ───
+    # Priority: service_bucket_accounts.SAVINGS → charge_accounts.SAVINGS_PROCEEDS
     try:
-        savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
-        sh_dest = (savings_acct or {}).get("sh_account_number", "")
+        svc_acct = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
+        if svc_acct:
+            sh_dest = svc_acct.get("sh_account_number", "")
+        else:
+            savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+            sh_dest = (savings_acct or {}).get("sh_account_number", "")
         if sh_acct and sh_dest:
             await call_sh("POST", "/transfers", body={
                 "debitAccountNumber": sh_acct,
@@ -227,6 +232,9 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
                 "narration": f"BOMPAY savings {goal['name'][:20]}",
                 "paymentReference": txn_id
             })
+            logger.info(f"[Savings] SH sweep OK: ₦{req.amount} user→savings account={sh_dest}")
+        else:
+            logger.warning(f"[Savings] No SH destination configured for SAVINGS bucket — wallet debited only")
     except Exception as e:
         logger.warning(f"[Savings] SH sweep failed (wallet already debited): {e}")
 
@@ -283,21 +291,28 @@ async def delete_savings(goal_id: str, request: Request):
         # Atomic credit to wallet
         await db.wallets.update_one({"user_id": user["_id"]},
             {"$inc": {"available_balance": payout_kobo, "ledger_balance": payout_kobo}})
-        # SH reverse sweep: SAVINGS_PROCEEDS → user SH account (best-effort)
+        # SH reverse sweep: SAVINGS service account → user SH account (best-effort)
         try:
-            savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
-            sh_dest = (savings_acct or {}).get("sh_account_number", "")
+            svc_acct = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
+            if svc_acct:
+                sh_src = svc_acct.get("sh_account_number", "")
+            else:
+                savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+                sh_src = (savings_acct or {}).get("sh_account_number", "")
             wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
             user_sh = (wallet_doc or {}).get("sh_account_number", "")
-            if sh_dest and user_sh:
+            if sh_src and user_sh:
                 await call_sh("POST", "/transfers", body={
-                    "debitAccountNumber": sh_dest,
+                    "debitAccountNumber": sh_src,
                     "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
                     "beneficiaryAccountNumber": user_sh,
                     "amount": payout_kobo / 100, "saveBeneficiary": False,
                     "narration": f"BOMPAY savings withdrawal {goal['name'][:20]}",
                     "paymentReference": f"TXN{secrets.token_hex(12).upper()}"
                 })
+                logger.info(f"[Savings] SH reverse sweep OK: ₦{payout_kobo/100} savings→user")
+            else:
+                logger.warning(f"[Savings] No SH source configured for SAVINGS bucket — wallet credited only")
         except Exception as e:
             logger.warning(f"[Savings] SH withdrawal sweep failed: {e}")
 
