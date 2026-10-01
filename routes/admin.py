@@ -8,7 +8,7 @@ import bcrypt
 import jwt as pyjwt
 import httpx
 import requests as _requests
-from fastapi import APIRouter, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Request, Response, BackgroundTasks, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 import csv, io
 from fpdf import FPDF
@@ -528,6 +528,26 @@ async def update_user_status(user_id: str, request: Request):
     body = await request.json()
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"status": body.get("status", "ACTIVE")}})
     return {"message": "User status updated"}
+
+
+@router.post("/admin/users/{user_id}/reset-pin")
+async def admin_reset_user_pin(user_id: str, request: Request):
+    """Admin: reset a customer's transaction PIN to default 0000."""
+    await get_admin_user(request)
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(400, "Invalid user ID")
+    user = await db.users.find_one({"_id": oid}, {"phone": 1, "first_name": 1})
+    if not user:
+        raise HTTPException(404, "User not found")
+    await db.users.update_one({"_id": oid}, {"$set": {
+        "pin_hash": hash_pin("0000"),
+        "pin_failed_attempts": 0,
+        "pin_locked_until": None
+    }})
+    await audit(str(oid), "ADMIN_PIN_RESET", "auth", {"reset_to": "0000"})
+    return {"message": f"PIN reset to 0000 for {user.get('phone', user_id)}"}
 
 @router.get("/admin/users/{user_id}")
 async def admin_user_detail(user_id: str, request: Request):
@@ -3496,3 +3516,46 @@ async def admin_freeze_family_group(family_id: str, request: Request):
                 {"family_id": family_id, "family_name": fam.get("name"), "new_status": new_status})
     return {"status": new_status, "message": f"Family '{fam.get('name')}' {action} successfully"}
 
+
+
+@router.get("/admin/webhook-events")
+async def admin_webhook_events(limit: int = 20, admin=Depends(get_admin_user)):
+    """View recent webhook events for debugging."""
+    events = await db.webhooks.find({}).sort("received_at", -1).limit(limit).to_list(limit)
+    result = []
+    for e in events:
+        e["_id"] = str(e["_id"])
+        result.append(e)
+    return result
+
+
+
+@router.post("/admin/fix-callback-urls")
+async def fix_callback_urls(admin=Depends(get_admin_user)):
+    """Update callbackUrl for ALL existing virtual accounts on Safe Haven to the production URL."""
+    prod_callback = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("API_BASE_URL", "")
+    callback_url = f"{prod_callback}/api/webhooks/safehaven"
+
+    wallets = await db.wallets.find(
+        {"sh_account_id": {"$exists": True, "$ne": ""}}
+    ).to_list(1000)
+
+    results = []
+    for w in wallets:
+        sh_id = w.get("sh_account_id", "")
+        acct_num = w.get("sh_account_number", "")
+        user_id = w.get("user_id", "")
+        if not sh_id:
+            continue
+        try:
+            # Try virtual-accounts endpoint first, then accounts endpoint
+            r = await call_sh("PUT", f"/virtual-accounts/{sh_id}", body={"callbackUrl": callback_url})
+            results.append({"user_id": user_id, "account": acct_num, "sh_id": sh_id, "status": "updated", "callback": callback_url, "response": str(r)[:200]})
+        except Exception as e1:
+            try:
+                r2 = await call_sh("PATCH", f"/accounts/{sh_id}", body={"callbackUrl": callback_url})
+                results.append({"user_id": user_id, "account": acct_num, "sh_id": sh_id, "status": "updated_via_accounts", "callback": callback_url, "response": str(r2)[:200]})
+            except Exception as e2:
+                results.append({"user_id": user_id, "account": acct_num, "sh_id": sh_id, "status": "failed", "error": str(e2)})
+
+    return {"callback_url_used": callback_url, "total": len(results), "results": results}

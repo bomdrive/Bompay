@@ -226,7 +226,7 @@ def verify_pin_hash(pin: str, encoded_hash: str) -> bool:
 
 def create_access_token(uid: str, email: str) -> str:
     return pyjwt.encode(
-        {"sub": uid, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=12), "type": "access"},
+        {"sub": uid, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
@@ -267,7 +267,7 @@ async def get_admin_user(request: Request) -> dict:
 
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
     opts = dict(httponly=True, secure=True, samesite="none", path="/")
-    response.set_cookie("access_token", access_token, max_age=43200, **opts)
+    response.set_cookie("access_token", access_token, max_age=86400, **opts)
     response.set_cookie("refresh_token", refresh_token, max_age=604800, **opts)
 
 # ===== WALLET / LEDGER UTILS =====
@@ -1461,7 +1461,6 @@ class SetPinReq(BaseModel):
 
 class ResetPinReq(BaseModel):
     pin: str
-    password: str
 
 class VerifyPinReq(BaseModel):
     pin: str

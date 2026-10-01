@@ -184,6 +184,8 @@ async def logout(response: Response):
 @router.get("/auth/me")
 async def get_me(request: Request):
     user = await get_current_user(request)
+    if user.get("status") == "SUSPENDED":
+        raise HTTPException(403, "Account suspended. Contact support.")
     wallet = await db.wallets.find_one({"user_id": user["_id"]})
     if wallet:
         user["account_number"] = wallet.get("account_number", "")
@@ -246,7 +248,7 @@ async def refresh(request: Request, response: Response):
             raise HTTPException(401, "User not found")
         uid = str(user["_id"])
         response.set_cookie("access_token", create_access_token(uid, user["email"]),
-                           httponly=True, secure=True, samesite="none", max_age=43200, path="/")
+                           httponly=True, secure=True, samesite="none", max_age=86400, path="/")
         return {"message": "Token refreshed"}
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(401, "Refresh token expired. Please login again.")
@@ -303,16 +305,75 @@ async def reset_pin_endpoint(req: ResetPinReq, request: Request):
     if not req.pin.isdigit() or len(req.pin) != 4:
         raise HTTPException(400, "New PIN must be exactly 4 digits")
     user = await get_current_user(request)
-    user_doc = await db.users.find_one({"_id": ObjectId(user["_id"])}, {"password_hash": 1})
-    if not user_doc or not verify_password(req.password, user_doc.get("password_hash", "")):
-        raise HTTPException(401, "Password confirmation failed")
     await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
         "pin_hash": hash_pin(req.pin), "pin_failed_attempts": 0,
         "pin_locked_until": None, "pin_set_at": datetime.now(timezone.utc).isoformat()
     }})
     return {"message": "Transaction PIN updated successfully"}
 
-# ===== PHONE OTP AUTH =====
+
+@router.post("/auth/forgot-pin")
+async def forgot_pin(request: Request):
+    """Send PIN reset OTP to authenticated user's registered phone."""
+    user = await get_current_user(request)
+    phone = user.get("phone", "")
+    if not phone:
+        raise HTTPException(400, "No phone number on file for this account.")
+    # Rate limit: 1 per 60 seconds
+    recent = await db.otp_sessions.find_one({"phone": phone, "type": "PIN_RESET"})
+    if recent:
+        sent_at = recent.get("sent_at", "")
+        try:
+            sent_dt = datetime.fromisoformat(sent_at)
+            if (datetime.now(timezone.utc) - sent_dt) < timedelta(seconds=60):
+                raise HTTPException(429, "Please wait 60 seconds before requesting another code.")
+        except (ValueError, TypeError):
+            pass
+    otp_code = "".join(secrets.choice("0123456789") for _ in range(6))
+    otp_hash = hashlib.sha256(otp_code.encode()).hexdigest()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    await db.otp_sessions.delete_many({"phone": phone, "type": "PIN_RESET"})
+    await db.otp_sessions.insert_one({
+        "phone": phone, "type": "PIN_RESET", "otp_hash": otp_hash,
+        "expires_at": expires, "attempts": 0, "verified": False,
+        "sent_at": datetime.now(timezone.utc).isoformat()
+    })
+    sms_body = f"Your BOMPAY PIN reset code is: {otp_code}. Valid for 10 minutes. Do not share this code."
+    result = await _send_via_bulksms(phone, sms_body)
+    if not result.get("ok"):
+        logger.warning(f"[FORGOT-PIN] SMS failed for {phone}: {result}")
+    masked = "*" * (len(phone) - 4) + phone[-4:]
+    return {"sent": True, "message": f"PIN reset code sent to {masked}", "masked_phone": masked}
+
+
+@router.post("/auth/reset-pin-otp")
+async def reset_pin_via_otp(request: Request):
+    """Verify PIN reset OTP and clear the user's PIN so they can set a new one."""
+    user = await get_current_user(request)
+    body = await request.json()
+    otp_code = body.get("otp_code", "").strip()
+    phone = user.get("phone", "")
+    session = await db.otp_sessions.find_one({"phone": phone, "type": "PIN_RESET"})
+    if not session:
+        raise HTTPException(400, "No PIN reset requested. Please tap 'Forgot PIN?' to start.")
+    if session.get("expires_at", "") < datetime.now(timezone.utc).isoformat():
+        raise HTTPException(400, "Code expired. Please request a new one.")
+    if session.get("attempts", 0) >= 3:
+        raise HTTPException(429, "Too many failed attempts. Request a new code.")
+    entered_hash = hashlib.sha256(otp_code.encode()).hexdigest()
+    if entered_hash != session.get("otp_hash", ""):
+        await db.otp_sessions.update_one({"_id": session["_id"]}, {"$inc": {"attempts": 1}})
+        raise HTTPException(400, "Invalid code. Please try again.")
+    # Clear PIN
+    await db.users.update_one({"_id": ObjectId(user["_id"])}, {
+        "$unset": {"pin_hash": ""},
+        "$set": {"pin_failed_attempts": 0, "pin_locked_until": None}
+    })
+    await db.otp_sessions.delete_many({"phone": phone, "type": "PIN_RESET"})
+    await audit(user["_id"], "PIN_RESET_VIA_OTP", "auth", {})
+    return {"success": True, "message": "PIN cleared. Please set a new PIN in Security Settings."}
+
+
 def _normalize_phone(phone: str) -> str:
     p = phone.strip().replace(" ", "").replace("-", "")
     if p.startswith("0"):
