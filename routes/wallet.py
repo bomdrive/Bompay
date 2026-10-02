@@ -208,35 +208,44 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
     w = await db.wallets.find_one({"user_id": user["_id"]})
     if (w or {}).get("sh_account_number"):
         raise HTTPException(400, "Virtual account already created for this account.")
-    if not req.otp.strip() or not re.match(r"^\d{4,6}$", req.otp.strip()):
-        raise HTTPException(400, "OTP must be 4-6 digits")
-    # Build callback URL for Safe Haven webhooks
-    # Prefer explicit WEBHOOK_BASE_URL (set in Railway/production), then API_BASE_URL
+    if req.identity_type not in ("BVN", "NIN"):
+        raise HTTPException(400, "Identity type must be BVN or NIN")
+    if not re.match(r"^\d{11}$", req.identity_number.strip()):
+        raise HTTPException(400, f"{req.identity_type} must be exactly 11 digits")
+    # Basic date-of-birth validation (YYYY-MM-DD)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", req.date_of_birth.strip()):
+        raise HTTPException(400, "Date of birth must be in YYYY-MM-DD format")
+
     _base = (os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("API_BASE_URL") or "").rstrip("/")
     callback_url = f"{_base}/api/webhooks/safehaven"
     phone = user.get("phone", "")
     if phone and not phone.startswith("+"):
-        phone = f"+{phone}"
+        phone = "+234" + phone.lstrip("0") if phone.startswith("0") else "+" + phone
+
+    # ── BVN Indemnity flow — single step, no OTP required ──────────────────
     try:
-        r = await call_sh("POST", "/accounts/v2/subaccount", body={
+        r = await call_sh("POST", "/accounts/subaccount", body={
             "phoneNumber": phone,
             "emailAddress": user.get("email", ""),
             "externalReference": user["_id"],
             "identityType": req.identity_type,
             "identityNumber": req.identity_number.strip(),
-            "identityId": req.identity_id.strip(),
-            "otp": req.otp.strip(),
-            "callbackUrl": callback_url
+            "dateOfBirth": req.date_of_birth.strip(),
+            "booleanMatch": True,
+            "autoSweep": False,
+            "callbackUrl": callback_url,
         })
     except Exception as e:
-        raise HTTPException(400, f"Sub-account creation failed: {e}")
+        raise HTTPException(400, f"Account creation failed: {e}")
+
     data = r.get("data") or {}
-    acct_num = data.get("accountNumber")
+    acct_num  = data.get("accountNumber")
     acct_name = data.get("accountName")
-    sh_id = data.get("_id")
+    sh_id     = data.get("_id") or data.get("id") or ""
     if not acct_num:
-        msg = r.get("message") or "Account creation failed. Please verify your OTP and try again."
+        msg = r.get("message") or "Account creation failed. Check your BVN/NIN and date of birth."
         raise HTTPException(400, msg)
+
     # Update wallet with Safe Haven account details
     await db.wallets.update_one({"user_id": user["_id"]}, {"$set": {
         "sh_account_id": sh_id,
@@ -244,33 +253,36 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
         "sh_account_name": acct_name,
         "account_number": acct_num,
     }})
-    # Update user's legal name from Safe Haven KYC (BVN/NIN verified name)
-    # Safe Haven prefixes names with the institution e.g. "Bompay / Eliom Uwam" — strip prefix
+    # Update user's legal name from Safe Haven KYC
     if acct_name:
         clean_name = acct_name.strip()
         if " / " in clean_name:
             clean_name = clean_name.split(" / ", 1)[1].strip()
         parts = clean_name.split()
         if len(parts) >= 2:
-            kyc_first = parts[0].capitalize()
-            kyc_last = " ".join(parts[1:]).capitalize()
             await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
-                "first_name": kyc_first, "last_name": kyc_last, "kyc_verified_name": acct_name
+                "first_name": parts[0].capitalize(),
+                "last_name": " ".join(parts[1:]).capitalize(),
+                "kyc_verified_name": acct_name,
             }})
-    # Set KYC Tier 1 verified after virtual account creation
+    # Set KYC Tier 1
     await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
         "kyc_tier": 1, "kyc_status": "VERIFIED"
     }})
-    # Clear KYC temp fields
-    await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$unset": {
-        "kyc_identity_id": "", "kyc_identity_type": "", "kyc_identity_number": ""
-    }})
-    await notify(user["_id"], "Account Activated!", f"Your virtual account number is {acct_num}. You can now receive and send money.", "success")
+    # Persist identity_id from SH response to kyc_records for later use (business accounts)
+    if sh_id:
+        await db.kyc_records.update_one(
+            {"user_id": str(user["_id"])},
+            {"$set": {"identity_id": sh_id}},
+            upsert=True,
+        )
+    await notify(user["_id"], "Account Activated!",
+                 f"Your virtual account number is {acct_num}. You can now receive and send money.", "success")
     await audit(user["_id"], "CREATE_VIRTUAL_ACCOUNT", "wallet", {"account_number": acct_num})
     return {
         "account_number": acct_num,
         "account_name": acct_name,
-        "message": "Virtual account created successfully! Your account number is ready."
+        "message": "Virtual account created successfully! Your account number is ready.",
     }
 
 @router.get("/kyc/subaccount-balance")

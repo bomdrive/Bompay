@@ -1435,10 +1435,9 @@ class KYCInitiateReq(BaseModel):
     identity_number: str
 
 class KYCCreateAccountReq(BaseModel):
-    identity_id: str
-    otp: str
-    identity_type: str
+    identity_type: str    # BVN or NIN
     identity_number: str
+    date_of_birth: str    # YYYY-MM-DD  (indemnity flow — no OTP required)
 
 class BettingReq(BaseModel):
     platform: str
