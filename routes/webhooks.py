@@ -203,6 +203,52 @@ async def safehaven_webhook(request: Request):
                     logger.info(f"[SH-WEBHOOK] duplicate skipped session_id={session_id}")
             else:
                 logger.warning(f"[SH-WEBHOOK] ⚠️ no wallet found for creditAccountNumber={credit_acct_num!r}")
+                # ── Check if this is a business sub-account credit ─────────────
+                biz = await db.businesses.find_one(
+                    {"sh_account_number": credit_acct_num, "status": "active"}
+                )
+                if biz:
+                    biz_id = str(biz["_id"])
+                    dup = await db.transactions.find_one(
+                        {"provider_reference": session_id, "business_id": biz_id}
+                    )
+                    if not dup:
+                        amt_kobo = int(amount * 100)
+                        biz_txn_id = f"BTXN{secrets.token_hex(12).upper()}"
+                        debit_name = (data.get("debitAccountName") or data.get("senderName")
+                                      or data.get("debitName") or "External Transfer")
+                        narration = data.get("narration") or f"Transfer from {debit_name}"
+
+                        await db.transactions.insert_one({
+                            "transaction_id": biz_txn_id,
+                            "business_id": biz_id,
+                            "user_id": biz.get("owner_id", ""),
+                            "type": "WALLET_FUNDING", "direction": "CREDIT", "amount": amt_kobo,
+                            "fee": 0, "vat": 0, "currency": "NGN",
+                            "status": "COMPLETED", "provider": "SAFEHAVEN",
+                            "description": narration,
+                            "provider_reference": session_id,
+                            "metadata": {"event_type": event_type,
+                                         "debit_account": data.get("debitAccountNumber"),
+                                         "debit_name": debit_name},
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        await db.business_wallets.update_one(
+                            {"business_id": biz_id},
+                            {"$inc": {"available_balance": amt_kobo, "ledger_balance": amt_kobo}},
+                            upsert=True,
+                        )
+                        owner_id = biz.get("owner_id", "")
+                        biz_name = biz.get("name", "Your Business")
+                        if owner_id:
+                            await notify(owner_id, f"Business Credit — {biz_name}",
+                                         f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
+                        logger.info(f"[SH-WEBHOOK] ✅ business credit ₦{amount} → {biz_name} ({biz_id})")
+                    else:
+                        logger.info(f"[SH-WEBHOOK] business duplicate skipped session_id={session_id}")
+                else:
+                    logger.warning(f"[SH-WEBHOOK] ⚠️ no business found for account={credit_acct_num!r}")
         else:
             logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
                         f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")

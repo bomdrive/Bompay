@@ -300,15 +300,38 @@ async def business_wallet(business_id: str, request: Request):
     user = await get_current_user(request)
     b = await _get_business(business_id, user["_id"])
     w = await _biz_wallet(business_id)
-    sh_balance = 0.0
+    sh_balance = None
+
+    # Try by subaccount ID first
     if b.get("sh_subaccount_id"):
         try:
             r = await call_sh("GET", f"/accounts/{b['sh_subaccount_id']}")
             acc = r.get("data", r)
-            sh_balance = float(acc.get("availableBalance", acc.get("balance", 0)))
+            sh_balance = float(acc.get("availableBalance", acc.get("balance", -1)))
+            if sh_balance < 0:
+                sh_balance = None
         except Exception as e:
-            logger.warning(f"[BIZ-WALLET] SH fetch failed: {e}")
-            sh_balance = w.get("available_balance", 0) / 100
+            logger.warning(f"[BIZ-WALLET] SH fetch by id failed: {e}")
+
+    # Fallback: look up by account number
+    if sh_balance is None and b.get("sh_account_number"):
+        try:
+            r = await call_sh("GET", f"/accounts", params={"accountNumber": b["sh_account_number"]})
+            items = r.get("data", r)
+            if isinstance(items, list) and items:
+                items = items[0]
+            elif isinstance(items, dict):
+                pass
+            sh_balance = float(items.get("availableBalance", items.get("balance", -1)))
+            if sh_balance < 0:
+                sh_balance = None
+        except Exception as e:
+            logger.warning(f"[BIZ-WALLET] SH fetch by acct_num failed: {e}")
+
+    # Final fallback: use internal ledger
+    if sh_balance is None:
+        sh_balance = w.get("available_balance", 0) / 100
+
     return {
         "available_balance": sh_balance,
         "ledger_balance": w.get("ledger_balance", 0) / 100,
@@ -1286,9 +1309,14 @@ async def admin_approve_business(business_id: str, request: Request):
         raise HTTPException(502, f"Could not create Safe Haven corporate account: {e}")
 
     sh_data = sh_resp.get("data", sh_resp)
-    sh_account_id  = sh_data.get("_id") or sh_data.get("id") or sh_data.get("accountId") or ""
-    sh_account_num = sh_data.get("accountNumber") or sh_data.get("virtualAccountNumber") or ""
+    # Safe Haven may return the account ID in various fields — try them all
+    sh_account_id  = (sh_data.get("_id") or sh_data.get("id") or sh_data.get("accountId")
+                      or sh_data.get("subAccountId") or sh_data.get("subaccount_id") or "")
+    sh_account_num = (sh_data.get("accountNumber") or sh_data.get("virtualAccountNumber")
+                      or sh_data.get("account_number") or "")
     sh_bank_name   = sh_data.get("bankName") or sh_data.get("bank") or "Safe Haven MFB"
+
+    logger.info(f"[BIZ APPROVE] SH response keys: {list(sh_data.keys())} → id={sh_account_id} acct={sh_account_num}")
 
     now = now_utc()
     await db.businesses.update_one(
