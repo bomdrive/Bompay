@@ -184,10 +184,9 @@ async def create_business(req: CreateBusinessReq, request: Request):
     if count >= max_biz:
         raise HTTPException(400, f"Maximum of {max_biz} business account(s) allowed per user.")
 
-    # KYC gate — BVN verification required
-    kyc = await db.kyc_records.find_one({"user_id": uid_str})
-    identity_id = user.get("kyc_identity_id") or (kyc or {}).get("identity_id")
-    if not identity_id:
+    # KYC gate — require at least Tier 1 (BVN/NIN verified + virtual account created)
+    kyc_tier = user.get("kyc_tier", 0)
+    if kyc_tier < 1:
         raise HTTPException(400, "Please complete your personal KYC (BVN verification) before applying for a business account.")
 
     phone = req.phone.strip()
