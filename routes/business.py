@@ -184,6 +184,11 @@ async def create_business(req: CreateBusinessReq, request: Request):
     if count >= max_biz:
         raise HTTPException(400, f"Maximum of {max_biz} business account(s) allowed per user.")
 
+    # Block new application if one is already pending review
+    pending = await db.businesses.find_one({"owner_id": uid_str, "status": "pending_approval"})
+    if pending:
+        raise HTTPException(400, "You already have a business application under review. Please wait for it to be approved or rejected before applying again.")
+
     # KYC gate — require at least Tier 1 (BVN/NIN verified + virtual account created)
     kyc_tier = user.get("kyc_tier", 0)
     if kyc_tier < 1:
