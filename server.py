@@ -32,17 +32,23 @@ app = FastAPI(title="Bompay API", version="1.0.0")
 api_router = APIRouter(prefix="/api")
 
 # ===== CORS =====
-allowed_origins = [
+# EXTRA_ORIGINS: comma-separated list of additional allowed origins (set in Railway env)
+_extra = [o.strip() for o in os.environ.get("EXTRA_ORIGINS", "").split(",") if o.strip()]
+allowed_origins = list({
     FRONTEND_URL,
     "http://localhost:3000",
     "https://bompay-ledger.preview.emergentagent.com",
-]
+    "https://bompay.app",
+    "https://www.bompay.app",
+    *_extra,
+})
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Set-Cookie"],
 )
 
 @app.exception_handler(RequestValidationError)
@@ -55,14 +61,14 @@ from routes import (
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family,
+    push, epos, promotions, family, business,
 )
 
 for mod in [
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family,
+    push, epos, promotions, family, business,
 ]:
     app.include_router(mod.router, prefix="/api")
 
@@ -100,6 +106,13 @@ async def startup():
     await db.otp_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.biometric_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.webauthn_challenges.create_index("expires_at", expireAfterSeconds=0)
+
+    # Clear legacy WebAuthn credentials registered with wrong RP_ID (old Railway URL)
+    # Safe to run repeatedly — only deletes credentials tied to old RP origins
+    if os.environ.get("WEBAUTHN_CLEAR_LEGACY") == "true":
+        result = await db.webauthn_credentials.delete_many({})
+        await db.webauthn_challenges.delete_many({})
+        print(f"[startup] Cleared {result.deleted_count} legacy WebAuthn credentials")
 
     # Seed admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL})

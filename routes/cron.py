@@ -612,3 +612,266 @@ async def cron_nip_inward_balance(request: Request):
         "total_ngn": total_cost_ngn,
         "reference": sweep_ref
     }
+
+
+
+# ─── BUSINESS PAYROLL AUTO-RUN ───────────────────────────────────────────────
+@router.post("/cron/business-payroll")
+async def cron_business_payroll(request: Request):
+    """Daily 9 AM — finds all active businesses whose pay_day = today and runs payroll."""
+    from bson import ObjectId as OID
+    _verify_cron(request)
+
+    today_day = datetime.now(timezone.utc).day
+    businesses = await db.businesses.find(
+        {"status": "active", "pay_day": today_day}
+    ).to_list(None)
+
+    results = []
+
+    for b in businesses:
+        biz_id   = str(b["_id"])
+        owner_id = b["owner_id"]
+        biz_name = b["name"]
+        now      = datetime.now(timezone.utc)
+
+        active_staff = await db.business_staff.find(
+            {"business_id": biz_id, "status": "active"}
+        ).to_list(None)
+
+        if not active_staff:
+            results.append({"business": biz_name, "status": "skipped", "reason": "no active staff"})
+            continue
+
+        total_kobo = sum(s.get("net_pay", 0) for s in active_staff)
+        w = await db.business_wallets.find_one({"business_id": biz_id}) or {}
+
+        # ── Insufficient balance ──────────────────────────────────────────────
+        if w.get("available_balance", 0) < total_kobo:
+            await notify(owner_id, f"Payroll Failed — {biz_name}",
+                f"Auto-payroll failed: insufficient business balance. "
+                f"Need ₦{total_kobo/100:,.2f}. Please fund your business wallet.")
+            owner = await db.users.find_one({"_id": OID(owner_id)}) or {}
+            owner_phone = owner.get("phone", "")
+            if owner_phone:
+                op = owner_phone.strip()
+                if op.startswith("0"):   op = "+234" + op[1:]
+                elif not op.startswith("+"): op = "+234" + op
+                sms = (f"BOMPAY: Auto payroll for {biz_name} FAILED — insufficient balance. "
+                       f"Fund your business wallet to pay {len(active_staff)} staff member(s). "
+                       f"Amount needed: ₦{total_kobo/100:,.2f}.")
+                try:
+                    provider = await get_sms_provider()
+                    if provider == "BULKSMSLIVE": await _send_via_bulksms(op, sms)
+                    else:                          await _send_via_sendora(op, sms)
+                except Exception as e:
+                    logger.warning(f"[CRON-PAYROLL] SMS failed for {biz_name}: {e}")
+            results.append({"business": biz_name, "status": "failed", "reason": "insufficient_balance",
+                             "needed": total_kobo, "available": w.get("available_balance", 0)})
+            continue
+
+        # ── Run payroll with loan deductions ──────────────────────────────────
+        errors = []
+        paid   = []
+
+        for staff in active_staff:
+            net  = staff.get("net_pay", 0)
+            name = staff.get("name", "?")
+            try:
+                sw = await db.wallets.find_one({"user_id": staff.get("user_id")})
+                if not sw:
+                    errors.append(f"{name}: wallet not found"); continue
+
+                # Compute loan deductions for this staff member
+                active_loans = await db.business_staff_loans.find(
+                    {"business_id": biz_id, "staff_id": str(staff["_id"]), "status": "active"}
+                ).to_list(None)
+                loan_ded = sum(
+                    min(l.get("monthly_deduction", 0), l.get("outstanding_balance", 0))
+                    for l in active_loans
+                )
+                adj_net = max(0, net - loan_ded)
+
+                # Debit business (adj_net only), credit staff
+                await db.business_wallets.update_one(
+                    {"business_id": biz_id},
+                    {"$inc": {"available_balance": -adj_net, "ledger_balance": -adj_net}}
+                )
+                await db.wallets.update_one(
+                    {"user_id": staff.get("user_id")},
+                    {"$inc": {"available_balance": adj_net, "ledger_balance": adj_net}}
+                )
+
+                # SH transfer
+                if b.get("sh_subaccount_id") and b.get("sh_account_number") and adj_net > 0:
+                    try:
+                        pay_ref = f"SAL-AUTO-{biz_id[:6]}-{str(staff['_id'])[:6]}-{int(now.timestamp())}"
+                        await call_sh("POST", "/transfers", body={
+                            "nameEnquiryReference": "",
+                            "debitAccountNumber":   b["sh_account_number"],
+                            "beneficiaryBankCode":  SAFEHAVEN_OWN_BANK_CODE,
+                            "beneficiaryAccountNumber": sw.get("account_number", ""),
+                            "amount":     adj_net,
+                            "saveBeneficiary": False,
+                            "narration":  f"Salary — {biz_name}",
+                            "paymentReference": pay_ref,
+                        })
+                    except Exception as e:
+                        logger.warning(f"[CRON-PAYROLL] SH for {name}: {e}")
+
+                # Business transaction record
+                await db.business_transactions.insert_one({
+                    "business_id": biz_id,
+                    "type": "DEBIT",
+                    "category": "PAYROLL",
+                    "amount": adj_net,
+                    "description": f"Salary — {name}" + (f" (loan deducted ₦{loan_ded/100:,.2f})" if loan_ded else ""),
+                    "staff_id": str(staff["_id"]),
+                    "auto": True,
+                    "created_at": now,
+                })
+
+                # Process loan repayments
+                for loan in active_loans:
+                    instalment  = min(loan.get("monthly_deduction", 0), loan.get("outstanding_balance", 0))
+                    new_balance = max(0, loan.get("outstanding_balance", 0) - instalment)
+                    new_status  = "completed" if new_balance == 0 else "active"
+                    await db.business_staff_loans.update_one(
+                        {"_id": loan["_id"]},
+                        {"$set": {"outstanding_balance": new_balance, "status": new_status,
+                                  "last_deduction_at": now},
+                         "$push": {"repayments": {"amount": instalment, "date": now.isoformat(),
+                                                  "remaining": new_balance}}}
+                    )
+
+                # Notify staff (in-app)
+                await notify(staff["user_id"], "Salary Credited",
+                             f"Your salary of ₦{adj_net/100:,.2f} from {biz_name} has been credited!"
+                             + (f" Loan instalment ₦{loan_ded/100:,.2f} deducted." if loan_ded else ""))
+
+                # Notify staff (SMS)
+                staff_phone = staff.get("phone", "")
+                if staff_phone:
+                    sp = staff_phone.strip()
+                    if sp.startswith("0"):    sp = "+234" + sp[1:]
+                    elif not sp.startswith("+"): sp = "+234" + sp
+                    sms = (f"BOMPAY: Your salary of ₦{adj_net/100:,.2f} from {biz_name} has been credited!"
+                           + (f" Loan repayment ₦{loan_ded/100:,.2f} deducted." if loan_ded else ""))
+                    try:
+                        provider = await get_sms_provider()
+                        if provider == "BULKSMSLIVE": await _send_via_bulksms(sp, sms)
+                        else:                          await _send_via_sendora(sp, sms)
+                    except Exception as e:
+                        logger.warning(f"[CRON-PAYROLL] Staff SMS for {name}: {e}")
+
+                paid.append(name)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                logger.error(f"[CRON-PAYROLL] Staff {name} error: {e}")
+
+        # Record payroll run
+        await db.business_payroll.insert_one({
+            "business_id": biz_id,
+            "owner_id":    owner_id,
+            "total_amount": sum(s.get("net_pay", 0) for s in active_staff if s.get("name") in paid),
+            "staff_paid":  paid,
+            "errors":      errors,
+            "status":      "completed" if not errors else "partial",
+            "run_at":      now,
+            "auto":        True,
+        })
+
+        # Notify owner
+        msg = (f"Auto-payroll for {biz_name}: {len(paid)} staff paid, "
+               + (f"{len(errors)} error(s)." if errors else "all successful!"))
+        await notify(owner_id, f"Payroll Complete — {biz_name}", msg)
+
+        results.append({
+            "business": biz_name, "status": "done",
+            "paid": len(paid), "errors": errors,
+        })
+
+    return {"results": results, "processed": len(businesses), "pay_day": today_day}
+
+
+# ─── BUSINESS PAYROLL REMINDER ────────────────────────────────────────────────
+@router.post("/cron/business-payroll-reminder")
+async def business_payroll_reminder(request: Request):
+    """Daily — sends owner an SMS preview 2 days before payday so they can fund the account."""
+    today       = datetime.now(timezone.utc)
+    target_day  = (today + timedelta(days=2)).day
+
+    businesses = await db.businesses.find({"status": "active"}).to_list(None)
+    results    = []
+
+    for biz in businesses:
+        pay_day = biz.get("pay_day")
+        if not pay_day:
+            continue
+        try:
+            if int(pay_day) != target_day:
+                continue
+        except (ValueError, TypeError):
+            continue
+
+        biz_id   = str(biz["_id"])
+        owner_id = biz.get("owner_id", "")
+        biz_name = biz.get("name", "Your Business")
+        acct_num = biz.get("sh_account_number", "")
+
+        # Idempotency — one reminder per business per calendar month
+        month_key = f"{today.year}-{today.month:02d}"
+        if await db.business_payroll_reminders.find_one({"business_id": biz_id, "month_key": month_key}):
+            results.append({"business": biz_name, "status": "already_sent"})
+            continue
+
+        active_staff = await db.business_staff.find(
+            {"business_id": biz_id, "status": "active"}
+        ).to_list(None)
+        if not active_staff:
+            continue
+
+        total_kobo   = sum(s.get("net_pay", s.get("gross_pay", 0)) for s in active_staff)
+        staff_names  = [s.get("name", "Staff") for s in active_staff]
+        name_preview = ", ".join(staff_names[:3]) + (f" +{len(staff_names)-3} more" if len(staff_names) > 3 else "")
+
+        sms = (
+            f"BOMPAY: Payroll for {biz_name} is due in 2 days. "
+            f"{len(active_staff)} staff: {name_preview}. "
+            f"Expected total: \u20A6{total_kobo/100:,.2f}. "
+            f"Fund your account {acct_num} before payday."
+        )
+
+        # Send SMS to business owner
+        if owner_id:
+            owner = await db.users.find_one({"_id": ObjectId(owner_id)})
+            phone = (owner or {}).get("phone", "")
+            if phone:
+                p = phone.strip()
+                if p.startswith("0"):      p = "+234" + p[1:]
+                elif not p.startswith("+"): p = "+234" + p
+                try:
+                    provider = await get_sms_provider()
+                    if provider == "BULKSMSLIVE": await _send_via_bulksms(p, sms)
+                    else:                          await _send_via_sendora(p, sms)
+                except Exception as e:
+                    logger.warning(f"[PAYROLL-REMINDER] SMS failed for {biz_name}: {e}")
+
+            await notify(owner_id,
+                         f"Payroll Reminder — {biz_name}",
+                         f"Payroll due in 2 days. {len(active_staff)} staff. "
+                         f"Total: \u20A6{total_kobo/100:,.2f}. Fund your business account.")
+
+        # Record so we don't send again this month
+        await db.business_payroll_reminders.insert_one({
+            "business_id": biz_id,
+            "month_key":   month_key,
+            "sent_at":     today,
+            "staff_count": len(active_staff),
+            "total_kobo":  total_kobo,
+        })
+
+        results.append({"business": biz_name, "status": "reminder_sent",
+                         "staff": len(active_staff), "total_ngn": total_kobo / 100})
+
+    return {"results": results, "target_pay_day": target_day, "checked": len(businesses)}
