@@ -1244,24 +1244,28 @@ async def admin_approve_business(business_id: str, request: Request):
         raise HTTPException(404, "Business owner not found")
 
     kyc = await db.kyc_records.find_one({"user_id": b["owner_id"]})
-    # Prefer director_identity_id (from Director KYB), fall back to owner's KYC identity
+    # Prefer director_identity_id (from Director KYB), fall back to owner's persisted KYC identity
     identity_id = (b.get("director_identity_id")
                    or owner.get("kyc_identity_id")
                    or (kyc or {}).get("identity_id"))
-    if not identity_id:
-        raise HTTPException(400, "Owner has not completed personal KYC (BVN verification). Initiate Director KYB first.")
+
+    # Only block if a *different* director was submitted but KYB was never run for them
+    if not identity_id and not (b.get("director_is_applicant", True)):
+        raise HTTPException(400, "Director identity not verified. Use 'Initiate Director KYB' to verify the director's BVN before approving.")
 
     external_ref = b.get("external_ref") or f"bompay-biz-{b['owner_id'][:8]}-{uuid.uuid4().hex[:8]}"
     sh_payload = {
         "phoneNumber": b.get("phone", ""),
         "emailAddress": b.get("email", ""),
         "externalReference": external_ref,
-        "identityType": "vID",
-        "identityId": identity_id,
         "companyRegistrationNumber": b.get("rc_number", ""),
         "callbackUrl": f"{WEBHOOK_BASE_URL}/api/webhooks/safehaven",
         "autoSweep": False,
     }
+    # Include identity fields only when available (existing KYC-verified users may not have it stored)
+    if identity_id:
+        sh_payload["identityType"] = "vID"
+        sh_payload["identityId"] = identity_id
     try:
         sh_resp = await call_sh("POST", "/accounts/v2/subaccount/", body=sh_payload)
     except Exception as e:
