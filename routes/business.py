@@ -1175,23 +1175,36 @@ async def admin_init_director_kyb(business_id: str, request: Request):
     if not b:
         raise HTTPException(404, "Business not found")
 
+    # Parse optional body (admin may supply owner BVN when identity_id is missing)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    supplied_bvn = (body.get("bvn") or "").strip()
+
     if b.get("director_is_applicant", True):
-        # Use owner's existing verified identity (from personal KYC)
+        # Try stored identity first
         owner = await db.users.find_one({"_id": oid(b["owner_id"])})
         kyc = await db.kyc_records.find_one({"user_id": b["owner_id"]})
         identity_id = (owner or {}).get("kyc_identity_id") or (kyc or {}).get("identity_id")
-        if not identity_id:
-            raise HTTPException(400, "Business owner has not completed personal KYC (BVN verification)")
-        await db.businesses.update_one(
-            {"_id": oid(business_id)},
-            {"$set": {"director_identity_id": identity_id, "director_kyb_status": "verified", "updated_at": now_utc()}}
-        )
-        return {"message": "Director identity sourced from applicant's verified KYC", "status": "verified"}
 
-    # Different director — verify BVN with Safe Haven
-    director_bvn = b.get("director_bvn", "").strip()
-    if not director_bvn:
-        raise HTTPException(400, "Director BVN is missing from the business application")
+        if identity_id:
+            await db.businesses.update_one(
+                {"_id": oid(business_id)},
+                {"$set": {"director_identity_id": identity_id, "director_kyb_status": "verified", "updated_at": now_utc()}}
+            )
+            return {"message": "Director identity sourced from applicant's verified KYC", "status": "verified"}
+
+        # identity_id not stored — admin must supply owner's BVN
+        if not supplied_bvn:
+            raise HTTPException(400, "Owner identity not found. Please enter the owner's BVN to verify their identity.")
+
+        director_bvn = supplied_bvn
+    else:
+        # Different director — use BVN from business doc, or supplied BVN
+        director_bvn = supplied_bvn or b.get("director_bvn", "").strip()
+        if not director_bvn:
+            raise HTTPException(400, "Director BVN is missing from the business application")
 
     settings = await db.provider_settings.find_one({"provider": "safehaven"})
     platform_acct = (settings or {}).get("account_number", "").strip()
