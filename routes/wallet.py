@@ -75,16 +75,27 @@ async def get_wallet_balance(request: Request):
     user = await get_current_user(request)
     w = await get_wallet(user["_id"])
     is_admin = user.get("role") == "admin"
+
+    # ── PRIMARY: Live Safe Haven balance ──────────────────────────────────────
+    sh_id = w.get("sh_account_id")
+    sh_balance_ngn = w["available_balance"] / 100  # fallback (shadow)
+    if sh_id:
+        try:
+            sh_balance_ngn = await get_sh_subaccount_balance(sh_id)
+        except Exception as e:
+            logger.warning(f"[Wallet] SH balance fetch failed for {user['_id']}: {e}")
+            # Serve shadow balance if SH is unreachable
+
     return {
         "account_number": w.get("sh_account_number") or w["account_number"],
         "account_name": w.get("sh_account_name") or f"{user.get('first_name','')} {user.get('last_name','')}".strip().upper(),
         "has_virtual_account": is_admin or bool(w.get("sh_account_number")),
         "sh_account_id": w.get("sh_account_id"),
-        "available_balance": w["available_balance"] / 100,
-        "ledger_balance": w["ledger_balance"] / 100,
-        "pending_balance": w["pending_balance"] / 100,
-        "held_balance": w["held_balance"] / 100,
-        "currency": "NGN", "status": w["status"], "tier": w["tier"]
+        "available_balance": sh_balance_ngn,          # Live SH balance (Naira)
+        "ledger_balance":    sh_balance_ngn,           # Mirror for UI consistency
+        "pending_balance":   w["pending_balance"] / 100,
+        "held_balance":      w["held_balance"] / 100,
+        "currency": "NGN", "status": w["status"], "tier": w["tier"],
     }
 
 @router.post("/wallet/fund")
