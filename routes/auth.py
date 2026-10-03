@@ -1082,14 +1082,6 @@ async def delete_passkey(credential_id: str, request: Request):
         raise HTTPException(404, "Passkey not found")
     return {"message": "Biometric removed"}
 
-async def get_sh_subaccount_balance(account_id: str) -> float:
-    """Fetch the live Safe Haven sub-account balance."""
-    try:
-        r = await call_sh("GET", f"/accounts/{account_id}")
-        return float((r.get("data") or {}).get("accountBalance", 0))
-    except Exception:
-        return 0.0
-
 async def require_virtual_account(user: dict):
     """Raise 403 if user hasn't created their Safe Haven virtual account yet."""
     if user.get("role") == "admin":

@@ -608,8 +608,8 @@ async def mock_sh(path: str, body: dict = None) -> dict:
     # Get sub-account balance
     if path.startswith("/accounts/") and len(path.split("/")) == 3:
         return {"statusCode": 200, "data": {
-            "accountBalance": 0, "bookBalance": 0, "accountNumber": "0000000000",
-            "status": "Active", "canDebit": True, "canCredit": True
+            "availableBalance": 0, "accountBalance": 0, "bookBalance": 0,
+            "accountNumber": "0000000000", "status": "Active", "canDebit": True, "canCredit": True
         }}
     return {"statusCode": 200, "data": {}}
 
@@ -1852,12 +1852,14 @@ def _parse_auth_credential(data: dict) -> AuthenticationCredential:
 
 
 async def get_sh_subaccount_balance(account_id: str) -> float:
-    """Fetch the live Safe Haven sub-account balance."""
-    try:
-        r = await call_sh("GET", f"/accounts/{account_id}")
-        return float((r.get("data") or {}).get("accountBalance", 0))
-    except Exception:
-        return 0.0
+    """Fetch the live Safe Haven sub-account balance (availableBalance is the spendable amount).
+    Raises on failure so callers can choose their own fallback."""
+    r = await call_sh("GET", f"/accounts/{account_id}")
+    # SH response may be wrapped in {"data": {...}} or flat
+    data = r.get("data") or r
+    # Safe Haven returns accountBalance (spendable); availableBalance is also checked
+    bal = data.get("availableBalance") or data.get("accountBalance") or data.get("bookBalance") or 0
+    return float(bal)
 
 async def require_virtual_account(user: dict):
     """Raise 403 if user hasn't created their Safe Haven virtual account yet."""
