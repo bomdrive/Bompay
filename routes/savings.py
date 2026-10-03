@@ -236,12 +236,13 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
     progress = (new_amt / target * 100) if target > 0 else 0
     await notify(user["_id"], "Savings Updated",
                  f"₦{req.amount:,.2f} added to '{goal['name']}'. Progress: {progress:.1f}%", "success")
-    w_after = await get_wallet(user["_id"])
+    # Use live SH balance for notification (balance after contribution)
+    sh_bal_after = sh_bal_ngn - req.amount
     asyncio.create_task(send_event_notification(user["_id"], "SAVINGS_DEBIT", {
-        "amount": req.amount, "goal": goal["name"], "balance": w_after["available_balance"] / 100
+        "amount": req.amount, "goal": goal["name"], "balance": sh_bal_after
     }))
     asyncio.create_task(send_event_sms(user["_id"], "SAVINGS_DEBIT", {
-        "amount": req.amount, "goal": goal["name"], "balance": w_after["available_balance"] / 100
+        "amount": req.amount, "goal": goal["name"], "balance": sh_bal_after
     }))
     return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount,
             "new_total": new_amt, "progress": round(progress, 1)}
