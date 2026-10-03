@@ -177,66 +177,56 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
     if await db.transactions.find_one({"idempotency_key": idem}):
         raise HTTPException(409, "Duplicate contribution detected. Please wait before retrying.")
 
-    # ─── Dual balance check: BOMPAY wallet AND Safe Haven ───
-    wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
-    if not wallet_doc or wallet_doc.get("available_balance", 0) < amt:
-        raise HTTPException(400, f"Insufficient BOMPAY wallet balance. Required: ₦{req.amount:,.2f}")
-    # Check SH balance if SH account linked
-    sh_acct = wallet_doc.get("sh_account_number")
-    if sh_acct:
-        try:
-            sh_bal_resp = await call_sh("GET", f"/accounts/{wallet_doc.get('sh_account_id', sh_acct)}/balance")
-            sh_bal = sh_bal_resp.get("data", {}).get("availableBalance", sh_bal_resp.get("availableBalance", None))
-            if sh_bal is not None and float(sh_bal) * 100 < amt:
-                raise HTTPException(400, f"Insufficient balance. Available: ₦{float(sh_bal):,.2f}, Required: ₦{req.amount:,.2f}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[Savings] SH balance check skipped: {e}")
-
-    # ─── Atomic wallet debit (prevents race conditions) ───
-    updated_w = await db.wallets.find_one_and_update(
-        {"user_id": user["_id"], "available_balance": {"$gte": amt}},
-        {"$inc": {"available_balance": -amt, "ledger_balance": -amt}},
-        return_document=True
-    )
-    if not updated_w:
-        raise HTTPException(400, "Insufficient balance (concurrent deduction detected)")
-
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
+
+    # ── PRIMARY: Live SH balance check ──────────────────────────────────────
+    wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+    sh_id   = (wallet_doc or {}).get("sh_account_id", "")
+    sh_acct = (wallet_doc or {}).get("sh_account_number", "")
+    if not sh_id or not sh_acct:
+        raise HTTPException(400, "Safe Haven account not configured. Please complete KYC.")
+    sh_balance = await call_sh("GET", f"/accounts/{sh_id}")
+    sh_bal_ngn = float(sh_balance.get("data", sh_balance).get("availableBalance",
+                  sh_balance.get("data", sh_balance).get("accountBalance", 0)) or 0)
+    if sh_bal_ngn * 100 < amt:
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal_ngn:,.2f}")
+
+    # ── PRIMARY: SH transfer — user → SAVINGS bucket (blocking) ─────────────
+    svc_acct  = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
+    sh_dest   = (svc_acct or {}).get("sh_account_number", "")
+    if not sh_dest:
+        savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+        sh_dest = (savings_acct or {}).get("sh_account_number", "")
+    if not sh_dest:
+        raise HTTPException(503,
+            "Savings service account not configured. Please contact support or configure "
+            "it in Admin → Service Accounts.")
+    try:
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber":       sh_acct,
+            "beneficiaryBankCode":      SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": sh_dest,
+            "amount": req.amount, "saveBeneficiary": False,
+            "narration": f"BOMPAY savings {goal['name'][:20]}",
+            "paymentReference": txn_id,
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Payment failed. Please try again. ({e})")
+    # SHADOW: BOMPAY wallet mirror
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": user["_id"]},
+        {"$inc": {"available_balance": -amt, "ledger_balance": -amt}},
+    ))
+
     await db.transactions.insert_one({
         "transaction_id": txn_id, "idempotency_key": idem, "user_id": user["_id"],
         "type": "SAVINGS_CONTRIBUTION", "direction": "DEBIT",
         "amount": amt, "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
-        "provider": "INTERNAL", "description": f"Savings: {goal['name']}",
+        "provider": "SAFEHAVEN", "description": f"Savings: {goal['name']}",
         "metadata": {"goal_id": goal_id}, "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     })
     await db.savings_goals.update_one({"goal_id": goal_id}, {"$inc": {"current_amount": amt}})
-
-    # ─── SH sweep: user SH → configured SAVINGS service account (best-effort) ───
-    # Priority: service_bucket_accounts.SAVINGS → charge_accounts.SAVINGS_PROCEEDS
-    try:
-        svc_acct = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
-        if svc_acct:
-            sh_dest = svc_acct.get("sh_account_number", "")
-        else:
-            savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
-            sh_dest = (savings_acct or {}).get("sh_account_number", "")
-        if sh_acct and sh_dest:
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber": sh_acct,
-                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": sh_dest,
-                "amount": req.amount, "saveBeneficiary": False,
-                "narration": f"BOMPAY savings {goal['name'][:20]}",
-                "paymentReference": txn_id
-            })
-            logger.info(f"[Savings] SH sweep OK: ₦{req.amount} user→savings account={sh_dest}")
-        else:
-            logger.warning(f"[Savings] No SH destination configured for SAVINGS bucket — wallet debited only")
-    except Exception as e:
-        logger.warning(f"[Savings] SH sweep failed (wallet already debited): {e}")
 
     new_amt = (goal.get("current_amount", 0) + amt) / 100
     target = goal.get("target_amount", 0) / 100
@@ -291,33 +281,34 @@ async def delete_savings(goal_id: str, request: Request):
         payout_kobo = current_kobo + interest_kobo
 
     if payout_kobo > 0:
-        # Atomic credit to wallet
-        await db.wallets.update_one({"user_id": user["_id"]},
-            {"$inc": {"available_balance": payout_kobo, "ledger_balance": payout_kobo}})
-        # SH reverse sweep: SAVINGS service account → user SH account (best-effort)
+        # ── PRIMARY: SH reverse sweep — SAVINGS bucket → user SH (blocking) ─
+        svc_acct = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
+        sh_src = (svc_acct or {}).get("sh_account_number", "")
+        if not sh_src:
+            savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+            sh_src = (savings_acct or {}).get("sh_account_number", "")
+        if not sh_src:
+            raise HTTPException(503,
+                "Savings service account not configured. Please contact support or configure "
+                "it in Admin → Service Accounts.")
+        wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+        user_sh = (wallet_doc or {}).get("sh_account_number", "")
+        if not user_sh:
+            raise HTTPException(400, "Your Safe Haven account not found. Please complete KYC.")
         try:
-            svc_acct = await db.service_bucket_accounts.find_one({"service": "SAVINGS", "is_active": True})
-            if svc_acct:
-                sh_src = svc_acct.get("sh_account_number", "")
-            else:
-                savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
-                sh_src = (savings_acct or {}).get("sh_account_number", "")
-            wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
-            user_sh = (wallet_doc or {}).get("sh_account_number", "")
-            if sh_src and user_sh:
-                await call_sh("POST", "/transfers", body={
-                    "debitAccountNumber": sh_src,
-                    "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                    "beneficiaryAccountNumber": user_sh,
-                    "amount": payout_kobo / 100, "saveBeneficiary": False,
-                    "narration": f"BOMPAY savings withdrawal {goal['name'][:20]}",
-                    "paymentReference": f"TXN{secrets.token_hex(12).upper()}"
-                })
-                logger.info(f"[Savings] SH reverse sweep OK: ₦{payout_kobo/100} savings→user")
-            else:
-                logger.warning(f"[Savings] No SH source configured for SAVINGS bucket — wallet credited only")
+            await call_sh("POST", "/transfers", body={
+                "debitAccountNumber": sh_src,
+                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                "beneficiaryAccountNumber": user_sh,
+                "amount": payout_kobo / 100, "saveBeneficiary": False,
+                "narration": f"BOMPAY savings withdrawal {goal['name'][:20]}",
+                "paymentReference": f"TXN{secrets.token_hex(12).upper()}"
+            })
         except Exception as e:
-            logger.warning(f"[Savings] SH withdrawal sweep failed: {e}")
+            raise HTTPException(502, f"Withdrawal failed. Please try again. ({e})")
+        # SHADOW: BOMPAY wallet mirror (single update only)
+        asyncio.create_task(db.wallets.update_one({"user_id": user["_id"]},
+            {"$inc": {"available_balance": payout_kobo, "ledger_balance": payout_kobo}}))
 
         await notify(user["_id"], "Savings Withdrawn",
                      f"₦{payout_kobo/100:,.2f} returned to wallet.", "info")

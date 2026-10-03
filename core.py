@@ -2263,46 +2263,99 @@ async def _sh_vas_sweep(user_id: str, amount_kobo: int, txn_id: str, narration: 
 
 
 async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, desc: str, meta: dict):
+    """
+    PRIMARY FLOW — Safe Haven is the gate.
+    1. Check SH balance (live).
+    2. SH internal transfer: user SH → VAS bucket  (BLOCKING).
+    3. Record transaction.
+    4. Update BOMPAY wallet shadow (fire-and-forget).
+    """
     existing = await db.transactions.find_one({"idempotency_key": idem})
     if existing:
         return existing["transaction_id"], True
-    w = await get_wallet(user_id)
-    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ─────
-    if w["available_balance"] < amount_kobo:
-        raise HTTPException(400, "Insufficient funds")
+
     wallet_doc = await db.wallets.find_one({"user_id": user_id})
-    sh_id = (wallet_doc or {}).get("sh_account_id", "")
-    if sh_id:
-        try:
-            sh_balance = await get_sh_subaccount_balance(sh_id)
-            if sh_balance * 100 < amount_kobo:
-                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[VAS] SH balance check failed (non-fatal): {e}")
-    # ────────────────────────────────────────────────────────────────────────
-    bal_before = w["available_balance"]
+    if not wallet_doc:
+        raise HTTPException(400, "Wallet not found")
+
+    sh_id        = (wallet_doc or {}).get("sh_account_id", "")
+    user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                    or (wallet_doc or {}).get("account_number", ""))
+
+    if not sh_id or not user_sh_acct:
+        raise HTTPException(400, "Safe Haven account not found. Please complete account setup.")
+
+    # ── PRIMARY: Live SH balance check ───────────────────────────────────────
+    amount_ngn = amount_kobo / 100
+    sh_balance = await get_sh_subaccount_balance(sh_id)
+    if sh_balance < amount_ngn:
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}")
+
+    # ── VAS service bucket account ────────────────────────────────────────────
+    vas_bucket = await get_service_bucket_account("VAS")
+    if not vas_bucket:
+        vas_acct_doc = await db.charge_accounts.find_one({"category": "VAS_FEES"})
+        vas_bucket = (vas_acct_doc or {}).get("sh_account_number", "")
+    if not vas_bucket:
+        raise HTTPException(503,
+            "VAS service account not configured. Please contact support or configure "
+            "it in Admin → Service Accounts.")
+
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
+
+    # ── PRIMARY: SH internal transfer (blocking) ──────────────────────────────
+    try:
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber":    user_sh_acct,
+            "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": vas_bucket,
+            "amount":            amount_ngn,
+            "saveBeneficiary":   False,
+            "narration":         f"BOMPAY {txn_type}",
+            "paymentReference":  f"VAS_{txn_id}",
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Payment failed — please try again. ({e})")
+
+    # ── Record transaction ────────────────────────────────────────────────────
+    bal_before_kobo = int(sh_balance * 100)
     await db.transactions.insert_one({
         "transaction_id": txn_id, "idempotency_key": idem, "user_id": user_id,
         "type": txn_type, "direction": "DEBIT", "amount": amount_kobo, "fee": 0,
         "vat": 0, "currency": "NGN", "status": "PROCESSING", "provider": "SAFEHAVEN",
         "description": desc, "metadata": meta,
-        "balance_before_kobo": bal_before,
-        "balance_after_kobo": bal_before - amount_kobo,
+        "balance_before_kobo": bal_before_kobo,
+        "balance_after_kobo":  bal_before_kobo - amount_kobo,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     })
-    updated = await db.wallets.find_one_and_update(
-        {"user_id": user_id, "available_balance": {"$gte": amount_kobo}},
-        {"$inc": {"available_balance": -amount_kobo, "ledger_balance": -amount_kobo}},
-        return_document=True
-    )
-    if not updated:
-        await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
-        raise HTTPException(400, "Insufficient funds")
+
+    # ── SHADOW: Update BOMPAY wallet (fire-and-forget, not the gate) ──────────
+    asyncio.create_task(_shadow_wallet_debit(user_id, amount_kobo))
+
     return txn_id, False
+
+
+async def _shadow_wallet_debit(user_id: str, amount_kobo: int):
+    """Mirror a debit on the BOMPAY wallet shadow — never blocks the caller."""
+    try:
+        await db.wallets.update_one(
+            {"user_id": user_id},
+            {"$inc": {"available_balance": -amount_kobo, "ledger_balance": -amount_kobo}},
+        )
+    except Exception as e:
+        logger.warning(f"[Shadow] wallet debit mirror failed for {user_id}: {e}")
+
+
+async def _shadow_wallet_credit(user_id: str, amount_kobo: int):
+    """Mirror a credit on the BOMPAY wallet shadow — never blocks the caller."""
+    try:
+        await db.wallets.update_one(
+            {"user_id": user_id},
+            {"$inc": {"available_balance": amount_kobo, "ledger_balance": amount_kobo}},
+        )
+    except Exception as e:
+        logger.warning(f"[Shadow] wallet credit mirror failed for {user_id}: {e}")
 
 
 async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
@@ -2316,17 +2369,48 @@ async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
     if points > 0:
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$inc": {"reward_points": points}})
     await notify(user_id, notif_title, notif_msg, "success")
-    asyncio.create_task(_sh_vas_sweep(user_id, amount_kobo, txn_id, notif_title))
+    # SH debit already done in vas_debit — no sweep needed here
     if sms_event_type:
+        sh_bal = -1.0
+        try:
+            wd = await db.wallets.find_one({"user_id": user_id})
+            if wd and wd.get("sh_account_id"):
+                sh_bal = await get_sh_subaccount_balance(wd["sh_account_id"])
+        except Exception:
+            pass
         meta = dict(sms_meta or {})
-        meta.setdefault("balance", w.get("available_balance", 0) / 100)
+        meta.setdefault("balance", sh_bal if sh_bal >= 0 else w.get("available_balance", 0) / 100)
         asyncio.create_task(send_event_sms(user_id, sms_event_type, meta))
 
 
 async def vas_refund(user_id: str, txn_id: str, amount_kobo: int, title: str):
-    await db.wallets.update_one({"user_id": user_id},
-        {"$inc": {"available_balance": amount_kobo, "ledger_balance": amount_kobo}})
+    """Refund a failed VAS payment: credit SH back to user (primary) + BOMPAY wallet shadow."""
     await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
+    # PRIMARY: SH refund — VAS bucket → user SH
+    try:
+        wallet_doc = await db.wallets.find_one({"user_id": user_id})
+        user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                        or (wallet_doc or {}).get("account_number", ""))
+        vas_bucket = await get_service_bucket_account("VAS")
+        if not vas_bucket:
+            vas_acct_doc = await db.charge_accounts.find_one({"category": "VAS_FEES"})
+            vas_bucket = (vas_acct_doc or {}).get("sh_account_number", "")
+        if vas_bucket and user_sh_acct:
+            await call_sh("POST", "/transfers", body={
+                "debitAccountNumber":    vas_bucket,
+                "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
+                "beneficiaryAccountNumber": user_sh_acct,
+                "amount":           amount_kobo / 100,
+                "saveBeneficiary":  False,
+                "narration":        f"VAS refund {txn_id[:20]}",
+                "paymentReference": f"REF_{txn_id}",
+            })
+        else:
+            logger.warning(f"[VAS Refund] No VAS bucket or user SH — SH refund skipped for {txn_id}")
+    except Exception as e:
+        logger.warning(f"[VAS Refund] SH refund failed for txn={txn_id}: {e}")
+    # SHADOW: BOMPAY wallet mirror
+    asyncio.create_task(_shadow_wallet_credit(user_id, amount_kobo))
     await notify(user_id, title, "Payment failed. Funds reversed.", "error")
 
 

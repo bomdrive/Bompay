@@ -36,6 +36,8 @@ from core import (
     get_sms_provider,
     _send_via_bulksms,
     _send_via_sendora,
+    call_sh,
+    SAFEHAVEN_OWN_BANK_CODE,
 )
 
 router = APIRouter()
@@ -267,14 +269,18 @@ async def fund_family_wallet(family_id: str, req: FundFamilyReq, request: Reques
             f"Safe Haven balance insufficient. Available: ₦{sh_bal:,.2f}. "
             "Both your BOMPAY wallet and Safe Haven account must have equivalent funds.")
 
-    # Debit owner's available_balance (ring-fence — ledger_balance unchanged, SH not touched yet)
-    wallet = await db.wallets.find_one_and_update(
+    txn_id = f"FAM{secrets.token_hex(10).upper()}"
+
+    # PRIMARY: Ring-fence from BOMPAY wallet only.
+    # SH mirror check above verifies funds exist. SH is NOT debited here —
+    # it will be debited naturally when family members make actual purchases.
+    updated_w = await db.wallets.find_one_and_update(
         {"user_id": uid, "available_balance": {"$gte": amount_kobo}},
         {"$inc": {"available_balance": -amount_kobo}},
         return_document=True,
     )
-    if not wallet:
-        raise HTTPException(400, f"Insufficient balance. You need ₦{req.amount:,.2f} to fund the Family Wallet.")
+    if not updated_w:
+        raise HTTPException(400, f"Insufficient balance. You need ₦{req.amount:,.2f}")
 
     # Credit family wallet
     await db.family_groups.update_one(
@@ -283,7 +289,6 @@ async def fund_family_wallet(family_id: str, req: FundFamilyReq, request: Reques
          "$set": {"updated_at": _now()}},
     )
 
-    txn_id = f"FAM{secrets.token_hex(10).upper()}"
     await _ledger(family_id, None, "OWNER_FUND", amount_kobo,
                   f"₦{req.amount:,.2f} allocated to Family Wallet", txn_id)
 
@@ -346,6 +351,9 @@ async def withdraw_family_wallet(family_id: str, req: WithdrawFamilyReq, request
             f"Safe Haven balance insufficient. Available: ₦{sh_bal:,.2f}. "
             "Wallet and Safe Haven must be equivalent.")
 
+    # PRIMARY: Return funds to BOMPAY wallet only.
+    # SH mirror check above verifies balance consistency.
+    # SH is NOT moved here — family funds are ring-fenced from BOMPAY wallet.
     await db.family_groups.update_one(
         {"family_id": family_id},
         {"$inc": {"allocated_kobo": -amount_kobo, "available_kobo": -amount_kobo},

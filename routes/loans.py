@@ -60,7 +60,7 @@ from core import (  # noqa: F401,F403,F405
 )
 from core import (  # noqa: F401
     LoanReq, LoanRepayReq, verify_transaction_pin, get_loan_config,
-    _credit_cashback_bg, _check_referral_bg,
+    _credit_cashback_bg, _check_referral_bg, get_sh_subaccount_balance,
 )
 import ledger as pg_ledger
 
@@ -136,32 +136,39 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
     repay_amount = min(req.amount, outstanding)
     amt_kobo = int(round(repay_amount * 100))
 
-    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ──────
+    # ── PRIMARY: Live SH balance check ──────────────────────────────────────
     pre_w = await db.wallets.find_one({"user_id": user["_id"]})
-    if not pre_w or pre_w.get("available_balance", 0) < amt_kobo:
-        raise HTTPException(400, f"Insufficient wallet balance. Required: ₦{repay_amount:,.2f}")
-    sh_id = pre_w.get("sh_account_id", "")
-    if sh_id:
-        try:
-            from core import get_sh_subaccount_balance
-            sh_bal = await get_sh_subaccount_balance(sh_id)
-            if sh_bal * 100 < amt_kobo:
-                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[Loans] SH balance check failed (non-fatal): {e}")
-    # ─────────────────────────────────────────────────────────────────────────
+    sh_id   = (pre_w or {}).get("sh_account_id", "")
+    sh_acct = (pre_w or {}).get("sh_account_number", "")
+    if not sh_id or not sh_acct:
+        raise HTTPException(400, "Safe Haven account not configured. Please complete KYC.")
+    sh_bal = await get_sh_subaccount_balance(sh_id)
+    if sh_bal * 100 < amt_kobo:
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}")
 
-    # Atomic wallet debit
-    updated_wallet = await db.wallets.find_one_and_update(
-        {"user_id": user["_id"], "available_balance": {"$gte": amt_kobo}},
+    # ── PRIMARY: SH transfer — user → LOANS bucket (blocking) ──────────────
+    sh_repay_dest = await get_service_bucket_account("LOANS", "LOAN_REPAYMENTS")
+    txn_id = f"TXN{secrets.token_hex(12).upper()}"
+    if not sh_repay_dest:
+        raise HTTPException(503,
+            "Loans service account not configured. Please contact support or configure "
+            "it in Admin → Service Accounts.")
+    try:
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber": sh_acct,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": sh_repay_dest,
+            "amount": repay_amount,
+            "saveBeneficiary": False,
+            "narration": f"BOMPAY loan repayment {loan_id[:8]}",
+            "paymentReference": txn_id,
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Payment failed. Please try again. ({e})")
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": user["_id"]},
         {"$inc": {"available_balance": -amt_kobo, "ledger_balance": -amt_kobo}},
-        return_document=True
-    )
-    if not updated_wallet:
-        w = await get_wallet(user["_id"])
-        raise HTTPException(400, f"Insufficient wallet balance. Available: ₦{(w['available_balance']/100):,.2f}, Required: ₦{repay_amount:,.2f}")
+    ))
     # Update loan record
     new_amount_repaid = round(amount_repaid + repay_amount, 2)
     new_outstanding = round(total_repayment - new_amount_repaid, 2)
@@ -174,7 +181,6 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
         sched_update[f"repayment_schedule.{paid_idx}.status"] = "PAID"
         sched_update[f"repayment_schedule.{paid_idx}.paid_at"] = datetime.now(timezone.utc).isoformat()
         sched_update[f"repayment_schedule.{paid_idx}.paid_amount"] = repay_amount
-
     loan_update: dict = {
         "amount_repaid": new_amount_repaid,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -185,41 +191,17 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
         loan_update["repaid_at"] = datetime.now(timezone.utc).isoformat()
     await db.loan_applications.update_one({"loan_id": loan_id}, {"$set": loan_update})
     # Record transaction
-    txn_id = f"TXN{secrets.token_hex(12).upper()}"
     await db.transactions.insert_one({
         "transaction_id": txn_id, "user_id": user["_id"],
         "type": "LOAN_REPAYMENT", "direction": "DEBIT",
         "amount": amt_kobo, "fee": 0, "vat": 0, "currency": "NGN",
-        "status": "COMPLETED", "provider": "INTERNAL",
+        "status": "COMPLETED", "provider": "SAFEHAVEN",
         "description": f"Loan repayment — ₦{repay_amount:,.2f}",
-        "metadata": {
-            "loan_id": loan_id,
-            "outstanding_before": outstanding,
-            "outstanding_after": max(0.0, new_outstanding),
-            "fully_repaid": is_fully_repaid
-        },
+        "metadata": {"loan_id": loan_id, "outstanding_before": outstanding,
+                     "outstanding_after": max(0.0, new_outstanding), "fully_repaid": is_fully_repaid},
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     })
-    # Try to sweep to LOANS service bucket → falls back to LOAN_REPAYMENTS charge account (best-effort)
-    try:
-        sh_repay_dest = await get_service_bucket_account("LOANS", "LOAN_REPAYMENTS")
-        sender_w = await db.wallets.find_one({"user_id": user["_id"]})
-        if sh_repay_dest and sender_w and sender_w.get("sh_account_number"):
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber": sender_w["sh_account_number"],
-                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": sh_repay_dest,
-                "amount": repay_amount,
-                "saveBeneficiary": False,
-                "narration": f"BOMPAY loan repayment {loan_id[:8]}",
-                "paymentReference": txn_id
-            })
-        else:
-            logger.info(f"[Loans] No LOANS SH bucket configured — repayment tracked internally only")
-    except Exception as e:
-        logger.warning(f"[Loans] LOANS SH repayment sweep failed (non-fatal): {e}")
-    # Notify
     msg = "Loan fully repaid! Congratulations!" if is_fully_repaid else f"₦{repay_amount:,.2f} repaid. Outstanding: ₦{max(0.0, new_outstanding):,.2f}"
     await notify(user["_id"], "Loan Repayment", msg, "success")
     asyncio.create_task(send_event_notification(user["_id"], "LOAN_REPAYMENT", {

@@ -362,45 +362,47 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
         fee_kobo = int(fee_value * 100)
     total_debit = amt + fee_kobo
 
-    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ──────
+    # ── PRIMARY: Live SH balance check ──────────────────────────────────────
     pre_wallet = await db.wallets.find_one({"user_id": user["_id"]})
-    if not pre_wallet or pre_wallet.get("available_balance", 0) < total_debit:
-        raise HTTPException(400,
-            f"Insufficient balance. You need ₦{total_debit/100:,.2f} "
-            f"(₦{group['contribution_amount']:,.2f} contribution + ₦{fee_kobo/100:,.2f} fee)"
-        )
-    sh_id = pre_wallet.get("sh_account_id", "")
-    if sh_id:
-        try:
-            sh_bal = await get_sh_subaccount_balance(sh_id)
-            if sh_bal * 100 < total_debit:
-                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[Ajo] SH balance check failed (non-fatal): {e}")
-    # ─────────────────────────────────────────────────────────────────────────
-    # Atomic wallet deduction
-    wallet = await db.wallets.find_one_and_update(
-        {"user_id": user["_id"], "available_balance": {"$gte": total_debit}},
-        {"$inc": {"available_balance": -total_debit, "ledger_balance": -total_debit}},
-        return_document=True
-    )
-    if not wallet:
-        contrib_ngn = group["contribution_amount"]
-        fee_ngn = fee_kobo / 100
-        total_ngn = total_debit / 100
-        raise HTTPException(400,
-            f"Insufficient balance. You need ₦{total_ngn:,.2f} "
-            f"(₦{contrib_ngn:,.2f} contribution + ₦{fee_ngn:,.2f} fee)"
-        )
+    sh_id   = (pre_wallet or {}).get("sh_account_id", "")
+    user_sh = (pre_wallet or {}).get("sh_account_number", "")
+    if not sh_id or not user_sh:
+        raise HTTPException(400, "Safe Haven account not configured. Please complete KYC.")
+    sh_bal = await get_sh_subaccount_balance(sh_id)
+    if sh_bal * 100 < total_debit:
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}. Need ₦{total_debit/100:,.2f}")
+
+    # ── PRIMARY: SH transfer — user → AJO bucket (blocking) ─────────────────
+    sh_ajo_acct = await get_service_bucket_account("AJO")
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
+    if not sh_ajo_acct:
+        raise HTTPException(503,
+            "Ajo service account not configured. Please contact support or configure "
+            "it in Admin → Service Accounts.")
+    try:
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber": user_sh,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": sh_ajo_acct,
+            "amount": total_debit / 100,
+            "saveBeneficiary": False,
+            "narration": f"Ajo contribution — {group['name'][:25]}",
+            "paymentReference": txn_id,
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Payment failed. Please try again. ({e})")
+    wallet = pre_wallet
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": user["_id"]},
+        {"$inc": {"available_balance": -total_debit, "ledger_balance": -total_debit}},
+    ))
+
     now_iso = datetime.now(timezone.utc).isoformat()
     await db.transactions.insert_one({
         "transaction_id": txn_id, "user_id": user["_id"],
         "type": "AJO_CONTRIBUTION", "direction": "DEBIT",
         "amount": amt, "fee": fee_kobo, "vat": 0,
-        "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
+        "currency": "NGN", "status": "COMPLETED", "provider": "SAFEHAVEN",
         "description": f"Ajo contribution — {group['name']}",
         "metadata": {
             "group_id": group_id, "period_index": period_idx,
@@ -426,26 +428,6 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
     # Reset consecutive default days
     await db.ajo_members.update_one({"group_id": group_id, "user_id": user["_id"]},
                                     {"$set": {"consecutive_default_days": 0}})
-    # SH sweep of contribution amount → AJO service bucket (best-effort)
-    try:
-        sh_ajo_acct = await get_service_bucket_account("AJO")
-        if not sh_ajo_acct:
-            savings_cfg = await db.config.find_one({"key": "savings_config"})
-            sh_ajo_acct = (savings_cfg or {}).get("value", {}).get("savings_sh_account", "")
-        user_sh = (wallet or {}).get("sh_account_number", "")
-        if sh_ajo_acct and user_sh:
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber": user_sh,
-                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": sh_ajo_acct,
-                "amount": group["contribution_amount"], "saveBeneficiary": False,
-                "narration": f"Ajo contribution — {group['name']}",
-                "paymentReference": txn_id
-            })
-        else:
-            logger.info(f"[Ajo] No AJO SH bucket configured — contribution tracked internally only")
-    except Exception as e:
-        logger.warning(f"[Ajo] SH contribution sweep failed for {txn_id}: {e}")
     # ── Sweep contribution fee to AJO_CONTRIBUTION_FEES charge account (best-effort) ──
     if fee_kobo > 0:
         asyncio.create_task(_sweep_ajo_contribution_fee(txn_id, user_sh, fee_kobo, group["name"]))
@@ -602,13 +584,35 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
         raise HTTPException(404, "Group not found")
     amt = int(payout["amount"] * 100)
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
+
+    # ── PRIMARY: SH payout — AJO bucket → user SH (blocking, before any DB write) ──
+    sh_ajo_src = await get_service_bucket_account("AJO")
+    if not sh_ajo_src:
+        raise HTTPException(503,
+            "Ajo service account not configured. Please contact support or configure "
+            "it in Admin → Service Accounts.")
+    user_wallet = await db.wallets.find_one({"user_id": user["_id"]})
+    user_sh = (user_wallet or {}).get("sh_account_number", "")
+    if not user_sh:
+        raise HTTPException(400, "Your Safe Haven account not found. Please complete KYC.")
+    try:
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber": sh_ajo_src,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": user_sh,
+            "amount": payout["amount"], "saveBeneficiary": False,
+            "narration": f"Ajo payout — {group['name']}",
+            "paymentReference": txn_id
+        })
+    except Exception as e:
+        raise HTTPException(502, f"Payout failed. Please try again. ({e})")
+
+    # ── Record transaction (SH transfer succeeded) ────────────────────────────
     now_iso = datetime.now(timezone.utc).isoformat()
-    # Credit wallet
-    await db.wallets.update_one({"user_id": user["_id"]}, {"$inc": {"available_balance": amt, "ledger_balance": amt}})
     await db.transactions.insert_one({
         "transaction_id": txn_id, "user_id": user["_id"],
         "type": "AJO_PAYOUT", "direction": "CREDIT", "amount": amt, "fee": 0, "vat": 0,
-        "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
+        "currency": "NGN", "status": "COMPLETED", "provider": "SAFEHAVEN",
         "description": f"Ajo payout — {group['name']}",
         "metadata": {"group_id": group_id, "period_index": payout["period_index"], "payout_id": payout["payout_id"]},
         "created_at": now_iso, "updated_at": now_iso
@@ -624,12 +628,10 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
             await db.ajo_groups.update_one({"group_id": group_id}, {"$set": {
                 "status": "COMPLETED", "updated_at": now_iso
             }, "$inc": {"total_rounds_completed": 1}})
-            # Notify all members
             members_raw = await db.ajo_members.find({"group_id": group_id, "status": {"$ne": "LEFT"}}, {"user_id": 1}).to_list(50)
             for m in members_raw:
                 await notify(m["user_id"], f"Ajo '{group['name']}' Complete!", "All members have collected. The group is now closed.", "info")
         else:
-            # Start new round
             new_round = group.get("current_round", 1) + 1
             await db.ajo_groups.update_one({"group_id": group_id}, {"$set": {
                 "current_round": new_round, "updated_at": now_iso
@@ -638,24 +640,11 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
             for m in members_raw:
                 await notify(m["user_id"], f"Ajo '{group['name']}' — Round {new_round} Starts!", "A new round of contributions has started.", "info")
     await notify(user["_id"], "Ajo Payout Collected!", f"₦{payout['amount']:,.2f} added to your wallet.", "success")
-    # SH sweep: AJO bucket → user's SH account (best-effort)
-    try:
-        sh_ajo_src = await get_service_bucket_account("AJO")
-        user_wallet = await db.wallets.find_one({"user_id": user["_id"]})
-        user_sh = (user_wallet or {}).get("sh_account_number", "")
-        if sh_ajo_src and user_sh:
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber": sh_ajo_src,
-                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": user_sh,
-                "amount": payout["amount"], "saveBeneficiary": False,
-                "narration": f"Ajo payout — {group['name']}",
-                "paymentReference": txn_id
-            })
-        else:
-            logger.info(f"[Ajo] No AJO SH bucket configured — payout tracked internally only")
-    except Exception as e:
-        logger.warning(f"[Ajo] SH payout sweep failed (wallet already credited): {e}")
+    # SHADOW: BOMPAY wallet mirror
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": user["_id"]},
+        {"$inc": {"available_balance": amt, "ledger_balance": amt}},
+    ))
     return {"message": f"₦{payout['amount']:,.2f} collected successfully!", "transaction_id": txn_id}
 
 @router.post("/ajo/{group_id}/pay-arrears")
