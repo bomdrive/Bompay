@@ -111,7 +111,11 @@ async def submit_nin(req: KYCNINReq, request: Request):
 @router.get("/savings")
 async def get_savings(request: Request):
     user = await get_current_user(request)
-    goals = await db.savings_goals.find({"user_id": user["_id"], "status": {"$ne": "DELETED"}}, {"_id": 0}).to_list(100)
+    uid_str = str(user["_id"])
+    goals = await db.savings_goals.find(
+        {"$or": [{"user_id": uid_str}, {"user_id": user["_id"]}], "status": {"$ne": "DELETED"}},
+        {"_id": 0}
+    ).to_list(100)
     for g in goals:
         g["target_amount_ngn"] = g.get("target_amount", 0) / 100
         g["current_amount_ngn"] = g.get("current_amount", 0) / 100
@@ -168,7 +172,11 @@ async def create_savings_goal(req: SavingsReq, request: Request):
 async def contribute_savings(goal_id: str, req: ContributeReq, request: Request):
     user = await get_current_user(request)
     await verify_transaction_pin(user["_id"], req.transaction_pin)
-    goal = await db.savings_goals.find_one({"goal_id": goal_id, "user_id": user["_id"]})
+    uid_str = str(user["_id"])
+    goal = await db.savings_goals.find_one({
+        "goal_id": goal_id,
+        "$or": [{"user_id": uid_str}, {"user_id": user["_id"]}]
+    })
     if not goal:
         raise HTTPException(404, "Savings goal not found")
     amt = int(req.amount * 100)
@@ -216,10 +224,10 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
     except Exception as e:
         raise HTTPException(502, f"Payment failed. Please try again. ({e})")
     # SHADOW: BOMPAY wallet mirror
-    asyncio.create_task(db.wallets.update_one(
+    await db.wallets.update_one(
         {"user_id": user["_id"]},
         {"$inc": {"available_balance": -amt, "ledger_balance": -amt}},
-    ))
+    )
 
     await db.transactions.insert_one({
         "transaction_id": txn_id, "idempotency_key": idem, "user_id": user["_id"],
@@ -250,7 +258,11 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
 @router.delete("/savings/{goal_id}")
 async def delete_savings(goal_id: str, request: Request):
     user = await get_current_user(request)
-    goal = await db.savings_goals.find_one({"goal_id": goal_id, "user_id": user["_id"]})
+    uid_str = str(user["_id"])
+    goal = await db.savings_goals.find_one({
+        "goal_id": goal_id,
+        "$or": [{"user_id": uid_str}, {"user_id": user["_id"]}]
+    })
     if not goal:
         raise HTTPException(404, "Goal not found")
 
@@ -313,8 +325,8 @@ async def delete_savings(goal_id: str, request: Request):
         except Exception as e:
             raise HTTPException(502, f"Withdrawal failed. Please try again. ({e})")
         # SHADOW: BOMPAY wallet mirror (single update only)
-        asyncio.create_task(db.wallets.update_one({"user_id": user["_id"]},
-            {"$inc": {"available_balance": payout_kobo, "ledger_balance": payout_kobo}}))
+        await db.wallets.update_one({"user_id": user["_id"]},
+            {"$inc": {"available_balance": payout_kobo, "ledger_balance": payout_kobo}})
 
         await notify(user["_id"], "Savings Withdrawn",
                      f"₦{payout_kobo/100:,.2f} returned to wallet.", "info")
@@ -328,7 +340,11 @@ async def delete_savings(goal_id: str, request: Request):
 async def get_savings_contributions(goal_id: str, request: Request):
     """User: get contribution breakdown for one savings goal."""
     user = await get_current_user(request)
-    goal = await db.savings_goals.find_one({"goal_id": goal_id, "user_id": user["_id"]}, {"_id": 0})
+    uid_str = str(user["_id"])
+    goal = await db.savings_goals.find_one({
+        "goal_id": goal_id,
+        "$or": [{"user_id": uid_str}, {"user_id": user["_id"]}]
+    }, {"_id": 0})
     if not goal:
         raise HTTPException(404, "Goal not found")
     txns = await db.transactions.find(
