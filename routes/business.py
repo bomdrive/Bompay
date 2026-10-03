@@ -11,6 +11,8 @@ from core import (
     get_current_user, call_sh, SAFEHAVEN_OWN_BANK_CODE,
     send_email, _email_html, notify, get_sms_provider,
     _send_via_bulksms, _send_via_sendora,
+    get_sh_subaccount_balance, send_event_sms, verify_pin_hash,
+    get_service_bucket_account,
 )
 
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "")
@@ -39,6 +41,41 @@ async def _biz_wallet(business_id: str):
 async def _max_businesses() -> int:
     cfg = await db.admin_settings.find_one({"key": "business_config"}) or {}
     return cfg.get("max_per_user", 0)          # 0 = not set yet → block creation
+
+async def _get_biz_sh_balance(b: dict) -> float:
+    """Fetch live Safe Haven balance for a business subaccount. Returns -1.0 if unavailable."""
+    if b.get("sh_subaccount_id"):
+        try:
+            return await get_sh_subaccount_balance(b["sh_subaccount_id"])
+        except Exception:
+            pass
+    if b.get("sh_account_number"):
+        try:
+            r = await call_sh("GET", "/accounts", params={"accountNumber": b["sh_account_number"]})
+            items = r.get("data", r)
+            if isinstance(items, list) and items:
+                items = items[0]
+            bal = float(items.get("availableBalance", items.get("accountBalance", items.get("balance", -1))))
+            return bal if bal >= 0 else -1.0
+        except Exception:
+            pass
+    return -1.0
+
+async def _check_module_ban(uid: str, module: str):
+    """Raise 403 if user is banned from a module (business or family)."""
+    ban = await db.user_module_bans.find_one({"user_id": str(uid), "module": module, "active": True})
+    if ban:
+        reason = ban.get("reason", "")
+        msg = f"Your access to the {module.title()} module has been restricted."
+        if reason:
+            msg += f" Reason: {reason}"
+        msg += " Please contact support."
+        raise HTTPException(403, msg)
+
+async def _get_payroll_fee_per_staff() -> int:
+    """Return the payroll fee per staff in kobo. Default ₦50 = 5000 kobo."""
+    cfg = await db.admin_settings.find_one({"key": "payroll_fee_config"}) or {}
+    return int(cfg.get("fee_per_staff_kobo", 5000))
 
 async def _record_biz_txn(business_id: str, direction: str, category: str,
                            amount_kobo: int, description: str, metadata: dict = None):
@@ -174,6 +211,8 @@ async def lookup_business(query: str = "", request: Request = None):
 async def create_business(req: CreateBusinessReq, request: Request):
     user = await get_current_user(request)
     uid_str = str(user["_id"])
+
+    await _check_module_ban(uid_str, "business")
 
     max_biz = await _max_businesses()
     if max_biz == 0:
@@ -500,6 +539,8 @@ async def get_payroll_preview(business_id: str, request: Request):
 @router.post("/business/{business_id}/payroll/run")
 async def run_payroll(business_id: str, request: Request):
     user = await get_current_user(request)
+    uid_str = str(user["_id"])
+    await _check_module_ban(uid_str, "business")
     b = await _get_business(business_id, user["_id"])
 
     active_staff = await db.business_staff.find(
@@ -519,9 +560,25 @@ async def run_payroll(business_id: str, request: Request):
         staff_with_loans.append((s, active_loans, loan_ded, adj_net))
 
     total_payout = sum(adj for _, _, _, adj in staff_with_loans)
+    staff_count  = len(staff_with_loans)
+
+    # ── Payroll fee: ₦50 per staff (admin-configurable) ───────────────────────
+    fee_per_staff = await _get_payroll_fee_per_staff()
+    total_fee = fee_per_staff * staff_count
+
+    # ── Balance checks ────────────────────────────────────────────────────────
     w = await _biz_wallet(business_id)
-    if w["available_balance"] < total_payout:
-        raise HTTPException(400, f"Insufficient balance. Need ₦{total_payout/100:,.2f}, have ₦{w['available_balance']/100:,.2f}")
+    total_required = total_payout + total_fee
+    if w["available_balance"] < total_required:
+        raise HTTPException(400,
+            f"Insufficient balance. Need ₦{total_required/100:,.2f} (salaries ₦{total_payout/100:,.2f} + fee ₦{total_fee/100:,.2f}), "
+            f"have ₦{w['available_balance']/100:,.2f}")
+
+    # Safe Haven balance check
+    sh_bal = await _get_biz_sh_balance(b)
+    if sh_bal >= 0 and sh_bal * 100 < total_payout:
+        raise HTTPException(400,
+            f"Insufficient Safe Haven balance for payroll. SH available: ₦{sh_bal:,.2f}, need ₦{total_payout/100:,.2f}")
 
     errors = []
     paid   = []
@@ -542,7 +599,7 @@ async def run_payroll(business_id: str, request: Request):
                 {"$inc": {"available_balance": adj_net, "ledger_balance": adj_net}}
             )
 
-            # SH transfer
+            # SH transfer (salary)
             if b.get("sh_subaccount_id") and adj_net > 0:
                 try:
                     await call_sh("POST", "/transfers", body={
@@ -575,22 +632,88 @@ async def run_payroll(business_id: str, request: Request):
                                               "remaining": new_balance}}}
                 )
 
+            # ── SMS to staff ──────────────────────────────────────────────────
+            asyncio.create_task(send_event_sms(staff["user_id"], "BUSINESS_SALARY_CREDIT", {
+                "amount": adj_net / 100, "business": b["name"],
+                "balance": (staff_wallet.get("available_balance", 0) + adj_net) / 100,
+            }))
+            # ── In-app notify to staff ─────────────────────────────────────────
+            asyncio.create_task(notify(staff["user_id"], "Salary Received",
+                f"₦{adj_net/100:,.2f} salary from {b['name']} credited to your wallet."))
+
             paid.append(staff["name"])
         except Exception as e:
             errors.append(f"{staff['name']}: {e}")
+
+    # ── Deduct payroll fee from business wallet ────────────────────────────────
+    fee_txn_id = ""
+    if total_fee > 0 and paid:
+        await db.business_wallets.update_one(
+            {"business_id": business_id},
+            {"$inc": {"available_balance": -total_fee, "ledger_balance": -total_fee}}
+        )
+        await _record_biz_txn(business_id, "DEBIT", "PAYROLL_FEE",
+                              total_fee, f"Payroll processing fee ({len(paid)} staff × ₦{fee_per_staff/100:,.0f})")
+        # Route fee to PAYROLL service bucket if configured
+        payroll_bucket_acct = await get_service_bucket_account("PAYROLL")
+        if payroll_bucket_acct and b.get("sh_account_number"):
+            try:
+                await call_sh("POST", "/transfers", body={
+                    "nameEnquiryReference": "",
+                    "debitAccountNumber": b["sh_account_number"],
+                    "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                    "beneficiaryAccountNumber": payroll_bucket_acct,
+                    "amount": total_fee,
+                    "saveBeneficiary": False,
+                    "narration": f"Payroll fee — {b['name']}",
+                    "paymentReference": f"PAYFEE-{business_id[:8]}-{uuid.uuid4().hex[:8]}",
+                })
+            except Exception as e:
+                logger.warning(f"[PAYROLL-FEE] SH fee transfer failed: {e}")
 
     await db.business_payroll.insert_one({
         "business_id": business_id,
         "owner_id": str(user["_id"]),
         "total_amount": total_payout,
+        "fee_total": total_fee,
+        "fee_per_staff": fee_per_staff,
         "staff_paid": paid,
         "errors": errors,
         "status": "completed" if not errors else "partial",
         "run_at": now_utc(),
         "auto": False,
     })
+
+    # ── Notify owner ───────────────────────────────────────────────────────────
+    w_after = await _biz_wallet(business_id)
+    async def _notify_owner():
+        try:
+            await notify(uid_str, "Payroll Complete",
+                f"{len(paid)} staff paid ₦{total_payout/100:,.2f}. Fee: ₦{total_fee/100:,.2f}. Biz Bal: ₦{w_after.get('available_balance',0)/100:,.2f}")
+            await send_event_sms(uid_str, "BUSINESS_PAYROLL_DONE", {
+                "count": len(paid), "total": total_payout / 100,
+                "fee": total_fee / 100, "balance": w_after.get("available_balance", 0) / 100,
+            })
+            owner_email = (user.get("email") or user.get("email_address") or "").strip()
+            if owner_email:
+                owner_name = f"{user.get('first_name','')} {user.get('last_name','')}".strip() or "Customer"
+                html = _email_html(
+                    f"Payroll Complete — {b['name']}",
+                    [
+                        f"Payroll run completed for <strong>{b['name']}</strong>.",
+                        f"<strong>{len(paid)}</strong> staff paid | Total: ₦{total_payout/100:,.2f}",
+                        f"Payroll processing fee: ₦{total_fee/100:,.2f} ({len(paid)} staff × ₦{fee_per_staff/100:,.0f})",
+                        f"Business balance after: ₦{w_after.get('available_balance',0)/100:,.2f}",
+                    ] + ([f"Errors ({len(errors)}): " + "; ".join(errors)] if errors else []),
+                    "Log in to BOMPAY Business to view payroll history."
+                )
+                await send_email(to=owner_email, subject=f"[BOMPAY] Payroll Complete — {b['name']}", html=html)
+        except Exception as ex:
+            logger.warning(f"[PAYROLL] owner notify failed: {ex}")
+    asyncio.create_task(_notify_owner())
+
     return {"message": f"Payroll completed. {len(paid)} paid, {len(errors)} errors.",
-            "paid": paid, "errors": errors}
+            "paid": paid, "errors": errors, "fee_total_ngn": total_fee / 100}
 
 
 # ─── 11. PAYROLL HISTORY ────────────────────────────────────────────────────
@@ -616,8 +739,9 @@ async def business_transactions(business_id: str, page: int = 1, limit: int = 20
 # ─── 13. TRANSFER FROM BUSINESS ──────────────────────────────────────────────
 @router.post("/business/{business_id}/transfer")
 async def business_transfer(business_id: str, req: TransferFromBusinessReq, request: Request):
-    from core import verify_pin_hash
     user = await get_current_user(request)
+    uid_str = str(user["_id"])
+    await _check_module_ban(uid_str, "business")
     b = await _get_business(business_id, user["_id"])
     if b["status"] != "active":
         raise HTTPException(400, "Business account is not active")
@@ -632,6 +756,11 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
     w = await _biz_wallet(business_id)
     if w["available_balance"] < amount_kobo:
         raise HTTPException(400, "Insufficient business balance")
+
+    # Safe Haven balance check (mirror — business SH must have equivalent funds)
+    sh_bal = await _get_biz_sh_balance(b)
+    if sh_bal >= 0 and sh_bal * 100 < amount_kobo:
+        raise HTTPException(400, f"Insufficient Safe Haven balance. Available: ₦{sh_bal:,.2f}")
 
     # Name enquiry
     try:
@@ -652,6 +781,7 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
     )
 
     # SH transfer from business subaccount
+    pay_ref = f"BIZTXN-{uuid.uuid4().hex[:12]}"
     try:
         await call_sh("POST", "/transfers", body={
             "nameEnquiryReference": ne_ref,
@@ -661,7 +791,7 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
             "amount": amount_kobo,
             "saveBeneficiary": False,
             "narration": req.narration,
-            "paymentReference": f"BIZTXN-{uuid.uuid4().hex[:12]}",
+            "paymentReference": pay_ref,
         })
     except Exception as e:
         # Reverse wallet debit on SH failure
@@ -673,8 +803,42 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
 
     await _record_biz_txn(business_id, "DEBIT", "TRANSFER", amount_kobo,
                           f"Transfer to {beneficiary_name}",
-                          {"account": req.beneficiary_account, "narration": req.narration})
-    return {"message": "Transfer successful", "beneficiary_name": beneficiary_name}
+                          {"account": req.beneficiary_account, "narration": req.narration, "ref": pay_ref})
+
+    # Notifications (fire-and-forget)
+    w_after = await _biz_wallet(business_id)
+    biz_name = b["name"]
+    async def _notify_transfer():
+        try:
+            # In-app notify owner
+            await notify(uid_str, "Business Transfer Sent",
+                         f"₦{req.amount:,.2f} sent to {beneficiary_name} from {biz_name}. Ref: {pay_ref}")
+            # SMS to owner
+            await send_event_sms(uid_str, "BUSINESS_TRANSFER_DEBIT", {
+                "amount": req.amount, "beneficiary": beneficiary_name,
+                "business": biz_name, "ref": pay_ref,
+                "balance": w_after.get("available_balance", 0) / 100,
+            })
+            # Email to owner
+            owner_email = (user.get("email") or user.get("email_address") or "").strip()
+            owner_name  = f"{user.get('first_name','')} {user.get('last_name','')}".strip() or "Customer"
+            if owner_email:
+                html = _email_html(
+                    f"Business Transfer — ₦{req.amount:,.2f} sent",
+                    [
+                        f"Your business <strong>{biz_name}</strong> transferred <strong>₦{req.amount:,.2f}</strong> to <strong>{beneficiary_name}</strong>.",
+                        f"Account: {req.beneficiary_account} | Narration: {req.narration}",
+                        f"Reference: {pay_ref}",
+                        f"Business balance after: ₦{w_after.get('available_balance', 0)/100:,.2f}",
+                    ],
+                    "If you did not authorise this, contact support immediately."
+                )
+                await send_email(to=owner_email, subject=f"[BOMPAY] Business Transfer Sent — {biz_name}", html=html)
+        except Exception as ex:
+            logger.warning(f"[BIZ-TRANSFER] notify failed: {ex}")
+    asyncio.create_task(_notify_transfer())
+
+    return {"message": "Transfer successful", "beneficiary_name": beneficiary_name, "reference": pay_ref}
 
 
 # ─── 14. CRM — CUSTOMERS ─────────────────────────────────────────────────────
@@ -991,6 +1155,11 @@ async def approve_staff_loan(business_id: str, staff_id: str, loan_id: str, requ
     w = await _biz_wallet(business_id)
     if w["available_balance"] < amount_kobo:
         raise HTTPException(400, f"Insufficient business balance. Need ₦{amount_kobo/100:,.2f}, have ₦{w['available_balance']/100:,.2f}")
+
+    # Safe Haven balance check before loan disbursement
+    sh_bal = await _get_biz_sh_balance(b)
+    if sh_bal >= 0 and sh_bal * 100 < amount_kobo:
+        raise HTTPException(400, f"Insufficient Safe Haven balance. SH available: ₦{sh_bal:,.2f}, need ₦{amount_kobo/100:,.2f}")
 
     staff = await db.business_staff.find_one({"_id": oid(staff_id), "business_id": business_id})
     if not staff:
@@ -1535,3 +1704,82 @@ async def get_business_statement(business_id: str, year: int = 0, month: int = 0
             for s in sales
         ],
     }
+
+
+
+# ─── ADMIN: PAYROLL FEE CONFIG ────────────────────────────────────────────────
+@router.get("/admin/settings/payroll-fee")
+async def admin_get_payroll_fee(request: Request):
+    user = await get_current_user(request)
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    cfg = await db.admin_settings.find_one({"key": "payroll_fee_config"}) or {}
+    fee_kobo = cfg.get("fee_per_staff_kobo", 5000)
+    return {"fee_per_staff_ngn": fee_kobo / 100, "fee_per_staff_kobo": fee_kobo}
+
+
+@router.post("/admin/settings/payroll-fee")
+async def admin_set_payroll_fee(fee_per_staff_ngn: float, request: Request):
+    user = await get_current_user(request)
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    if fee_per_staff_ngn < 0:
+        raise HTTPException(400, "Fee cannot be negative")
+    fee_kobo = int(fee_per_staff_ngn * 100)
+    await db.admin_settings.update_one(
+        {"key": "payroll_fee_config"},
+        {"$set": {"key": "payroll_fee_config", "fee_per_staff_kobo": fee_kobo, "updated_at": now_utc()}},
+        upsert=True,
+    )
+    return {"message": f"Payroll fee set to ₦{fee_per_staff_ngn:,.2f} per staff", "fee_per_staff_ngn": fee_per_staff_ngn}
+
+
+# ─── ADMIN: MODULE BAN — BUSINESS & FAMILY ────────────────────────────────────
+@router.get("/admin/users/{user_id}/module-bans")
+async def admin_get_module_bans(user_id: str, request: Request):
+    user = await get_current_user(request)
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
+    bans = await db.user_module_bans.find({"user_id": user_id}).to_list(None)
+    return {"bans": [
+        {"module": b["module"], "active": b.get("active", False),
+         "reason": b.get("reason", ""), "banned_at": str(b.get("banned_at", ""))}
+        for b in bans
+    ]}
+
+
+@router.post("/admin/users/{user_id}/module-bans")
+async def admin_ban_module(user_id: str, request: Request):
+    admin = await get_current_user(request)
+    if admin.get("role") != "admin": raise HTTPException(403, "Admin only")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    module = body.get("module", "").lower()
+    reason = body.get("reason", "")
+    if module not in ("business", "family"):
+        raise HTTPException(400, "module must be 'business' or 'family'")
+    await db.user_module_bans.update_one(
+        {"user_id": user_id, "module": module},
+        {"$set": {"user_id": user_id, "module": module, "active": True,
+                  "reason": reason, "banned_at": now_utc(), "banned_by": str(admin["_id"])}},
+        upsert=True,
+    )
+    # Notify user
+    asyncio.create_task(notify(user_id, f"{module.title()} Module Restricted",
+        f"Your access to {module.title()} has been restricted. " + (f"Reason: {reason}" if reason else "Contact support for details.")))
+    return {"message": f"User banned from {module} module"}
+
+
+@router.delete("/admin/users/{user_id}/module-bans/{module}")
+async def admin_unban_module(user_id: str, module: str, request: Request):
+    admin = await get_current_user(request)
+    if admin.get("role") != "admin": raise HTTPException(403, "Admin only")
+    module = module.lower()
+    if module not in ("business", "family"):
+        raise HTTPException(400, "module must be 'business' or 'family'")
+    await db.user_module_bans.update_one(
+        {"user_id": user_id, "module": module},
+        {"$set": {"active": False, "unbanned_at": now_utc(), "unbanned_by": str(admin["_id"])}},
+    )
+    asyncio.create_task(notify(user_id, f"{module.title()} Module Restored",
+        f"Your access to the {module.title()} module has been restored."))
+    return {"message": f"User ban removed for {module} module"}

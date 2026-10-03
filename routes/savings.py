@@ -247,6 +247,9 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
     asyncio.create_task(send_event_notification(user["_id"], "SAVINGS_DEBIT", {
         "amount": req.amount, "goal": goal["name"], "balance": w_after["available_balance"] / 100
     }))
+    asyncio.create_task(send_event_sms(user["_id"], "SAVINGS_DEBIT", {
+        "amount": req.amount, "goal": goal["name"], "balance": w_after["available_balance"] / 100
+    }))
     return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount,
             "new_total": new_amt, "progress": round(progress, 1)}
 

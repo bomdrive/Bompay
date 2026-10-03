@@ -102,7 +102,9 @@ async def buy_airtime(req: AirtimeReq, request: Request):
             pref = r.get("data", {}).get("transactionReference", "")
         pts = max(1, int(req.amount * 0.02))
         await vas_complete(user["_id"], txn_id, amt, pref,
-            "Airtime Purchased", f"₦{req.amount:,.0f} {req.network} airtime → {req.phone_number}", pts)
+            "Airtime Purchased", f"₦{req.amount:,.0f} {req.network} airtime → {req.phone_number}", pts,
+            sms_event_type="AIRTIME",
+            sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id})
         asyncio.create_task(send_event_notification(user["_id"], "AIRTIME", {
             "amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id
         }))
@@ -151,7 +153,9 @@ async def buy_data(req: DataReq, request: Request):
             pref = r.get("data", {}).get("transactionReference", "")
         pts = max(1, int(req.amount * 0.02))
         await vas_complete(user["_id"], txn_id, amt, pref,
-            "Data Purchased", f"₦{req.amount:,.0f} data bundle → {req.phone_number}", pts)
+            "Data Purchased", f"₦{req.amount:,.0f} data bundle → {req.phone_number}", pts,
+            sms_event_type="DATA",
+            sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "plan": req.plan_id, "ref": txn_id})
         asyncio.create_task(send_event_notification(user["_id"], "DATA", {
             "amount": req.amount, "network": req.network, "phone": req.phone_number,
             "plan": req.plan_id, "ref": txn_id
@@ -201,7 +205,9 @@ async def pay_cable(req: CableReq, request: Request):
                 "bundleCode": req.package_id, "amount": req.amount, "channel": "WEB", "cardNumber": req.smartcard_number})
             pref = r.get("data", {}).get("transactionReference", "")
         await vas_complete(user["_id"], txn_id, amt, pref,
-            "Cable TV Renewed", f"{req.provider} subscription renewed for {req.smartcard_number}")
+            "Cable TV Renewed", f"{req.provider} subscription renewed for {req.smartcard_number}",
+            sms_event_type="CABLE",
+            sms_meta={"plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id})
         asyncio.create_task(send_event_notification(user["_id"], "CABLE", {
             "plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id
         }))
@@ -267,7 +273,9 @@ async def pay_electricity(req: ElectricityReq, request: Request):
         await db.transactions.update_one({"transaction_id": txn_id},
             {"$set": {"metadata.token": token, "metadata.units": units, "metadata.pg_ref": pref}})
         await vas_complete(user["_id"], txn_id, amt, pref,
-            "Electricity Purchased", f"Token: {token} | Units: {units}")
+            "Electricity Purchased", f"Token: {token} | Units: {units}",
+            sms_event_type="ELECTRICITY",
+            sms_meta={"token": token, "units": units, "meter": req.meter_number, "disco": req.disco, "ref": txn_id})
         asyncio.create_task(send_event_notification(user["_id"], "ELECTRICITY", {
             "token": token, "units": units, "meter": req.meter_number
         }))
@@ -366,7 +374,9 @@ async def fund_betting_wallet(req: BettingReq, request: Request):
         await vas_complete(
             user["_id"], txn_id, amt, pref,
             f"{BETTING_PLATFORMS[platform]} Wallet Funded",
-            f"₦{req.amount:,.2f} deposited to {req.account_id}"
+            f"₦{req.amount:,.2f} deposited to {req.account_id}",
+            sms_event_type="BETTING",
+            sms_meta={"amount": req.amount, "platform": BETTING_PLATFORMS[platform], "ref": txn_id}
         )
     except HTTPException:
         await vas_refund(user["_id"], txn_id, amt, "Betting Deposit Failed")

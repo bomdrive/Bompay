@@ -849,11 +849,23 @@ async def send_event_sms(user_id: str, event_type: str, metadata: dict):
                 else None  # Token not ready yet — webhook will send when token arrives
             ),
             "CABLE": lambda m: f"BOMPAY: {m.get('plan','')} Cable TV renewed for smartcard {m.get('smartcard','')}. Ref: {m.get('ref','')}",
+            "BETTING": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} wallet top-up to {m.get('platform','')} account. Ref: {m.get('ref','')}. Bal: NGN{m.get('balance',0):,.0f}",
             "SAVINGS_DEBIT": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} auto-debited to savings goal '{m.get('goal','')}'. Bal: NGN{m.get('balance',0):,.0f}",
             "LOAN_DISBURSED": lambda m: f"BOMPAY Loan: NGN{m.get('amount',0):,.0f} disbursed to wallet. Monthly repayment: NGN{m.get('monthly',0):,.0f} x {m.get('tenor',0)} months.",
             "LOAN_REPAYMENT": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} loan repayment received. Outstanding: NGN{m.get('outstanding',0):,.0f}.{'  Loan fully repaid!' if m.get('fully_repaid') else ''}",
             "AJO_PAYOUT_READY": lambda m: f"BOMPAY Ajo: Your NGN{m.get('amount',0):,.0f} pool from '{m.get('group','')}' is ready to collect. Open the BOMPAY app to claim your funds.",
             "REFERRAL_BONUS": lambda m: f"BOMPAY Referral: NGN{m.get('amount',0):,.0f} referral bonus added! {m.get('note','')} Check Referrals in the app.",
+            # ─── Business events ─────────────────────────────────────────────
+            "BUSINESS_TRANSFER_DEBIT": lambda m: f"BOMPAY Business: NGN{m.get('amount',0):,.0f} transferred to {m.get('beneficiary','')} from {m.get('business','')}. Ref: {m.get('ref','')}. Biz Bal: NGN{m.get('balance',0):,.0f}",
+            "BUSINESS_TRANSFER_CREDIT": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} received from {m.get('sender_biz','')} to your account. Ref: {m.get('ref','')}. Bal: NGN{m.get('balance',0):,.0f}",
+            "BUSINESS_SALARY_CREDIT": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} salary from {m.get('business','')} credited to your wallet. Bal: NGN{m.get('balance',0):,.0f}",
+            "BUSINESS_LOAN_CREDIT": lambda m: f"BOMPAY: NGN{m.get('amount',0):,.0f} salary advance from {m.get('business','')} credited. Monthly deduction: NGN{m.get('monthly',0):,.0f}",
+            "BUSINESS_PAYROLL_DONE": lambda m: f"BOMPAY Business: Payroll run complete. {m.get('count',0)} staff paid, total NGN{m.get('total',0):,.0f}. Fee: NGN{m.get('fee',0):,.0f}. Biz Bal: NGN{m.get('balance',0):,.0f}",
+            # ─── Family events ────────────────────────────────────────────────
+            "FAMILY_FUND": lambda m: f"BOMPAY Family: NGN{m.get('amount',0):,.0f} allocated to {m.get('family','')} Family Wallet. Family Bal: NGN{m.get('balance',0):,.0f}",
+            "FAMILY_WITHDRAW": lambda m: f"BOMPAY Family: NGN{m.get('amount',0):,.0f} returned from {m.get('family','')} Family Wallet to your main wallet.",
+            "FAMILY_ALLOCATION": lambda m: f"BOMPAY Family: NGN{m.get('amount',0):,.0f} allocated to your {m.get('family','')} family spending balance.",
+            "FAMILY_REQUEST_APPROVED": lambda m: f"BOMPAY Family: Your NGN{m.get('amount',0):,.0f} request from {m.get('family','')} was approved. Your family balance: NGN{m.get('balance',0):,.0f}",
         }
         fn = templates.get(event_type)
         if not fn:
@@ -2255,8 +2267,21 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
     if existing:
         return existing["transaction_id"], True
     w = await get_wallet(user_id)
+    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ─────
     if w["available_balance"] < amount_kobo:
         raise HTTPException(400, "Insufficient funds")
+    wallet_doc = await db.wallets.find_one({"user_id": user_id})
+    sh_id = (wallet_doc or {}).get("sh_account_id", "")
+    if sh_id:
+        try:
+            sh_balance = await get_sh_subaccount_balance(sh_id)
+            if sh_balance * 100 < amount_kobo:
+                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[VAS] SH balance check failed (non-fatal): {e}")
+    # ────────────────────────────────────────────────────────────────────────
     bal_before = w["available_balance"]
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
     await db.transactions.insert_one({
@@ -2281,7 +2306,8 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
 
 
 async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
-                       notif_title: str, notif_msg: str, points: int = 0):
+                       notif_title: str, notif_msg: str, points: int = 0,
+                       sms_event_type: str = "", sms_meta: dict = None):
     w = await get_wallet(user_id)
     await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {
         "status": "COMPLETED", "provider_reference": pref, "updated_at": datetime.now(timezone.utc).isoformat()
@@ -2291,6 +2317,10 @@ async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$inc": {"reward_points": points}})
     await notify(user_id, notif_title, notif_msg, "success")
     asyncio.create_task(_sh_vas_sweep(user_id, amount_kobo, txn_id, notif_title))
+    if sms_event_type:
+        meta = dict(sms_meta or {})
+        meta.setdefault("balance", w.get("available_balance", 0) / 100)
+        asyncio.create_task(send_event_sms(user_id, sms_event_type, meta))
 
 
 async def vas_refund(user_id: str, txn_id: str, amount_kobo: int, title: str):

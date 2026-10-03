@@ -135,6 +135,24 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
     # Clamp to outstanding to avoid floating-point overshoot
     repay_amount = min(req.amount, outstanding)
     amt_kobo = int(round(repay_amount * 100))
+
+    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ──────
+    pre_w = await db.wallets.find_one({"user_id": user["_id"]})
+    if not pre_w or pre_w.get("available_balance", 0) < amt_kobo:
+        raise HTTPException(400, f"Insufficient wallet balance. Required: ₦{repay_amount:,.2f}")
+    sh_id = pre_w.get("sh_account_id", "")
+    if sh_id:
+        try:
+            from core import get_sh_subaccount_balance
+            sh_bal = await get_sh_subaccount_balance(sh_id)
+            if sh_bal * 100 < amt_kobo:
+                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[Loans] SH balance check failed (non-fatal): {e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Atomic wallet debit
     updated_wallet = await db.wallets.find_one_and_update(
         {"user_id": user["_id"], "available_balance": {"$gte": amt_kobo}},
@@ -205,6 +223,9 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
     msg = "Loan fully repaid! Congratulations!" if is_fully_repaid else f"₦{repay_amount:,.2f} repaid. Outstanding: ₦{max(0.0, new_outstanding):,.2f}"
     await notify(user["_id"], "Loan Repayment", msg, "success")
     asyncio.create_task(send_event_notification(user["_id"], "LOAN_REPAYMENT", {
+        "amount": repay_amount, "outstanding": max(0.0, new_outstanding), "fully_repaid": is_fully_repaid
+    }))
+    asyncio.create_task(send_event_sms(user["_id"], "LOAN_REPAYMENT", {
         "amount": repay_amount, "outstanding": max(0.0, new_outstanding), "fully_repaid": is_fully_repaid
     }))
     return {

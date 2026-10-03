@@ -20,7 +20,7 @@ from core import (  # noqa: F401,F403,F405
     create_access_token, create_refresh_token, get_current_user, get_admin_user,
     set_auth_cookies, log_login_session,
     # wallet / ledger
-    gen_account_number, get_wallet, ledger_entry,
+    gen_account_number, get_wallet, ledger_entry, get_sh_subaccount_balance,
     # notifications
     notify, audit, send_event_sms, send_event_email, send_event_notification, send_email,
     send_push_notification,
@@ -362,7 +362,25 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
         fee_kobo = int(fee_value * 100)
     total_debit = amt + fee_kobo
 
-    # Balance check (covers contribution + fee atomically)
+    # ── Dual balance check: Bompay wallet AND Safe Haven virtual account ──────
+    pre_wallet = await db.wallets.find_one({"user_id": user["_id"]})
+    if not pre_wallet or pre_wallet.get("available_balance", 0) < total_debit:
+        raise HTTPException(400,
+            f"Insufficient balance. You need ₦{total_debit/100:,.2f} "
+            f"(₦{group['contribution_amount']:,.2f} contribution + ₦{fee_kobo/100:,.2f} fee)"
+        )
+    sh_id = pre_wallet.get("sh_account_id", "")
+    if sh_id:
+        try:
+            sh_bal = await get_sh_subaccount_balance(sh_id)
+            if sh_bal * 100 < total_debit:
+                raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_bal:,.2f}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[Ajo] SH balance check failed (non-fatal): {e}")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Atomic wallet deduction
     wallet = await db.wallets.find_one_and_update(
         {"user_id": user["_id"], "available_balance": {"$gte": total_debit}},
         {"$inc": {"available_balance": -total_debit, "ledger_balance": -total_debit}},
@@ -454,6 +472,9 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
                              f"₦{payout_amount:,.2f} is ready to collect from '{group['name']}'!", "success")
                 asyncio.create_task(send_event_notification(recipient_id, "AJO_PAYOUT_READY", {
                     "amount": payout_amount, "group": group["name"]
+                }))
+                asyncio.create_task(send_event_sms(recipient_id, "AJO_PAYOUT_READY", {
+                    "amount": payout_amount / 100, "group": group["name"]
                 }))
 
 

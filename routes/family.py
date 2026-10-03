@@ -29,6 +29,13 @@ from core import (
     verify_transaction_pin,
     notify,
     logger,
+    get_sh_subaccount_balance,
+    send_event_sms,
+    send_email,
+    _email_html,
+    get_sms_provider,
+    _send_via_bulksms,
+    _send_via_sendora,
 )
 
 router = APIRouter()
@@ -101,6 +108,30 @@ async def _ledger(family_id: str, member_id: Optional[str], entry_type: str,
         "created_at": _now(),
     })
 
+async def _check_family_module_ban(uid: str):
+    """Raise 403 if user is banned from the Family module."""
+    ban = await db.user_module_bans.find_one({"user_id": str(uid), "module": "family", "active": True})
+    if ban:
+        reason = ban.get("reason", "")
+        msg = "Your access to the Family module has been restricted."
+        if reason:
+            msg += f" Reason: {reason}"
+        msg += " Please contact support."
+        raise HTTPException(403, msg)
+
+async def _get_owner_sh_balance(owner_uid: str) -> float:
+    """Fetch owner's Safe Haven virtual account balance. Returns -1.0 if unavailable."""
+    w = await db.wallets.find_one({"user_id": owner_uid})
+    if not w:
+        return -1.0
+    sh_id = w.get("sh_account_id")
+    if not sh_id:
+        return -1.0
+    try:
+        return await get_sh_subaccount_balance(sh_id)
+    except Exception:
+        return -1.0
+
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +140,7 @@ async def create_family(req: CreateFamilyReq, request: Request):
     """Create a new family group and its wallet (owner only)."""
     user = await get_current_user(request)
     uid = str(user["_id"])
+    await _check_family_module_ban(uid)
 
     # One family per owner for now
     existing = await db.family_groups.find_one({"owner_user_id": uid})
@@ -212,11 +244,12 @@ async def get_family(request: Request):
 async def fund_family_wallet(family_id: str, req: FundFamilyReq, request: Request):
     """
     Ring-fence funds from the owner's wallet into the Family Wallet.
-    No Safe Haven transfer — this is a Bompay-internal allocation.
-    Owner's available_balance decreases; family available_kobo increases.
+    Safe Haven mirror check only — SH is NOT debited here.
+    When members spend their allocation, the owner's SH is debited then.
     """
     user = await get_current_user(request)
     uid = str(user["_id"])
+    await _check_family_module_ban(uid)
     await verify_transaction_pin(uid, req.transaction_pin)
 
     fam = await _get_family_or_404(family_id)
@@ -227,7 +260,14 @@ async def fund_family_wallet(family_id: str, req: FundFamilyReq, request: Reques
 
     amount_kobo = int(req.amount * 100)
 
-    # Debit owner's available_balance (ring-fence — ledger_balance unchanged)
+    # Safe Haven mirror check — both BOMPAY wallet and SH must have equivalent funds
+    sh_bal = await _get_owner_sh_balance(uid)
+    if sh_bal >= 0 and sh_bal * 100 < amount_kobo:
+        raise HTTPException(400,
+            f"Safe Haven balance insufficient. Available: ₦{sh_bal:,.2f}. "
+            "Both your BOMPAY wallet and Safe Haven account must have equivalent funds.")
+
+    # Debit owner's available_balance (ring-fence — ledger_balance unchanged, SH not touched yet)
     wallet = await db.wallets.find_one_and_update(
         {"user_id": uid, "available_balance": {"$gte": amount_kobo}},
         {"$inc": {"available_balance": -amount_kobo}},
@@ -246,13 +286,39 @@ async def fund_family_wallet(family_id: str, req: FundFamilyReq, request: Reques
     txn_id = f"FAM{secrets.token_hex(10).upper()}"
     await _ledger(family_id, None, "OWNER_FUND", amount_kobo,
                   f"₦{req.amount:,.2f} allocated to Family Wallet", txn_id)
-    await notify(uid, "Family Wallet Funded",
-                 f"₦{req.amount:,.2f} added to {fam['name']} Family Wallet.", "success")
+
+    new_fam_bal = (fam.get("available_kobo", 0) + amount_kobo) / 100
+    asyncio.create_task(notify(uid, "Family Wallet Funded",
+                 f"₦{req.amount:,.2f} added to {fam['name']} Family Wallet.", "success"))
+
+    # SMS + email to owner
+    asyncio.create_task(send_event_sms(uid, "FAMILY_FUND", {
+        "amount": req.amount, "family": fam["name"], "balance": new_fam_bal,
+    }))
+    async def _email_owner():
+        try:
+            owner_email = (user.get("email") or user.get("email_address") or "").strip()
+            owner_name  = f"{user.get('first_name','')} {user.get('last_name','')}".strip() or "Customer"
+            if owner_email:
+                html = _email_html(
+                    f"Family Wallet Funded — ₦{req.amount:,.2f}",
+                    [
+                        f"Hi {owner_name}, you funded your <strong>{fam['name']}</strong> Family Wallet with <strong>₦{req.amount:,.2f}</strong>.",
+                        f"Family Wallet balance: ₦{new_fam_bal:,.2f}",
+                        "Your Safe Haven account will be debited when family members make purchases.",
+                    ],
+                    "Manage your family in the BOMPAY app."
+                )
+                await send_email(to=owner_email,
+                                 subject=f"[BOMPAY] Family Wallet Funded — {fam['name']}", html=html)
+        except Exception as ex:
+            logger.warning(f"[FAMILY-FUND] email failed: {ex}")
+    asyncio.create_task(_email_owner())
 
     logger.info(f"[Family] {uid} funded family {family_id} ₦{req.amount:,.2f}")
     return {
         "message": f"₦{req.amount:,.2f} allocated to Family Wallet",
-        "family_available": (fam.get("available_kobo", 0) + amount_kobo) / 100,
+        "family_available": new_fam_bal,
     }
 
 
@@ -261,6 +327,7 @@ async def withdraw_family_wallet(family_id: str, req: WithdrawFamilyReq, request
     """Pull unallocated funds back from Family Wallet into owner's wallet."""
     user = await get_current_user(request)
     uid = str(user["_id"])
+    await _check_family_module_ban(uid)
     await verify_transaction_pin(uid, req.transaction_pin)
 
     fam = await _get_family_or_404(family_id)
@@ -271,6 +338,13 @@ async def withdraw_family_wallet(family_id: str, req: WithdrawFamilyReq, request
         raise HTTPException(400, "Withdrawal amount must be greater than zero.")
     if fam.get("available_kobo", 0) < amount_kobo:
         raise HTTPException(400, "Insufficient Family Wallet balance for withdrawal.")
+
+    # Safe Haven mirror check — verify both sides are in sync
+    sh_bal = await _get_owner_sh_balance(uid)
+    if sh_bal >= 0 and sh_bal * 100 < amount_kobo:
+        raise HTTPException(400,
+            f"Safe Haven balance insufficient. Available: ₦{sh_bal:,.2f}. "
+            "Wallet and Safe Haven must be equivalent.")
 
     await db.family_groups.update_one(
         {"family_id": family_id},
@@ -283,6 +357,12 @@ async def withdraw_family_wallet(family_id: str, req: WithdrawFamilyReq, request
     )
     await _ledger(family_id, None, "OWNER_WITHDRAW", amount_kobo,
                   f"₦{req.amount:,.2f} returned to owner wallet")
+
+    asyncio.create_task(notify(uid, "Family Wallet Withdrawal",
+        f"₦{req.amount:,.2f} returned from {fam['name']} to your main wallet."))
+    asyncio.create_task(send_event_sms(uid, "FAMILY_WITHDRAW", {
+        "amount": req.amount, "family": fam["name"],
+    }))
     return {"message": f"₦{req.amount:,.2f} returned to your wallet"}
 
 
@@ -291,6 +371,7 @@ async def add_family_member(family_id: str, req: AddMemberReq, request: Request)
     """Add a member to the family and optionally set allocation + limits."""
     user = await get_current_user(request)
     uid = str(user["_id"])
+    await _check_family_module_ban(uid)
 
     fam = await _get_family_or_404(family_id)
     await _require_owner(fam, uid)
@@ -342,6 +423,12 @@ async def add_family_member(family_id: str, req: AddMemberReq, request: Request)
     target_name = f"{target.get('first_name', '')} {target.get('last_name', '')}".strip() or target.get("phone_number", "")
     asyncio.create_task(notify(req.user_id, "You've been added to a Family",
                                f"You're now part of {fam['name']} on BOMPAY.", "info"))
+    # SMS/notify member if they received an initial allocation
+    if allocated_kobo > 0:
+        asyncio.create_task(send_event_sms(req.user_id, "FAMILY_ALLOCATION", {
+            "amount": req.allocated_amount, "family": fam["name"],
+            "balance": allocated_kobo / 100,
+        }))
     return {"member_id": member_id, "message": f"{target_name} added to {fam['name']}"}
 
 
@@ -541,6 +628,13 @@ async def respond_to_request(family_id: str, request_id: str,
     if approved_kobo > fam.get("available_kobo", 0):
         raise HTTPException(400, "Insufficient Family Wallet balance to approve this request.")
 
+    # Safe Haven mirror check
+    sh_bal = await _get_owner_sh_balance(uid)
+    if sh_bal >= 0 and sh_bal * 100 < approved_kobo:
+        raise HTTPException(400,
+            f"Safe Haven balance insufficient. Available: ₦{sh_bal:,.2f}. "
+            "Both wallet and Safe Haven must have equivalent funds.")
+
     mem = await db.family_members.find_one({"member_id": mon_req["requester_member_id"]})
     if not mem or mem.get("status") != "ACTIVE":
         raise HTTPException(400, "Member is not active")
@@ -559,8 +653,20 @@ async def respond_to_request(family_id: str, request_id: str,
     )
     await _ledger(family_id, mem["member_id"], "REQUEST_APPROVED", approved_kobo,
                   f"₦{approved_kobo / 100:,.2f} approved from money request")
+
+    member_new_bal = (mem.get("allocated_kobo", 0) + approved_kobo) / 100
     asyncio.create_task(notify(mon_req["requester_user_id"], "Request Approved!",
                                f"₦{approved_kobo / 100:,.2f} added to your Family spending balance.", "success"))
+    # SMS to member
+    asyncio.create_task(send_event_sms(mon_req["requester_user_id"], "FAMILY_REQUEST_APPROVED", {
+        "amount": approved_kobo / 100, "family": fam["name"], "balance": member_new_bal,
+    }))
+    # Notify + SMS to owner too
+    asyncio.create_task(notify(uid, "Request Approved",
+        f"You approved ₦{approved_kobo/100:,.2f} for a family member in {fam['name']}."))
+    asyncio.create_task(send_event_sms(uid, "FAMILY_ALLOCATION", {
+        "amount": approved_kobo / 100, "family": fam["name"], "balance": fam.get("available_kobo", 0) / 100,
+    }))
     return {"message": f"₦{approved_kobo / 100:,.2f} approved"}
 
 
@@ -668,3 +774,38 @@ async def get_family_ledger(
         e["amount"] = e.get("amount_kobo", 0) / 100
 
     return {"ledger": entries}
+
+
+# ─── ADMIN: FAMILY MODULE BAN ─────────────────────────────────────────────────
+@router.post("/admin/family/users/{user_id}/ban")
+async def admin_ban_family_user(user_id: str, request: Request):
+    """Ban or unban a user from the Family module."""
+    admin = await get_current_user(request)
+    if admin.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = body.get("action", "ban")   # "ban" | "unban"
+    reason = body.get("reason", "")
+    if action == "ban":
+        await db.user_module_bans.update_one(
+            {"user_id": user_id, "module": "family"},
+            {"$set": {"user_id": user_id, "module": "family", "active": True,
+                      "reason": reason, "banned_at": _now(),
+                      "banned_by": str(admin["_id"])}},
+            upsert=True,
+        )
+        asyncio.create_task(notify(user_id, "Family Module Restricted",
+            "Your access to Family has been restricted. Contact support for details."))
+        return {"message": "User banned from Family module"}
+    else:
+        await db.user_module_bans.update_one(
+            {"user_id": user_id, "module": "family"},
+            {"$set": {"active": False, "unbanned_at": _now(),
+                      "unbanned_by": str(admin["_id"])}},
+        )
+        asyncio.create_task(notify(user_id, "Family Module Restored",
+            "Your access to the Family module has been restored."))
+        return {"message": "User unbanned from Family module"}

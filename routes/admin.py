@@ -3897,6 +3897,7 @@ SERVICE_BUCKET_SERVICES = [
     {"key": "EPOS", "label": "e-POS", "description": "Holds ePOS merchant transaction float"},
     {"key": "CARD", "label": "Card", "description": "Card product float account"},
     {"key": "FAMILY", "label": "Family", "description": "Family wallet allocations float"},
+    {"key": "PAYROLL", "label": "Payroll Fee", "description": "Receives ₦50-per-staff payroll processing fee from businesses"},
     {"key": "CASHBACK", "label": "Cashback", "description": "Source account for cashback payouts to users"},
     {"key": "REFERRAL", "label": "Referral Bonus", "description": "Source account for referral bonus payouts to users"},
 ]
