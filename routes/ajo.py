@@ -20,7 +20,7 @@ from core import (  # noqa: F401,F403,F405
     create_access_token, create_refresh_token, get_current_user, get_admin_user,
     set_auth_cookies, log_login_session,
     # wallet / ledger
-    gen_account_number, get_wallet, ledger_entry, get_sh_subaccount_balance,
+    gen_account_number, get_wallet, ledger_entry, get_sh_subaccount_balance, sh_name_enquiry,
     # notifications
     notify, audit, send_event_sms, send_event_email, send_event_notification, send_email,
     send_push_notification,
@@ -380,7 +380,9 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
             "Ajo service account not configured. Please contact support or configure "
             "it in Admin → Service Accounts.")
     try:
+        ne_ref = await sh_name_enquiry(sh_ajo_acct)
         await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
             "debitAccountNumber": user_sh,
             "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
             "beneficiaryAccountNumber": sh_ajo_acct,
@@ -596,7 +598,9 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
     if not user_sh:
         raise HTTPException(400, "Your Safe Haven account not found. Please complete KYC.")
     try:
+        ne_ref = await sh_name_enquiry(user_sh)
         await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
             "debitAccountNumber": sh_ajo_src,
             "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
             "beneficiaryAccountNumber": user_sh,

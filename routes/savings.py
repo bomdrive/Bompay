@@ -59,6 +59,7 @@ from core import (  # noqa: F401,F403,F405
 )
 from core import (  # noqa: F401
     KYCBVNReq, KYCNINReq, SavingsReq, ContributeReq, verify_transaction_pin,
+    get_sh_subaccount_balance, sh_name_enquiry,
 )
 import ledger as pg_ledger
 
@@ -202,7 +203,9 @@ async def contribute_savings(goal_id: str, req: ContributeReq, request: Request)
             "Savings service account not configured. Please contact support or configure "
             "it in Admin → Service Accounts.")
     try:
+        ne_ref = await sh_name_enquiry(sh_dest)
         await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
             "debitAccountNumber":       sh_acct,
             "beneficiaryBankCode":      SAFEHAVEN_OWN_BANK_CODE,
             "beneficiaryAccountNumber": sh_dest,
@@ -296,7 +299,9 @@ async def delete_savings(goal_id: str, request: Request):
         if not user_sh:
             raise HTTPException(400, "Your Safe Haven account not found. Please complete KYC.")
         try:
+            ne_ref = await sh_name_enquiry(user_sh)
             await call_sh("POST", "/transfers", body={
+                "nameEnquiryReference": ne_ref,
                 "debitAccountNumber": sh_src,
                 "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
                 "beneficiaryAccountNumber": user_sh,

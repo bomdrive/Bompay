@@ -1861,6 +1861,21 @@ async def get_sh_subaccount_balance(account_id: str) -> float:
     bal = data.get("availableBalance") or data.get("accountBalance") or data.get("bookBalance") or 0
     return float(bal)
 
+
+async def sh_name_enquiry(account_number: str, bank_code: str = None) -> str:
+    """Perform a Safe Haven name enquiry and return the sessionId required for /transfers.
+    Returns empty string on failure (SH will reject the transfer with 400 if this is wrong,
+    but some internal transfers work with empty string)."""
+    try:
+        r = await call_sh("POST", "/transfers/name-enquiry", body={
+            "bankCode": bank_code or SAFEHAVEN_OWN_BANK_CODE,
+            "accountNumber": account_number,
+        })
+        return (r.get("data") or {}).get("sessionId", "")
+    except Exception as e:
+        logger.warning(f"[SH] Name enquiry failed for {account_number}: {e}")
+        return ""
+
 async def require_virtual_account(user: dict):
     """Raise 403 if user hasn't created their Safe Haven virtual account yet."""
     if user.get("role") == "admin":
@@ -2314,8 +2329,11 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
 
     # ── PRIMARY: SH internal transfer (blocking) ──────────────────────────────
+    # Name enquiry is required by Safe Haven before any transfer
+    ne_ref = await sh_name_enquiry(vas_bucket)
     try:
         await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
             "debitAccountNumber":    user_sh_acct,
             "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
             "beneficiaryAccountNumber": vas_bucket,

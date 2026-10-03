@@ -11,7 +11,7 @@ from core import (
     get_current_user, call_sh, SAFEHAVEN_OWN_BANK_CODE,
     send_email, _email_html, notify, get_sms_provider,
     _send_via_bulksms, _send_via_sendora,
-    get_sh_subaccount_balance, send_event_sms, verify_pin_hash,
+    get_sh_subaccount_balance, sh_name_enquiry, send_event_sms, verify_pin_hash,
     get_service_bucket_account,
 )
 
@@ -602,11 +602,13 @@ async def run_payroll(business_id: str, request: Request):
             # SH transfer (salary)
             if b.get("sh_subaccount_id") and adj_net > 0:
                 try:
+                    staff_sh_acct = staff_wallet.get("sh_account_number") or staff_wallet.get("account_number", "")
+                    ne_salary = await sh_name_enquiry(staff_sh_acct) if staff_sh_acct else ""
                     await call_sh("POST", "/transfers", body={
-                        "nameEnquiryReference": "",
+                        "nameEnquiryReference": ne_salary,
                         "debitAccountNumber": b["sh_account_number"],
                         "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                        "beneficiaryAccountNumber": staff_wallet.get("account_number", ""),
+                        "beneficiaryAccountNumber": staff_sh_acct,
                         "amount": adj_net,
                         "saveBeneficiary": False,
                         "narration": f"Salary – {b['name']}",
@@ -658,8 +660,9 @@ async def run_payroll(business_id: str, request: Request):
         payroll_bucket_acct = await get_service_bucket_account("PAYROLL")
         if payroll_bucket_acct and b.get("sh_account_number"):
             try:
+                ne_fee = await sh_name_enquiry(payroll_bucket_acct)
                 await call_sh("POST", "/transfers", body={
-                    "nameEnquiryReference": "",
+                    "nameEnquiryReference": ne_fee,
                     "debitAccountNumber": b["sh_account_number"],
                     "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
                     "beneficiaryAccountNumber": payroll_bucket_acct,

@@ -60,7 +60,7 @@ from core import (  # noqa: F401,F403,F405
 )
 from core import (  # noqa: F401
     LoanReq, LoanRepayReq, verify_transaction_pin, get_loan_config,
-    _credit_cashback_bg, _check_referral_bg, get_sh_subaccount_balance,
+    _credit_cashback_bg, _check_referral_bg, get_sh_subaccount_balance, sh_name_enquiry,
 )
 import ledger as pg_ledger
 
@@ -154,7 +154,9 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
             "Loans service account not configured. Please contact support or configure "
             "it in Admin → Service Accounts.")
     try:
+        ne_ref = await sh_name_enquiry(sh_repay_dest)
         await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
             "debitAccountNumber": sh_acct,
             "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
             "beneficiaryAccountNumber": sh_repay_dest,
