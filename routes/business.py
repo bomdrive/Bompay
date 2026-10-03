@@ -685,14 +685,17 @@ async def run_payroll(business_id: str, request: Request):
     })
 
     # ── Notify owner ───────────────────────────────────────────────────────────
-    w_after = await _biz_wallet(business_id)
+    # Use live SH balance for notifications (sh_bal fetched above, adjusted for payroll spend)
+    biz_sh_after = max(0.0, sh_bal - (total_payout + total_fee) / 100) if sh_bal >= 0 else None
+    w_after_shadow = await _biz_wallet(business_id)
+    biz_balance_for_notif = biz_sh_after if biz_sh_after is not None else w_after_shadow.get("available_balance", 0) / 100
     async def _notify_owner():
         try:
             await notify(uid_str, "Payroll Complete",
-                f"{len(paid)} staff paid ₦{total_payout/100:,.2f}. Fee: ₦{total_fee/100:,.2f}. Biz Bal: ₦{w_after.get('available_balance',0)/100:,.2f}")
+                f"{len(paid)} staff paid ₦{total_payout/100:,.2f}. Fee: ₦{total_fee/100:,.2f}. Biz Bal: ₦{biz_balance_for_notif:,.2f}")
             await send_event_sms(uid_str, "BUSINESS_PAYROLL_DONE", {
                 "count": len(paid), "total": total_payout / 100,
-                "fee": total_fee / 100, "balance": w_after.get("available_balance", 0) / 100,
+                "fee": total_fee / 100, "balance": biz_balance_for_notif,
             })
             owner_email = (user.get("email") or user.get("email_address") or "").strip()
             if owner_email:
@@ -703,7 +706,7 @@ async def run_payroll(business_id: str, request: Request):
                         f"Payroll run completed for <strong>{b['name']}</strong>.",
                         f"<strong>{len(paid)}</strong> staff paid | Total: ₦{total_payout/100:,.2f}",
                         f"Payroll processing fee: ₦{total_fee/100:,.2f} ({len(paid)} staff × ₦{fee_per_staff/100:,.0f})",
-                        f"Business balance after: ₦{w_after.get('available_balance',0)/100:,.2f}",
+                        f"Business balance after: ₦{biz_balance_for_notif:,.2f}",
                     ] + ([f"Errors ({len(errors)}): " + "; ".join(errors)] if errors else []),
                     "Log in to BOMPAY Business to view payroll history."
                 )
@@ -806,7 +809,10 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
                           {"account": req.beneficiary_account, "narration": req.narration, "ref": pay_ref})
 
     # Notifications (fire-and-forget)
-    w_after = await _biz_wallet(business_id)
+    # Use live SH balance (sh_bal fetched above, adjusted for the transfer)
+    biz_sh_after_transfer = max(0.0, sh_bal - req.amount) if sh_bal >= 0 else None
+    w_after_shadow = await _biz_wallet(business_id)
+    biz_notif_balance = biz_sh_after_transfer if biz_sh_after_transfer is not None else w_after_shadow.get("available_balance", 0) / 100
     biz_name = b["name"]
     async def _notify_transfer():
         try:
@@ -817,7 +823,7 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
             await send_event_sms(uid_str, "BUSINESS_TRANSFER_DEBIT", {
                 "amount": req.amount, "beneficiary": beneficiary_name,
                 "business": biz_name, "ref": pay_ref,
-                "balance": w_after.get("available_balance", 0) / 100,
+                "balance": biz_notif_balance,
             })
             # Email to owner
             owner_email = (user.get("email") or user.get("email_address") or "").strip()
@@ -829,7 +835,7 @@ async def business_transfer(business_id: str, req: TransferFromBusinessReq, requ
                         f"Your business <strong>{biz_name}</strong> transferred <strong>₦{req.amount:,.2f}</strong> to <strong>{beneficiary_name}</strong>.",
                         f"Account: {req.beneficiary_account} | Narration: {req.narration}",
                         f"Reference: {pay_ref}",
-                        f"Business balance after: ₦{w_after.get('available_balance', 0)/100:,.2f}",
+                        f"Business balance after: ₦{biz_notif_balance:,.2f}",
                     ],
                     "If you did not authorise this, contact support immediately."
                 )

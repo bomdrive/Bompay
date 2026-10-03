@@ -32,6 +32,8 @@ from core import (  # noqa: F401,F403,F405
     get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
     # fee helpers
     calculate_nip_inward_commission,
+    # SH balance helper
+    get_sh_subaccount_balance,
     # private helpers (explicitly imported)
     _cloudinary_upload, _cloudinary_delete, _email_html,
     _send_tier_approval_email, _send_tier_revoke_email,
@@ -180,6 +182,14 @@ async def safehaven_webhook(request: Request):
                     await db.wallets.update_one({"user_id": wallet["user_id"]},
                         {"$inc": {"available_balance": amt_kobo, "ledger_balance": amt_kobo}})
                     w = await get_wallet(wallet["user_id"])
+                    # Use live SH balance in notification (primary account)
+                    sh_id_w = wallet.get("sh_account_id")
+                    notif_balance = w["available_balance"] / 100  # shadow fallback
+                    if sh_id_w:
+                        try:
+                            notif_balance = await get_sh_subaccount_balance(sh_id_w)
+                        except Exception:
+                            pass  # keep shadow fallback
                     await ledger_entry(wallet["user_id"], w["_id"], txn_id, "CREDIT", amt_kobo, narration)
                     try:
                         user_doc = await db.users.find_one({"_id": ObjectId(wallet["user_id"])})
@@ -191,9 +201,9 @@ async def safehaven_webhook(request: Request):
                     except Exception as le:
                         logger.error(f"[Ledger] webhook credit mirror failed: {le}")
                     await notify(wallet["user_id"], "Credit Alert",
-                                 f"₦{amount:,.2f} received from {debit_name}. New balance: ₦{(w['available_balance']/100):,.2f}", "success")
+                                 f"₦{amount:,.2f} received from {debit_name}. New balance: ₦{notif_balance:,.2f}", "success")
                     asyncio.create_task(send_event_notification(wallet["user_id"], "TRANSFER_CREDIT", {
-                        "amount": amount, "sender": debit_name, "balance": w["available_balance"] / 100
+                        "amount": amount, "sender": debit_name, "balance": notif_balance
                     }))
                     asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
                     # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
@@ -244,6 +254,42 @@ async def safehaven_webhook(request: Request):
                         if owner_id:
                             await notify(owner_id, f"Business Credit — {biz_name}",
                                          f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
+                            # Live SH balance for business account
+                            biz_sh_bal = None
+                            biz_sh_id = biz.get("sh_subaccount_id")
+                            if biz_sh_id:
+                                try:
+                                    biz_sh_bal = await get_sh_subaccount_balance(biz_sh_id)
+                                except Exception:
+                                    pass
+                            if biz_sh_bal is None:
+                                biz_w = await db.business_wallets.find_one({"business_id": biz_id}) or {}
+                                biz_sh_bal = biz_w.get("available_balance", 0) / 100
+                            # SMS + email to business owner on inbound credit
+                            asyncio.create_task(send_event_sms(owner_id, "BUSINESS_TRANSFER_CREDIT", {
+                                "amount": amount, "sender_biz": debit_name,
+                                "ref": session_id,
+                                "balance": biz_sh_bal,
+                            }))
+                            async def _send_biz_credit_email(oid=owner_id, bn=biz_name, amt=amount, dn=debit_name, sid=session_id):
+                                try:
+                                    owner_doc = await db.users.find_one({"_id": ObjectId(oid)})
+                                    owner_email = (owner_doc or {}).get("email", "")
+                                    owner_name  = f"{(owner_doc or {}).get('first_name','')} {(owner_doc or {}).get('last_name','')}".strip() or "Customer"
+                                    if owner_email:
+                                        html = _email_html(
+                                            f"Business Credit — ₦{amt:,.2f}",
+                                            [
+                                                f"Hi {owner_name}, your business <strong>{bn}</strong> received a credit.",
+                                                f"Amount: <strong>₦{amt:,.2f}</strong> from <strong>{dn}</strong>",
+                                                f"Reference: {sid}",
+                                            ],
+                                            "Log in to BOMPAY Business to view your balance and transactions."
+                                        )
+                                        await send_email(to=owner_email, subject=f"[BOMPAY] Business Credit — {bn}", html=html)
+                                except Exception as ex:
+                                    logger.warning(f"[BIZ-CREDIT-EMAIL] {ex}")
+                            asyncio.create_task(_send_biz_credit_email())
                         logger.info(f"[SH-WEBHOOK] ✅ business credit ₦{amount} → {biz_name} ({biz_id})")
                     else:
                         logger.info(f"[SH-WEBHOOK] business duplicate skipped session_id={session_id}")

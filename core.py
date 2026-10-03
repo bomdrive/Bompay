@@ -2009,9 +2009,17 @@ async def _handle_sh_transfer_reversal(data: dict, eid: str) -> None:
             {"$inc": {"available_balance": total_refund, "ledger_balance": total_refund}})
         w = await get_wallet(user_id)
         await ledger_entry(user_id, w["_id"], rev_txn_id, "CREDIT", total_refund, "Transfer Reversal")
+        # Use live SH balance in notification
+        sh_id_rev = w.get("sh_account_id")
+        bal_display = w["available_balance"] / 100  # fallback to shadow
+        if sh_id_rev:
+            try:
+                bal_display = await get_sh_subaccount_balance(sh_id_rev)
+            except Exception:
+                pass
         await notify(user_id, "Transfer Reversed",
                      f"₦{total_refund/100:,.2f} refunded — your earlier transfer was reversed by the bank. "
-                     f"New balance: ₦{w['available_balance']/100:,.2f}", "info")
+                     f"New balance: ₦{bal_display:,.2f}", "info")
         logger.info(f"[SH Reversal] Processed: uid={user_id} refund=₦{total_refund/100:,.2f} rev_ref={rev_ref}")
     except Exception as e:
         logger.error(f"[SH Reversal] Handler error eid={eid}: {e}")

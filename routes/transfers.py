@@ -168,6 +168,7 @@ async def send_money(req: TransferReq, request: Request):
         raise HTTPException(400, f"Insufficient wallet balance. Available: ₦{(w['available_balance']/100):,.2f}, Need: ₦{(total/100):,.2f}")
     # Also verify Safe Haven sub-account balance matches
     sh_id = w.get("sh_account_id")
+    sh_balance: float | None = None
     if sh_id:
         sh_balance = await get_sh_subaccount_balance(sh_id)
         if sh_balance * 100 < total:
@@ -189,8 +190,8 @@ async def send_money(req: TransferReq, request: Request):
         "metadata": {"bank_code": req.bank_code, "account_number": req.account_number,
                      "beneficiary_name": req.beneficiary_name, "narration": req.narration,
                      "stamp_duty_applied": stamp_duty_ngn > 0},
-        "balance_before_kobo": w["available_balance"],
-        "balance_after_kobo": w["available_balance"] - total,
+        "balance_before_kobo": int(sh_balance * 100) if sh_balance is not None else w["available_balance"],
+        "balance_after_kobo": int((sh_balance - total / 100) * 100) if sh_balance is not None else w["available_balance"] - total,
         "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()
     })
     updated = await db.wallets.find_one_and_update(
@@ -250,9 +251,11 @@ async def send_money(req: TransferReq, request: Request):
         await audit(user["_id"], "BANK_TRANSFER", "wallet",
                     {"amount": req.amount, "beneficiary": req.beneficiary_name})
         w_after = await get_wallet(user["_id"])
+        # Use live SH balance for notification; fall back to shadow if SH not configured
+        bal_for_notif = (sh_balance - total / 100) if sh_balance is not None else (w_after["available_balance"] / 100)
         asyncio.create_task(send_event_notification(user["_id"], "TRANSFER_DEBIT", {
             "amount": req.amount, "beneficiary": req.beneficiary_name,
-            "ref": txn_id, "balance": w_after["available_balance"] / 100
+            "ref": txn_id, "balance": bal_for_notif
         }))
         asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "TRANSFER", f"bank transfer to {req.beneficiary_name}"))
         asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
@@ -539,64 +542,35 @@ async def bompay_transfer(req: BompayTransferReq, request: Request):
     total = amt + fee
 
     sender_wallet = await get_wallet(user["_id"])
-    if sender_wallet["available_balance"] < total:
-        raise HTTPException(400, f"Insufficient wallet balance. Available: ₦{(sender_wallet['available_balance']/100):,.2f}, Need: ₦{(total/100):,.2f}")
-
-    # Also check SA subaccount balance
+    # PRIMARY: Live Safe Haven balance check
     sh_id = sender_wallet.get("sh_account_id")
-    if sh_id:
-        sh_balance = await get_sh_subaccount_balance(sh_id)
-        if sh_balance * 100 < total:
-            raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}.")
+    if not sh_id:
+        raise HTTPException(400, "Safe Haven account not configured. Please complete KYC.")
+    sh_balance = await get_sh_subaccount_balance(sh_id)
+    if sh_balance * 100 < total:
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}")
 
     receiver_name = f"{receiver_doc.get('first_name','')} {receiver_doc.get('last_name','')}".strip().upper()
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
 
-    # Record sender DEBIT transaction
-    await db.transactions.insert_one({
-        "transaction_id": txn_id, "idempotency_key": idem, "user_id": user["_id"],
-        "type": "BOMPAY_INTERNAL_TRANSFER", "direction": "DEBIT", "amount": amt, "fee": fee,
-        "vat": 0, "currency": "NGN", "status": "PROCESSING", "provider": "SAFEHAVEN",
-        "description": f"BOMPAY Transfer to {receiver_name}",
-        "metadata": {
-            "sh_account_number": receiver_wallet["sh_account_number"],
-            "beneficiary_name": receiver_name, "narration": req.narration,
-            "receiver_user_id": str(receiver_wallet["user_id"])
-        },
-        "balance_before_kobo": sender_wallet["available_balance"],
-        "balance_after_kobo": sender_wallet["available_balance"] - total,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    })
-
-    # Debit sender wallet atomically
-    updated = await db.wallets.find_one_and_update(
-        {"user_id": user["_id"], "available_balance": {"$gte": total}},
-        {"$inc": {"available_balance": -total, "ledger_balance": -total}},
-        return_document=True
-    )
-    if not updated:
-        await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
-        raise HTTPException(400, "Insufficient funds")
-
     sender_sa_account = sender_wallet.get("sh_account_number") or sender_wallet.get("account_number", "")
 
+    # Name enquiry on receiver
+    name_enquiry_ref = txn_id
     try:
-        # Name enquiry on receiver to get valid nameEnquiryReference for SA
-        name_enquiry_ref = txn_id
-        try:
-            ne_res = await call_sh("POST", "/transfers/name-enquiry", body={
-                "bankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "accountNumber": receiver_wallet["sh_account_number"]
-            })
-            ne_data = ne_res.get("data", {})
-            name_enquiry_ref = ne_data.get("sessionId", txn_id)
-            if ne_data.get("accountName"):
-                receiver_name = ne_data["accountName"]
-        except Exception as ne_err:
-            logger.warning(f"[BompayTransfer] name enquiry failed (using txn_id as ref): {ne_err}")
+        ne_res = await call_sh("POST", "/transfers/name-enquiry", body={
+            "bankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "accountNumber": receiver_wallet["sh_account_number"]
+        })
+        ne_data = ne_res.get("data", {})
+        name_enquiry_ref = ne_data.get("sessionId", txn_id)
+        if ne_data.get("accountName"):
+            receiver_name = ne_data["accountName"]
+    except Exception as ne_err:
+        logger.warning(f"[BompayTransfer] name enquiry failed: {ne_err}")
 
-        # Execute Safe Haven transfer: sender SA → receiver SA
+    # PRIMARY: Execute Safe Haven transfer (blocking, SH is the gate)
+    try:
         pr = await call_sh("POST", "/transfers", body={
             "nameEnquiryReference": name_enquiry_ref,
             "debitAccountNumber": sender_sa_account,
@@ -607,81 +581,89 @@ async def bompay_transfer(req: BompayTransferReq, request: Request):
             "narration": req.narration or f"BOMPAY Transfer from {user['first_name']}",
             "paymentReference": txn_id
         })
-        pdata = pr.get("data", {})
-        provider_ref = pdata.get("transactionReference", txn_id)
+    except Exception as e:
+        raise HTTPException(502, f"Transfer failed. Please try again. ({e})")
 
-        # Complete sender transaction
-        await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {
-            "status": "COMPLETED", "provider_reference": provider_ref,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }})
+    pdata = pr.get("data", {})
+    provider_ref = pdata.get("transactionReference", txn_id)
 
-        # Credit receiver BOMPAY wallet immediately
-        # Use provider_ref as provider_reference → prevents webhook double-credit
-        credit_txn_id = f"TXN{secrets.token_hex(12).upper()}"
+    # Record sender DEBIT transaction
+    await db.transactions.insert_one({
+        "transaction_id": txn_id, "idempotency_key": idem, "user_id": user["_id"],
+        "type": "BOMPAY_INTERNAL_TRANSFER", "direction": "DEBIT", "amount": amt, "fee": fee,
+        "vat": 0, "currency": "NGN", "status": "COMPLETED", "provider": "SAFEHAVEN",
+        "description": f"BOMPAY Transfer to {receiver_name}",
+        "metadata": {
+            "sh_account_number": receiver_wallet["sh_account_number"],
+            "beneficiary_name": receiver_name, "narration": req.narration,
+            "receiver_user_id": str(receiver_wallet["user_id"])
+        },
+        "balance_before_kobo": int(sh_balance * 100),
+        "balance_after_kobo":  int(sh_balance * 100) - total,
+        "provider_reference": provider_ref,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    })
+
+    # SHADOW: Debit sender BOMPAY wallet mirror
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": user["_id"]},
+        {"$inc": {"available_balance": -total, "ledger_balance": -total}}
+    ))
+
+    # Credit receiver BOMPAY wallet mirror (SH already credited via transfer)
+    credit_txn_id = f"TXN{secrets.token_hex(12).upper()}"
+    await db.transactions.insert_one({
+        "transaction_id": credit_txn_id,
+        "user_id": str(receiver_wallet["user_id"]),
+        "type": "BOMPAY_INTERNAL_TRANSFER", "direction": "CREDIT", "amount": amt,
+        "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
+        "provider": "SAFEHAVEN",
+        "description": f"BOMPAY Transfer from {user['first_name']} {user.get('last_name','')}".strip(),
+        "provider_reference": provider_ref,
+        "metadata": {"sender_user_id": user["_id"],
+                     "sender_name": f"{user['first_name']} {user.get('last_name','')}".strip()},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    })
+    asyncio.create_task(db.wallets.update_one(
+        {"user_id": str(receiver_wallet["user_id"])},
+        {"$inc": {"available_balance": amt, "ledger_balance": amt}}
+    ))
+
+    # Fee income record
+    if fee > 0:
         await db.transactions.insert_one({
-            "transaction_id": credit_txn_id,
-            "user_id": str(receiver_wallet["user_id"]),
-            "type": "BOMPAY_INTERNAL_TRANSFER", "direction": "CREDIT", "amount": amt,
-            "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
-            "provider": "SAFEHAVEN",
-            "description": f"BOMPAY Transfer from {user['first_name']} {user.get('last_name','')}".strip(),
-            "provider_reference": provider_ref,
-            "metadata": {"sender_user_id": user["_id"],
-                         "sender_name": f"{user['first_name']} {user.get('last_name','')}".strip()},
+            "transaction_id": f"FEE{txn_id}", "user_id": "PLATFORM",
+            "type": "FEE_INCOME", "direction": "CREDIT", "amount": fee, "fee": 0,
+            "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
+            "description": f"BOMPAY transfer fee from {user['first_name']}",
+            "metadata": {"source_txn": txn_id, "payer_id": user["_id"], "service": "BOMPAY_TRANSFER"},
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat()
         })
-        await db.wallets.update_one(
-            {"user_id": str(receiver_wallet["user_id"])},
-            {"$inc": {"available_balance": amt, "ledger_balance": amt}}
-        )
+    sh_bompay_fee_ngn = float(pdata.get("fee") or pdata.get("charge") or 0)
+    asyncio.create_task(_sweep_fee_margin(
+        txn_id=txn_id, user_account=sender_sa_account,
+        bompay_fee_ngn=fee_ngn, sh_fee_ngn=sh_bompay_fee_ngn, category="BOMPAY_TRANSFER_FEES"
+    ))
 
-        # Fee income record
-        if fee > 0:
-            await db.transactions.insert_one({
-                "transaction_id": f"FEE{txn_id}", "user_id": "PLATFORM",
-                "type": "FEE_INCOME", "direction": "CREDIT", "amount": fee, "fee": 0,
-                "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
-                "description": f"BOMPAY transfer fee from {user['first_name']}",
-                "metadata": {"source_txn": txn_id, "payer_id": user["_id"], "service": "BOMPAY_TRANSFER"},
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            })
-        # Sweep BOMPAY margin to BOMPAY Transfer Fees charge account
-        # SH internal (sub→sub) transfers are typically free, so full BOMPAY fee is the margin
-        sh_bompay_fee_ngn = float(pdata.get("fee") or pdata.get("charge") or 0)
-        asyncio.create_task(_sweep_fee_margin(
-            txn_id=txn_id, user_account=sender_sa_account,
-            bompay_fee_ngn=fee_ngn, sh_fee_ngn=sh_bompay_fee_ngn, category="BOMPAY_TRANSFER_FEES"
-        ))
+    await notify(user["_id"], "Transfer Successful",
+                 f"₦{req.amount:,.2f} sent to {receiver_name}.", "success")
+    await notify(str(receiver_wallet["user_id"]), "Money Received",
+                 f"₦{req.amount:,.2f} received from {user['first_name']}.", "success")
+    await audit(user["_id"], "BOMPAY_INTERNAL_TRANSFER", "wallet",
+                {"amount": req.amount, "receiver": receiver_name})
+    asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "TRANSFER", f"BOMPAY transfer to {receiver_name}"))
+    asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
+    asyncio.create_task(_complete_epos_txn_bg(str(receiver_wallet["user_id"]), int(req.amount * 100), "BOMPAY"))
 
-        await notify(user["_id"], "Transfer Successful",
-                     f"₦{req.amount:,.2f} sent to {receiver_name}.", "success")
-        await notify(str(receiver_wallet["user_id"]), "Money Received",
-                     f"₦{req.amount:,.2f} received from {user['first_name']}.", "success")
-        await audit(user["_id"], "BOMPAY_INTERNAL_TRANSFER", "wallet",
-                    {"amount": req.amount, "receiver": receiver_name})
-        asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "TRANSFER", f"BOMPAY transfer to {receiver_name}"))
-        asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
-        asyncio.create_task(_complete_epos_txn_bg(str(receiver_wallet["user_id"]), int(req.amount * 100), "BOMPAY"))
-
-        return {
-            "transaction_id": txn_id, "status": "COMPLETED",
-            "amount": req.amount, "fee": fee / 100,
-            "receiver_name": receiver_name,
-            "provider_reference": provider_ref
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        await db.wallets.update_one({"user_id": user["_id"]},
-                                    {"$inc": {"available_balance": total, "ledger_balance": total}})
-        await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
-        await notify(user["_id"], "Transfer Failed",
-                     f"Transfer of ₦{req.amount:,.2f} failed. Funds reversed.", "error")
-        raise HTTPException(500, f"Transfer failed. Funds reversed.")
+    return {
+        "transaction_id": txn_id, "status": "COMPLETED",
+        "amount": req.amount, "fee": fee / 100,
+        "receiver_name": receiver_name,
+        "provider_reference": provider_ref
+    }
 
 # ===== TRANSACTIONS =====
 
