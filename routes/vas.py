@@ -64,6 +64,9 @@ from core import (  # noqa: F401
     vas_debit, vas_complete, vas_refund,
     _credit_cashback_bg, _check_referral_bg,
 )
+from routes.strowallet import (
+    strow_buy_airtime, strow_buy_data, strow_buy_cable,
+)
 import ledger as pg_ledger
 
 router = APIRouter()
@@ -96,6 +99,9 @@ async def buy_airtime(req: AirtimeReq, request: Request):
                 "provider_id": pid, "phone_number": req.phone_number, "amount": req.amount
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
+        elif provider == "STROWALLET":
+            result = await strow_buy_airtime(req.phone_number, req.amount, req.network)
+            pref = result["reference"]
         else:
             r = await call_sh("POST", "/vas/pay/airtime", body={"serviceCategoryId": "airtime",
                 "amount": req.amount, "channel": "WEB", "phoneNumber": req.phone_number, "network": req.network})
@@ -146,6 +152,12 @@ async def buy_data(req: DataReq, request: Request):
                 "bundle_id": bundle_id, "phone_number": req.phone_number
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
+        elif provider == "STROWALLET":
+            result = await strow_buy_data(
+                phone=req.phone_number, amount=req.amount,
+                network=req.network, variation_code=req.plan_id,
+            )
+            pref = result["reference"]
         else:
             r = await call_sh("POST", "/vas/pay/data", body={"serviceCategoryId": "data",
                 "bundleCode": req.plan_id, "amount": req.amount, "channel": "WEB",
@@ -200,6 +212,13 @@ async def pay_cable(req: CableReq, request: Request):
                 "plan_id": plan_id, "cardnumber": req.smartcard_number, "phone": req.smartcard_number
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
+        elif svc_provider == "STROWALLET":
+            result = await strow_buy_cable(
+                phone=req.smartcard_number, amount=req.amount,
+                provider=req.provider, variation_code=req.package_id,
+                smartcard_number=req.smartcard_number,
+            )
+            pref = result["reference"]
         else:
             r = await call_sh("POST", "/vas/pay/cable-tv", body={"serviceCategoryId": "cable-tv",
                 "bundleCode": req.package_id, "amount": req.amount, "channel": "WEB", "cardNumber": req.smartcard_number})

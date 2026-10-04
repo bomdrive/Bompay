@@ -65,6 +65,7 @@ from core import (  # noqa: F401
     _credit_cashback_bg, _check_referral_bg, _complete_epos_txn_bg,
 )
 import ledger as pg_ledger
+from routes.strowallet import strow_name_enquiry, strow_bank_transfer
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -89,15 +90,22 @@ async def get_banks():
 @router.post("/transfers/name-enquiry")
 async def name_enquiry(req: NameEnquiryReq, request: Request):
     await get_current_user(request)
-    r = await call_sh("POST", "/transfers/name-enquiry",
-                       body={"bankCode": req.bank_code, "accountNumber": req.account_number})
-    data = r.get("data", {})
-    sid = data.get("sessionId") or f"NEQ{secrets.token_hex(8).upper()}"
+    transfer_provider = await get_service_provider("TRANSFER")   # "SAFEHAVEN" or "STROWALLET"
+    if transfer_provider == "STROWALLET":
+        result = await strow_name_enquiry(req.bank_code, req.account_number)
+        sid = result["session_id"]
+        account_name = result["account_name"]
+    else:
+        r = await call_sh("POST", "/transfers/name-enquiry",
+                           body={"bankCode": req.bank_code, "accountNumber": req.account_number})
+        data = r.get("data", {})
+        sid = data.get("sessionId") or f"NEQ{secrets.token_hex(8).upper()}"
+        account_name = data.get("accountName", "")
     await db.name_enquiries.update_one({"session_id": sid},
         {"$setOnInsert": {"session_id": sid, "bank_code": req.bank_code,
-          "account_number": req.account_number, "account_name": data.get("accountName", ""),
+          "account_number": req.account_number, "account_name": account_name,
           "created_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
-    return {"account_name": data.get("accountName", ""), "account_number": req.account_number,
+    return {"account_name": account_name, "account_number": req.account_number,
             "bank_code": req.bank_code, "session_id": sid}
 
 @router.post("/transfers/send")
@@ -202,19 +210,38 @@ async def send_money(req: TransferReq, request: Request):
         await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
         raise HTTPException(400, "Insufficient funds")
     try:
-        pr = await call_sh("POST", "/transfers", body={
-            "nameEnquiryReference": req.name_enquiry_reference,
-            "debitAccountNumber": w["account_number"],
-            "beneficiaryBankCode": req.bank_code,
-            "beneficiaryAccountNumber": req.account_number,
-            "amount": req.amount,
-            "saveBeneficiary": False,
-            "narration": req.narration or f"Transfer from Bompay",
-            "paymentReference": txn_id
-        })
-        pdata = pr.get("data", {})
+        transfer_provider = await get_service_provider("TRANSFER")
+        if transfer_provider == "STROWALLET":
+            # ── Strowallet transfer path ──────────────────────────────────
+            result = await strow_bank_transfer(
+                amount=req.amount,
+                bank_code=req.bank_code,
+                account_number=req.account_number,
+                narration=req.narration or "BOMPAY Transfer",
+                payment_reference=txn_id,
+                sender_name=f"{user.get('first_name','')} {user.get('last_name','')}".strip() or "BOMPAY",
+                name_enquiry_ref=req.name_enquiry_reference or "",
+            )
+            pdata = result.get("raw", {}).get("data", {})
+            provider_ref = result["reference"]
+        else:
+            # ── Safe Haven transfer path (default) ────────────────────────
+            pr = await call_sh("POST", "/transfers", body={
+                "nameEnquiryReference": req.name_enquiry_reference,
+                "debitAccountNumber": w["account_number"],
+                "beneficiaryBankCode": req.bank_code,
+                "beneficiaryAccountNumber": req.account_number,
+                "amount": req.amount,
+                "saveBeneficiary": False,
+                "narration": req.narration or f"Transfer from Bompay",
+                "paymentReference": txn_id
+            })
+            pdata = pr.get("data", {})
+            provider_ref = pdata.get("transactionReference", "")
         await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {
-            "status": "COMPLETED", "provider_reference": pdata.get("transactionReference", ""),
+            "status": "COMPLETED",
+            "provider_reference": provider_ref,
+            "provider": transfer_provider,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }})
         await ledger_entry(user["_id"], w["_id"], txn_id, "DEBIT", total, f"Transfer to {req.beneficiary_name}")
@@ -229,14 +256,14 @@ async def send_money(req: TransferReq, request: Request):
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             })
-        # Sweep BOMPAY margin to Transfer Fees charge account
-        # sh_fee: what Safe Haven actually charged; bompay_fee: what user paid; margin goes to charge account
-        sh_fee_ngn = float(pdata.get("fee") or pdata.get("charges") or pdata.get("charge") or
-                           await get_nip_fee(req.amount))
-        asyncio.create_task(_sweep_fee_margin(
-            txn_id=txn_id, user_account=w["account_number"],
-            bompay_fee_ngn=fee_ngn, sh_fee_ngn=sh_fee_ngn, category="TRANSFER_FEES"
-        ))
+        # Sweep BOMPAY margin to Transfer Fees charge account (Safe Haven only)
+        if transfer_provider != "STROWALLET":
+            sh_fee_ngn = float(pdata.get("fee") or pdata.get("charges") or pdata.get("charge") or
+                               await get_nip_fee(req.amount))
+            asyncio.create_task(_sweep_fee_margin(
+                txn_id=txn_id, user_account=w["account_number"],
+                bompay_fee_ngn=fee_ngn, sh_fee_ngn=sh_fee_ngn, category="TRANSFER_FEES"
+            ))
         # Mirror to PostgreSQL immutable ledger
         try:
             await pg_ledger.record_transfer_out(
@@ -261,7 +288,7 @@ async def send_money(req: TransferReq, request: Request):
         asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
         return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount,
                 "fee": fee/100, "beneficiary_name": req.beneficiary_name,
-                "provider_reference": pdata.get("transactionReference", "")}
+                "provider_reference": provider_ref, "provider": transfer_provider}
     except Exception as e:
         await db.wallets.update_one({"user_id": user["_id"]}, {"$inc": {"available_balance": total, "ledger_balance": total}})
         await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})

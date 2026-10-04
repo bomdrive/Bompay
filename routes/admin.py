@@ -1836,8 +1836,8 @@ async def meter_validate(req: MeterValidateReq, request: Request):
 
 
 # ===== VAS ROUTING (per-service provider selection) =====
-VAS_SERVICES = ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING"]
-VAS_PROVIDERS = ["CDH", "PAIRGATE"]
+VAS_SERVICES  = ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING", "TRANSFER"]
+VAS_PROVIDERS = ["CDH", "PAIRGATE", "STROWALLET", "SAFEHAVEN"]
 
 @router.get("/admin/vas-routing")
 async def get_vas_routing(request: Request):
@@ -1845,7 +1845,8 @@ async def get_vas_routing(request: Request):
     routing = {}
     for svc in VAS_SERVICES:
         doc = await db.vas_routing.find_one({"service": svc})
-        routing[svc] = (doc or {}).get("provider", "CDH")
+        default = "SAFEHAVEN" if svc == "TRANSFER" else "CDH"
+        routing[svc] = (doc or {}).get("provider", default)
     return {"routing": routing, "services": VAS_SERVICES, "providers": VAS_PROVIDERS}
 
 @router.post("/admin/vas-routing")
@@ -1860,6 +1861,12 @@ async def set_vas_routing(request: Request):
             raise HTTPException(400, f"Unknown service: {svc}")
         if prov not in VAS_PROVIDERS:
             raise HTTPException(400, f"Unknown provider: {prov}")
+        # Validate TRANSFER can only use SAFEHAVEN or STROWALLET
+        if svc == "TRANSFER" and prov not in ("SAFEHAVEN", "STROWALLET"):
+            raise HTTPException(400, "Transfer provider must be SAFEHAVEN or STROWALLET")
+        # Validate VAS services cannot use SAFEHAVEN
+        if svc != "TRANSFER" and prov == "SAFEHAVEN":
+            raise HTTPException(400, "SAFEHAVEN is only valid for TRANSFER service")
         await db.vas_routing.update_one(
             {"service": svc},
             {"$set": {"service": svc, "provider": prov, "updated_at": datetime.now(timezone.utc).isoformat()}},
@@ -3898,6 +3905,7 @@ SERVICE_BUCKET_SERVICES = [
     {"key": "CARD", "label": "Card", "description": "Card product float account"},
     {"key": "FAMILY", "label": "Family", "description": "Family wallet allocations float"},
     {"key": "PAYROLL", "label": "Payroll Fee", "description": "Receives ₦50-per-staff payroll processing fee from businesses"},
+    {"key": "VAS", "label": "VAS (Value Added Services)", "description": "Receives user SH debits for airtime, data, cable, electricity, betting"},
     {"key": "CASHBACK", "label": "Cashback", "description": "Source account for cashback payouts to users"},
     {"key": "REFERRAL", "label": "Referral Bonus", "description": "Source account for referral bonus payouts to users"},
 ]
