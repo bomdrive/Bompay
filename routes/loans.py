@@ -67,6 +67,54 @@ import ledger as pg_ledger
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# ─── Loan eligibility helper ────────────────────────────────────────────────
+async def _get_loan_eligibility(user_id: str) -> dict:
+    """Calculate max loan based on transaction volume + repayment history."""
+    # Total completed transaction volume (kobo → naira)
+    pipeline = [
+        {"$match": {"user_id": user_id, "status": "COMPLETED"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]
+    res = await db.transactions.aggregate(pipeline).to_list(1)
+    volume_ngn = (res[0]["total"] if res else 0) / 100
+
+    # Base limit from volume brackets
+    if volume_ngn >= 400_000:
+        base_limit = 100_000.0
+    elif volume_ngn >= 200_000:
+        base_limit = 30_000.0
+    elif volume_ngn >= 100_000:
+        base_limit = 20_000.0
+    else:
+        base_limit = 0.0
+
+    # Adjust for repayment history
+    past_loans = await db.loan_applications.find(
+        {"user_id": user_id, "status": {"$in": ["REPAID", "OVERDUE"]}},
+        {"status": 1}
+    ).to_list(50)
+    multiplier = 1.0
+    for loan in past_loans:
+        if loan.get("status") == "REPAID":
+            multiplier = min(1.5, multiplier + 0.1)
+        else:  # OVERDUE
+            multiplier = max(0.3, multiplier - 0.3)
+
+    max_loan = round(base_limit * multiplier, 2)
+    return {
+        "eligible": max_loan > 0,
+        "transaction_volume": round(volume_ngn, 2),
+        "base_limit": base_limit,
+        "max_loan": max_loan,
+        "multiplier": round(multiplier, 2),
+    }
+
+
+@router.get("/loans/eligibility")
+async def loan_eligibility(request: Request):
+    user = await get_current_user(request)
+    return await _get_loan_eligibility(str(user["_id"]))
+
 @router.get("/loans")
 async def get_loans(request: Request):
     user = await get_current_user(request)
@@ -83,8 +131,19 @@ async def apply_loan(req: LoanReq, request: Request):
     min_amt = loan_cfg.get("min_amount", 5000.0)
     max_amt = loan_cfg.get("max_amount", 500000.0)
     max_tenor = loan_cfg.get("max_tenor", 12)
-    if req.amount < min_amt or req.amount > max_amt:
-        raise HTTPException(400, f"Loan amount must be ₦{min_amt:,.0f}–₦{max_amt:,.0f}")
+
+    # ── Transaction-volume eligibility ──────────────────────────────────────
+    eligibility = await _get_loan_eligibility(str(user["_id"]))
+    if not eligibility["eligible"]:
+        raise HTTPException(403,
+            "You need at least ₦100,000 in total transactions to apply for a loan. "
+            "Keep transacting to unlock loan access.")
+    volume_max = eligibility["max_loan"]
+
+    if req.amount < min_amt or req.amount > min(max_amt, volume_max):
+        raise HTTPException(400,
+            f"Based on your transaction history, your maximum loan amount is ₦{volume_max:,.0f}. "
+            f"Minimum is ₦{min_amt:,.0f}.")
     if req.tenor_months < 1 or req.tenor_months > max_tenor:
         raise HTTPException(400, f"Tenor must be 1–{max_tenor} months")
     # Block if user already has an active or pending loan
@@ -167,10 +226,10 @@ async def repay_loan(loan_id: str, req: LoanRepayReq, request: Request):
         })
     except Exception as e:
         raise HTTPException(502, f"Payment failed. Please try again. ({e})")
-    asyncio.create_task(db.wallets.update_one(
+    await db.wallets.update_one(
         {"user_id": user["_id"]},
         {"$inc": {"available_balance": -amt_kobo, "ledger_balance": -amt_kobo}},
-    ))
+    )
     # Update loan record
     new_amount_repaid = round(amount_repaid + repay_amount, 2)
     new_outstanding = round(total_repayment - new_amount_repaid, 2)

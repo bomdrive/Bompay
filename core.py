@@ -227,14 +227,15 @@ def verify_pin_hash(pin: str, encoded_hash: str) -> bool:
         return False
 
 def create_access_token(uid: str, email: str) -> str:
+    # No expiry — session lives until the user explicitly logs out
     return pyjwt.encode(
-        {"sub": uid, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24), "type": "access"},
+        {"sub": uid, "email": email, "type": "access"},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
 def create_refresh_token(uid: str) -> str:
     return pyjwt.encode(
-        {"sub": uid, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"},
+        {"sub": uid, "type": "refresh"},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
@@ -247,7 +248,8 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(401, "Not authenticated")
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                               options={"verify_exp": False})
         if payload.get("type") != "access":
             raise HTTPException(401, "Invalid token type")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
@@ -268,9 +270,10 @@ async def get_admin_user(request: Request) -> dict:
     return user
 
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
+    # 10-year cookie lifetime — effectively never expires
     opts = dict(httponly=True, secure=True, samesite="none", path="/")
-    response.set_cookie("access_token", access_token, max_age=86400, **opts)
-    response.set_cookie("refresh_token", refresh_token, max_age=604800, **opts)
+    response.set_cookie("access_token", access_token, max_age=315360000, **opts)
+    response.set_cookie("refresh_token", refresh_token, max_age=315360000, **opts)
 
 # ===== WALLET / LEDGER UTILS =====
 def gen_account_number() -> str:
