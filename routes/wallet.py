@@ -276,10 +276,13 @@ async def kyc_create_account(req: KYCCreateAccountReq, request: Request):
                 "last_name": " ".join(parts[1:]).capitalize(),
                 "kyc_verified_name": acct_name,
             }})
-    # Set KYC Tier 1
-    await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {
-        "kyc_tier": 1, "kyc_status": "VERIFIED"
-    }})
+    # Set KYC Tier 1 and persist identity fields for later use (cards, loans, etc.)
+    identity_update: dict = {"kyc_tier": 1, "kyc_status": "VERIFIED", "date_of_birth": req.date_of_birth.strip()}
+    if req.identity_type == "NIN":
+        identity_update["nin"] = req.identity_number.strip()
+    else:
+        identity_update["bvn"] = req.identity_number.strip()
+    await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": identity_update})
     # Persist identity_id from SH response to kyc_records for later use (business accounts)
     if sh_id:
         await db.kyc_records.update_one(

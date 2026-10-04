@@ -206,10 +206,11 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     creation_fee = cfg.get("naira_creation_fee", 0.0)
     total_ngn = creation_fee + req.initial_load
 
-    # Pull KYC data from user profile
-    kyc = await db.kyc_submissions.find_one({"user_id": uid}) or {}
-    nin  = kyc.get("nin") or user.get("nin") or ""
-    dob  = kyc.get("dob") or user.get("date_of_birth") or "1990-01-01"
+    # Pull KYC identity data from user profile (set during Tier 1 KYC account creation)
+    id_type   = user.get("kyc_identity_type", "")
+    id_number = user.get("kyc_identity_number", "")
+    nin = user.get("nin") or (id_number if id_type == "NIN" else "")
+    dob = user.get("date_of_birth") or "1990-01-01"
     phone = user.get("phone", "").lstrip("0")
     if not phone.startswith("234"):
         phone = "234" + phone
@@ -217,7 +218,9 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     last  = (user.get("last_name")  or (user.get("fullname", "User User").split() + [""])[1])
 
     if not nin:
-        raise HTTPException(400, "NIN required for Naira card. Complete KYC first.")
+        if user.get("bvn") or id_type == "BVN":
+            raise HTTPException(400, "Naira card creation requires NIN. Your account was set up with BVN. Please complete KYC with your NIN to get a Naira virtual card.")
+        raise HTTPException(400, "NIN is required for Naira card. Please complete KYC (Tier 1) first.")
 
     # Step 1 – Get or create Strowallet customer
     sw_cust_id = None
@@ -297,10 +300,12 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     load_ngn = req.initial_load_usd * rate
     total_ngn = creation_fee_ngn + load_ngn
 
-    kyc = await db.kyc_submissions.find_one({"user_id": uid}) or {}
-    nin  = kyc.get("nin") or user.get("nin") or ""
-    bvn  = kyc.get("bvn") or user.get("bvn") or ""
-    dob  = kyc.get("dob") or user.get("date_of_birth") or "1990-01-01"
+    # Pull KYC identity data from user profile (set during Tier 1 KYC account creation)
+    id_type   = user.get("kyc_identity_type", "")
+    id_number = user.get("kyc_identity_number", "")
+    nin = user.get("nin") or (id_number if id_type == "NIN" else "")
+    bvn = user.get("bvn") or (id_number if id_type == "BVN" else "")
+    dob = user.get("date_of_birth") or "1990-01-01"
     phone = user.get("phone", "").lstrip("0")
     if not phone.startswith("234"):
         phone = "234" + phone
@@ -311,7 +316,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     id_type   = "nin" if nin else "bvn"
 
     if not id_number:
-        raise HTTPException(400, "NIN or BVN required for USD card. Complete KYC first.")
+        raise HTTPException(400, "NIN or BVN is required for USD card. Please complete KYC (Tier 1) first.")
 
     # Deduct from Safe Haven first
     await _sh_deduct(user, total_ngn, f"BOMPAY USD {req.card_type.title()} Card creation")
