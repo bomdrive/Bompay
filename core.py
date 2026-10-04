@@ -714,11 +714,13 @@ async def get_vas_provider() -> str:
     return (doc or {}).get("value", "CHEAPDATAHUB")
 
 async def get_service_provider(service: str) -> str:
-    """Return the VAS provider configured for a specific service (AIRTIME, DATA, CABLE, ELECTRICITY, BETTING).
-    Falls back to the global vas_provider, then CDH."""
+    """Return the provider configured for a specific service.
+    TRANSFER defaults to SAFEHAVEN; VAS services default to CDH."""
     doc = await db.vas_routing.find_one({"service": service.upper()})
     if doc and doc.get("provider"):
         return doc["provider"].upper()
+    if service.upper() == "TRANSFER":
+        return "SAFEHAVEN"
     return await get_vas_provider()
 
 async def call_pg(method: str, path: str, body: dict = None) -> dict:
@@ -2264,6 +2266,29 @@ class CloudinarySettingsReq(BaseModel):
 
 
 # ===== VAS HELPERS (shared across routes) =====
+async def sh_internal_transfer(
+    from_account_number: str,
+    to_account_number: str,
+    amount_ngn: float,
+    narration: str,
+    ref: str,
+    name_enquiry_ref: str = "",
+) -> dict:
+    """Make a Safe Haven internal transfer between two SH accounts."""
+    body = {
+        "debitAccountNumber": from_account_number,
+        "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+        "beneficiaryAccountNumber": to_account_number,
+        "amount": amount_ngn,
+        "saveBeneficiary": False,
+        "narration": narration[:60],
+        "paymentReference": ref,
+    }
+    if name_enquiry_ref:
+        body["nameEnquiryReference"] = name_enquiry_ref
+    return await call_sh("POST", "/transfers", body=body)
+
+
 async def _sh_vas_sweep(user_id: str, amount_kobo: int, txn_id: str, narration: str) -> None:
     """Fire-and-forget: mirror VAS deduction on user's Safe Haven virtual account."""
     try:

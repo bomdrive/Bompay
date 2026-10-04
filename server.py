@@ -61,14 +61,14 @@ from routes import (
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business,
+    push, epos, promotions, family, business, cards,
 )
 
 for mod in [
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business,
+    push, epos, promotions, family, business, cards,
 ]:
     app.include_router(mod.router, prefix="/api")
 
