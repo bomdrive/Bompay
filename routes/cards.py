@@ -152,11 +152,18 @@ class CreateNairaCardReq(BaseModel):
     address: Optional[str] = "Lagos, Nigeria"
     city: Optional[str] = "Lagos"
     state: Optional[str] = "lg"
+    # Identity override — for users who completed KYC before these fields were persisted
+    nin: Optional[str] = None
+    date_of_birth: Optional[str] = None   # YYYY-MM-DD
 
 class CreateUSDCardReq(BaseModel):
     card_type: str      # "reusable" or "onetime"
     initial_load_usd: float = 3.0
     transaction_pin: str
+    # Identity override — for users who completed KYC before these fields were persisted
+    nin: Optional[str] = None
+    bvn: Optional[str] = None
+    date_of_birth: Optional[str] = None   # YYYY-MM-DD
 
 class FundCardReq(BaseModel):
     amount: float
@@ -180,6 +187,24 @@ async def list_cards(request: Request):
         {"_id": 0}
     ).to_list(20)
     return {"cards": cards}
+
+
+@router.get("/cards/identity-status")
+async def get_identity_status(request: Request):
+    """Returns what identity data is stored — frontend uses this to decide if it must collect NIN/BVN."""
+    user = await get_current_user(request)
+    id_type   = user.get("kyc_identity_type", "")
+    id_number = user.get("kyc_identity_number", "")
+    has_nin = bool(user.get("nin") or (id_number and id_type == "NIN"))
+    has_bvn = bool(user.get("bvn") or (id_number and id_type == "BVN"))
+    has_dob = bool(user.get("date_of_birth"))
+    return {
+        "has_nin": has_nin,
+        "has_bvn": has_bvn,
+        "has_dob": has_dob,
+        "has_identity": has_nin or has_bvn,
+        "identity_type": "NIN" if has_nin else ("BVN" if has_bvn else None),
+    }
 
 
 @router.post("/cards/naira")
@@ -206,11 +231,11 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     creation_fee = cfg.get("naira_creation_fee", 0.0)
     total_ngn = creation_fee + req.initial_load
 
-    # Pull KYC identity data from user profile (set during Tier 1 KYC account creation)
+    # Pull KYC identity data — request body overrides (for pre-fix users), then stored fields
     id_type   = user.get("kyc_identity_type", "")
     id_number = user.get("kyc_identity_number", "")
-    nin = user.get("nin") or (id_number if id_type == "NIN" else "")
-    dob = user.get("date_of_birth") or "1990-01-01"
+    nin = req.nin or user.get("nin") or (id_number if id_type == "NIN" else "")
+    dob = req.date_of_birth or user.get("date_of_birth") or "1990-01-01"
     phone = user.get("phone", "").lstrip("0")
     if not phone.startswith("234"):
         phone = "234" + phone
@@ -218,9 +243,17 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     last  = (user.get("last_name")  or (user.get("fullname", "User User").split() + [""])[1])
 
     if not nin:
-        if user.get("bvn") or id_type == "BVN":
+        if user.get("bvn") or (id_type == "BVN" and not req.nin):
             raise HTTPException(400, "Naira card creation requires NIN. Your account was set up with BVN. Please complete KYC with your NIN to get a Naira virtual card.")
-        raise HTTPException(400, "NIN is required for Naira card. Please complete KYC (Tier 1) first.")
+        raise HTTPException(400, "NIN is required for Naira card. Please provide your NIN to continue.")
+
+    # Persist identity fields for future use if they were supplied in this request
+    if req.nin and not user.get("nin"):
+        update: dict = {"nin": req.nin}
+        if req.date_of_birth and not user.get("date_of_birth"):
+            update["date_of_birth"] = req.date_of_birth
+        from bson import ObjectId as _OID
+        await db.users.update_one({"_id": _OID(uid)}, {"$set": update})
 
     # Step 1 – Get or create Strowallet customer
     sw_cust_id = None
@@ -300,12 +333,12 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     load_ngn = req.initial_load_usd * rate
     total_ngn = creation_fee_ngn + load_ngn
 
-    # Pull KYC identity data from user profile (set during Tier 1 KYC account creation)
-    id_type   = user.get("kyc_identity_type", "")
-    id_number = user.get("kyc_identity_number", "")
-    nin = user.get("nin") or (id_number if id_type == "NIN" else "")
-    bvn = user.get("bvn") or (id_number if id_type == "BVN" else "")
-    dob = user.get("date_of_birth") or "1990-01-01"
+    # Pull KYC identity data — request body overrides (for pre-fix users), then stored fields
+    stored_id_type   = user.get("kyc_identity_type", "")
+    stored_id_number = user.get("kyc_identity_number", "")
+    nin = req.nin or user.get("nin") or (stored_id_number if stored_id_type == "NIN" else "")
+    bvn = req.bvn or user.get("bvn") or (stored_id_number if stored_id_type == "BVN" else "")
+    dob = req.date_of_birth or user.get("date_of_birth") or "1990-01-01"
     phone = user.get("phone", "").lstrip("0")
     if not phone.startswith("234"):
         phone = "234" + phone
@@ -316,7 +349,20 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     id_type   = "nin" if nin else "bvn"
 
     if not id_number:
-        raise HTTPException(400, "NIN or BVN is required for USD card. Please complete KYC (Tier 1) first.")
+        raise HTTPException(400, "NIN or BVN is required for USD card. Please provide your NIN or BVN to continue.")
+
+    # Persist identity fields for future use if they were supplied in this request
+    if (req.nin or req.bvn) and not user.get("nin") and not user.get("bvn"):
+        update: dict = {}
+        if req.nin:
+            update["nin"] = req.nin
+        if req.bvn:
+            update["bvn"] = req.bvn
+        if req.date_of_birth and not user.get("date_of_birth"):
+            update["date_of_birth"] = req.date_of_birth
+        if update:
+            from bson import ObjectId as _OID
+            await db.users.update_one({"_id": _OID(uid)}, {"$set": update})
 
     # Deduct from Safe Haven first
     await _sh_deduct(user, total_ngn, f"BOMPAY USD {req.card_type.title()} Card creation")
