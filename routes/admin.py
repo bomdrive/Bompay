@@ -3902,7 +3902,7 @@ SERVICE_BUCKET_SERVICES = [
     {"key": "LOANS", "label": "Loans", "description": "Holds disbursed loan funds; receives repayments"},
     {"key": "AJO", "label": "Ajo Group", "description": "Holds Ajo rotating savings contributions"},
     {"key": "EPOS", "label": "e-POS", "description": "Holds ePOS merchant transaction float"},
-    {"key": "CARD", "label": "Card", "description": "Card product float account"},
+    {"key": "CARD", "label": "Card (Virtual Cards)", "description": "Receives Safe Haven debits when users create or fund Naira/USD virtual cards"},
     {"key": "FAMILY", "label": "Family", "description": "Family wallet allocations float"},
     {"key": "PAYROLL", "label": "Payroll Fee", "description": "Receives ₦50-per-staff payroll processing fee from businesses"},
     {"key": "VAS", "label": "VAS (Value Added Services)", "description": "Receives user SH debits for airtime, data, cable, electricity, betting"},

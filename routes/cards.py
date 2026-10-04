@@ -23,6 +23,7 @@ from core import (
     get_current_user, verify_transaction_pin,
     get_sh_subaccount_balance, sh_name_enquiry, sh_internal_transfer,
     send_event_notification, send_event_sms,
+    get_service_bucket_account,
 )
 
 router = APIRouter()
@@ -119,11 +120,10 @@ async def _sh_deduct(user: dict, amount_ngn: float, narration: str):
     balance = await get_sh_subaccount_balance(wallet["sh_account_id"])
     if balance < amount_ngn:
         raise HTTPException(400, f"Insufficient balance. Available: ₦{balance:,.2f}")
-    # Find CARDS service bucket
-    bucket = await db.service_accounts.find_one({"category": "CARDS"})
-    if not bucket or not bucket.get("sh_account_number"):
-        raise HTTPException(400, "CARDS service account not configured. Contact support.")
-    bucket_acct_num = bucket.get("sh_account_number", "")
+    # Get CARD service bucket account number (set in Admin → Service Accounts → Card)
+    bucket_acct_num = await get_service_bucket_account("CARD")
+    if not bucket_acct_num:
+        raise HTTPException(400, "CARD service account not configured. Go to Admin → Service Accounts → Card to set it up.")
     name_enquiry_ref = ""
     try:
         name_enquiry_ref = await sh_name_enquiry(bucket_acct_num, "090286")
