@@ -282,9 +282,10 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     id_number = user.get("kyc_identity_number", "")
     nin = req.nin or user.get("nin") or (id_number if id_type == "NIN" else "")
     dob = req.date_of_birth or user.get("date_of_birth") or "1990-01-01"
-    phone = user.get("phone", "").lstrip("0")
-    if not phone.startswith("234"):
-        phone = "234" + phone
+    _raw = user.get("phone", "").strip().lstrip("+").lstrip("0")
+    if not _raw.startswith("234"):
+        _raw = "234" + _raw
+    phone = _raw   # 2348034010891 — for Strowallet
     first = (user.get("first_name") or user.get("fullname", "User").split()[0])
     last  = (user.get("last_name")  or (user.get("fullname", "User User").split() + [""])[1])
 
@@ -404,9 +405,11 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     nin = req.nin or user.get("nin") or (stored_id_number if stored_id_type == "NIN" else "")
     bvn = req.bvn or user.get("bvn") or (stored_id_number if stored_id_type == "BVN" else "")
     dob = req.date_of_birth or user.get("date_of_birth") or "1990-01-01"
-    phone = user.get("phone", "").lstrip("0")
-    if not phone.startswith("234"):
-        phone = "234" + phone
+    _raw = user.get("phone", "").strip().lstrip("+").lstrip("0")
+    if not _raw.startswith("234"):
+        _raw = "234" + _raw
+    phone       = _raw          # full intl: 2348034010891 (Strowallet)
+    phone_local = _raw[3:]      # local 10-digit: 8034010891 (Ziiropay — dial_code sent separately)
     first = (user.get("first_name") or user.get("fullname", "User").split()[0])
     last  = (user.get("last_name")  or (user.get("fullname", "User User").split() + [""])[1])
     name_on_card = f"{first} {last}".upper()
@@ -457,7 +460,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
                 "first_name": first, "last_name": last,
                 "id_number": id_number, "id_type": id_type,
                 "email": user["email"],
-                "phone_number": phone,
+                "phone_number": phone_local,
                 "dial_code": "+234",
                 "date_of_birth": dob,
                 "id_front_image": PLACEHOLDER_IMG,
