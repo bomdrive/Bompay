@@ -110,10 +110,12 @@ async def _ziiro(method: str, path: str, params: dict) -> dict:
     data = r.json()
     if not data.get("success", True) and data.get("message"):
         import json as _json
+        clean_msg = data.get("message", "Card provider error — please try again")
+        logger.warning("Ziiropay error /%s → %s | full: %s", path, clean_msg, _json.dumps(data))
         raise HTTPException(400, _json.dumps({
             "provider": "ziiropay",
             "http_status": r.status_code,
-            "message": data.get("message"),
+            "message": clean_msg,
             "errors": data.get("errors"),
         }))
     return data
@@ -375,7 +377,7 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
                     "last4": (card_data.get("maskedPan") or "")[-4:] or "****",
                     "expiry_month": card_data.get("expiryMonth", ""),
                     "expiry_year": card_data.get("expiryYear", ""),
-                    "status": card_data.get("status", "processing"),
+                    "status": "active",  # force active after successful creation
                     "balance": 0.0,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
@@ -394,7 +396,7 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
         "last4": (card_data.get("maskedPan") or "")[-4:] or "****",
         "expiry_month": card_data.get("expiryMonth", ""),
         "expiry_year": card_data.get("expiryYear", ""),
-        "status": card_data.get("status", "processing"),
+        "status": "active",  # force active after successful creation
         "balance": 0.0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -539,13 +541,34 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         "masked_pan": "",
         "last4": "****",
         "expiry": "",
-        "status": card_data.get("card_status", "processing"),
+        "status": "active",  # Ziiropay cards are immediately usable
         "balance": initial_load_usd,
         "name_on_card": name_on_card,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.virtual_cards.insert_one(doc)
     doc.pop("_id", None)
+
+    # ── Eagerly fetch real card detail from Ziiropay ─────────────────────────
+    try:
+        detail_resp = await _ziiro("GET", "fetch-nfccard-detail", {"card_id": card_id})
+        card_detail = (detail_resp.get("response") or {}).get("card_detail") or {}
+        pan_raw  = card_detail.get("card_number") or card_detail.get("masked_pan") or ""
+        real_last4 = card_detail.get("last4") or (pan_raw[-4:] if pan_raw else "")
+        real_exp_m = card_detail.get("expiry_month") or card_detail.get("expiryMonth") or ""
+        real_exp_y = card_detail.get("expiry_year")  or card_detail.get("expiryYear")  or ""
+        patch: dict = {}
+        if real_last4 and not set(real_last4) <= {"*"}: patch["last4"]       = real_last4
+        if pan_raw:                                      patch["masked_pan"]  = pan_raw
+        if real_exp_m:                                   patch["expiry_month"] = real_exp_m
+        if real_exp_y:                                   patch["expiry_year"]  = real_exp_y
+        if patch:
+            await db.virtual_cards.update_one({"card_id": card_id}, {"$set": patch})
+            doc.update(patch)
+        logger.info("[USD Card] Post-creation detail fetch OK card=%s last4=%s", card_id, real_last4 or "n/a")
+    except Exception as _det_err:
+        logger.warning("[USD Card] Post-creation detail fetch failed card=%s: %s", card_id, _det_err)
+
     return {"success": True, "card": doc}
 
 
@@ -725,7 +748,20 @@ async def _toggle_card_status(rec: dict, target: str):
         await _strow("PUT", "naira_ChangeStatus", {"card_id": rec["card_id"], "status": status})
     else:
         status = "active" if target == "active" else "frozen"
-        await _ziiro("POST", "nfc-cards/status", {"card_id": rec["card_id"], "status": status})
+        try:
+            await _ziiro("POST", "nfc-cards/status", {"card_id": rec["card_id"], "status": status})
+        except HTTPException as exc:
+            # Gracefully handle "already in target state" responses from Ziiropay
+            import json as _json
+            raw = exc.detail or ""
+            try:
+                msg = (_json.loads(raw).get("message") or raw).lower() if isinstance(raw, str) else ""
+            except Exception:
+                msg = str(raw).lower()
+            if f"from {status} to {status}" in msg or "already" in msg:
+                logger.info("[STROW TOGGLE] Card %s already %s — treating as success", rec["card_id"], status)
+                return  # no-op: card is already in the desired state
+            raise
 
 
 @router.post("/cards/{card_id}/terminate")
@@ -927,8 +963,40 @@ async def admin_update_card_config(request: Request):
     return {"success": True}
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  WEBHOOK HANDLERS
+@router.post("/admin/cards/sync-status")
+async def admin_sync_card_status(request: Request):
+    """Pull live card status from each provider and update the local DB."""
+    await _require_admin(request)
+    cards = await db.virtual_cards.find(
+        {"status": {"$nin": ["TERMINATED"]}}, {"card_id": 1, "provider": 1, "status": 1}
+    ).to_list(500)
+
+    synced = 0; failed = 0; updated = 0
+    STATUS_MAP_STROW  = {"active": "active", "inactive": "inactive", "blocked": "inactive", "processing": "active"}
+    STATUS_MAP_ZIIRO  = {"active": "active", "frozen": "inactive", "pending": "active", "processing": "active"}
+
+    for rec in cards:
+        card_id = rec["card_id"]
+        try:
+            if rec["provider"] == "strowallet":
+                data   = await _strow("GET", "naira_viewcard", {"card_id": card_id})
+                raw    = ((data.get("data") or {}).get("status") or "").lower()
+                status = STATUS_MAP_STROW.get(raw, raw) or "active"
+            else:
+                data   = await _ziiro("GET", "fetch-nfccard-detail", {"card_id": card_id})
+                detail = (data.get("response") or {}).get("card_detail") or {}
+                raw    = (detail.get("card_status") or detail.get("status") or "").lower()
+                status = STATUS_MAP_ZIIRO.get(raw, raw) or "active"
+            synced += 1
+            if status and status != rec.get("status"):
+                await db.virtual_cards.update_one({"card_id": card_id}, {"$set": {"status": status}})
+                updated += 1
+        except Exception as e:
+            logger.warning("[Sync] card=%s error=%s", card_id, e)
+            failed += 1
+
+    return {"synced": synced, "updated": updated, "failed": failed,
+            "message": f"Synced {synced} cards — {updated} updated, {failed} failed"}
 #  Strowallet (Naira):  POST /api/webhooks/strowallet-cards
 #  Ziiropay   (USD):    POST /api/webhooks/ziiropay-cards
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
