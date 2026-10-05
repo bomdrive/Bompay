@@ -75,6 +75,7 @@ async def _exchange_rate_ngn_usd() -> float:
 async def _strow(method: str, path: str, params: dict) -> dict:
     pub = await strow_pub()
     params["public_key"] = pub
+    params.setdefault("mode", "live")   # ALWAYS use live mode — sandbox only accepts test BVN 12345678901
     url = f"{STROW_BASE}/{path}"
     async with httpx.AsyncClient(timeout=30) as c:
         if method == "GET":
@@ -193,7 +194,8 @@ class CreateNairaCardReq(BaseModel):
     address: Optional[str] = "Lagos, Nigeria"
     city: Optional[str] = "Lagos"
     state: Optional[str] = "lg"
-    # Identity override — for users who completed KYC before these fields were persisted
+    # Identity — BVN required by Strowallet; NIN included if available
+    bvn: Optional[str] = None
     nin: Optional[str] = None
     date_of_birth: Optional[str] = None   # YYYY-MM-DD
 
@@ -298,9 +300,10 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     creation_fee = cfg.get("naira_creation_fee", 0.0)
     total_ngn = creation_fee + req.initial_load
 
-    # Pull KYC identity data — request body overrides (for pre-fix users), then stored fields
+    # Pull KYC identity data — BVN is required by Strowallet; NIN included if available
     id_type   = user.get("kyc_identity_type", "")
     id_number = user.get("kyc_identity_number", "")
+    bvn = req.bvn or user.get("bvn") or (id_number if id_type == "BVN" else "")
     nin = req.nin or user.get("nin") or (id_number if id_type == "NIN" else "")
     dob = req.date_of_birth or user.get("date_of_birth") or "1990-01-01"
     _raw = user.get("phone", "").strip().lstrip("+").lstrip("0")
@@ -311,17 +314,19 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     last  = (user.get("last_name")  or (user.get("fullname", "User User").split() + [""])[1])
 
     if not nin:
-        if user.get("bvn") or (id_type == "BVN" and not req.nin):
-            raise HTTPException(400, "Naira card creation requires NIN. Your account was set up with BVN. Please complete KYC with your NIN to get a Naira virtual card.")
-        raise HTTPException(400, "NIN is required for Naira card. Please provide your NIN to continue.")
+        raise HTTPException(400, "NIN is required for Naira card creation. Please provide your 11-digit NIN (National Identification Number).")
 
     # Persist identity fields for future use if they were supplied in this request
+    identity_update: dict = {}
+    if req.bvn and not user.get("bvn"):
+        identity_update["bvn"] = req.bvn
     if req.nin and not user.get("nin"):
-        update: dict = {"nin": req.nin}
-        if req.date_of_birth and not user.get("date_of_birth"):
-            update["date_of_birth"] = req.date_of_birth
+        identity_update["nin"] = req.nin
+    if req.date_of_birth and not user.get("date_of_birth"):
+        identity_update["date_of_birth"] = req.date_of_birth
+    if identity_update:
         from bson import ObjectId as _OID
-        await db.users.update_one({"_id": _OID(uid)}, {"$set": update})
+        await db.users.update_one({"_id": _OID(uid)}, {"$set": identity_update})
 
     # Step 1 – Get or create Strowallet customer
     sw_cust_id = None
@@ -330,7 +335,8 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
         sw_cust_id = cust_doc["provider_customer_id"]
     else:
         resp = await _strow("POST", "naira_carduser", {
-            "firstname": first, "lastname": last,
+            "firstname": first,
+            "lastname": last,
             "email": user["email"],
             "phone": phone,
             "nin": nin,
@@ -341,7 +347,14 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
             "state": req.state,
             "provider": "black",
         })
-        sw_cust_id = (resp.get("data") or {}).get("customer_id")
+        sw_cust_id = (
+            (resp.get("data") or {}).get("customer_id")
+            or (resp.get("data") or {}).get("customerId")
+            or (resp.get("data") or {}).get("id")
+            or resp.get("customer_id")
+            or resp.get("customerId")
+            or resp.get("id")
+        )
         if not sw_cust_id:
             raise HTTPException(502, "Failed to create card profile with provider")
         await db.card_customers.insert_one({
@@ -352,7 +365,8 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
 
     # Step 2 – Create card FIRST (before any debit — avoid charge without card)
     resp = await _strow("POST", "naira_createcard", {
-        "customerId": sw_cust_id,
+        "customer_id": sw_cust_id,
+        "customerId": sw_cust_id,   # include both spellings — Strowallet API varies
         "type": "virtual",
         "brand": brand,
         "provider": "black",
@@ -862,9 +876,10 @@ async def refresh_card_balance(card_id: str, request: Request):
             if live is not None:
                 balance = float(live)
         else:
-            # Ziiropay — try nfc-card-balance endpoint
-            data = await _ziiro("GET", "nfc-card-balance", {"card_id": card_id})
-            live = (data.get("response") or {}).get("balance")
+            # Ziiropay — fetch-nfccard-detail includes live balance
+            data = await _ziiro("GET", "fetch-nfccard-detail", {"card_id": card_id})
+            detail = (data.get("response") or {}).get("card_detail") or data.get("response") or {}
+            live = detail.get("balance") or detail.get("card_balance") or detail.get("available_balance")
             if live is not None:
                 balance = float(live)
     except Exception as e:
