@@ -23,7 +23,7 @@ from core import (
     get_current_user, verify_transaction_pin,
     get_sh_subaccount_balance, sh_name_enquiry, sh_internal_transfer,
     send_event_notification, send_event_sms, send_push_notification,
-    get_service_bucket_account,
+    get_service_bucket_account, _verify_cron,
 )
 
 router = APIRouter()
@@ -402,6 +402,27 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     }
     await db.virtual_cards.insert_one(doc)
     doc.pop("_id", None)
+
+    # ── Eagerly fetch real card detail from Strowallet ───────────────────────
+    try:
+        detail_resp = await _strow("GET", "naira_viewcard", {"card_id": card_id})
+        strow_detail = detail_resp.get("data") or {}
+        masked = strow_detail.get("maskedPan") or strow_detail.get("masked_pan") or ""
+        real_last4 = (masked[-4:] if masked and not set(masked[-4:]) <= {"*"} else "") if masked else ""
+        patch: dict = {}
+        if masked:   patch["masked_pan"]  = masked
+        if real_last4: patch["last4"]     = real_last4
+        exp_m = strow_detail.get("expiryMonth") or strow_detail.get("expiry_month") or ""
+        exp_y = strow_detail.get("expiryYear")  or strow_detail.get("expiry_year")  or ""
+        if exp_m: patch["expiry_month"] = exp_m
+        if exp_y: patch["expiry_year"]  = exp_y
+        if patch:
+            await db.virtual_cards.update_one({"card_id": card_id}, {"$set": patch})
+            doc.update(patch)
+        logger.info("[Naira Card] Post-creation detail fetch OK card=%s last4=%s", card_id, real_last4 or "n/a")
+    except Exception as _det_err:
+        logger.warning("[Naira Card] Post-creation detail fetch failed card=%s: %s", card_id, _det_err)
+
     return {"success": True, "card": doc}
 
 
@@ -997,6 +1018,41 @@ async def admin_sync_card_status(request: Request):
 
     return {"synced": synced, "updated": updated, "failed": failed,
             "message": f"Synced {synced} cards — {updated} updated, {failed} failed"}
+
+
+@router.post("/cron/card-status-sync")
+async def cron_card_status_sync(request: Request):
+    """Cron-safe route: daily sync of card statuses from providers (no admin JWT needed)."""
+    _verify_cron(request)
+    cards = await db.virtual_cards.find(
+        {"status": {"$nin": ["TERMINATED"]}}, {"card_id": 1, "provider": 1, "status": 1}
+    ).to_list(500)
+    synced = 0; failed = 0; updated = 0
+    STATUS_MAP_STROW = {"active": "active", "inactive": "inactive", "blocked": "inactive", "processing": "active"}
+    STATUS_MAP_ZIIRO = {"active": "active", "frozen": "inactive", "pending": "active", "processing": "active"}
+    for rec in cards:
+        card_id = rec["card_id"]
+        try:
+            if rec["provider"] == "strowallet":
+                data = await _strow("GET", "naira_viewcard", {"card_id": card_id})
+                raw = ((data.get("data") or {}).get("status") or "").lower()
+                status = STATUS_MAP_STROW.get(raw, raw) or "active"
+            else:
+                data = await _ziiro("GET", "fetch-nfccard-detail", {"card_id": card_id})
+                detail = (data.get("response") or {}).get("card_detail") or {}
+                raw = (detail.get("card_status") or detail.get("status") or "").lower()
+                status = STATUS_MAP_ZIIRO.get(raw, raw) or "active"
+            synced += 1
+            if status and status != rec.get("status"):
+                await db.virtual_cards.update_one({"card_id": card_id}, {"$set": {"status": status}})
+                updated += 1
+        except Exception as e:
+            logger.warning("[Cron Sync] card=%s error=%s", card_id, e)
+            failed += 1
+    return {"synced": synced, "updated": updated, "failed": failed,
+            "message": f"Synced {synced} cards — {updated} updated, {failed} failed"}
+
+
 #  Strowallet (Naira):  POST /api/webhooks/strowallet-cards
 #  Ziiropay   (USD):    POST /api/webhooks/ziiropay-cards
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

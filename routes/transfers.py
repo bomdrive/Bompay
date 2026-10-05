@@ -171,16 +171,16 @@ async def send_money(req: TransferReq, request: Request):
     stamp_duty = int(stamp_duty_ngn * 100)
     total = amt + fee + stamp_duty
     w = await get_wallet(user["_id"])
-    # Check Bompay wallet balance
-    if w["available_balance"] < total:
-        raise HTTPException(400, f"Insufficient wallet balance. Available: ₦{(w['available_balance']/100):,.2f}, Need: ₦{(total/100):,.2f}")
-    # Also verify Safe Haven sub-account balance matches
+    # PRIMARY: Live Safe Haven balance check (SH is the financial authority)
     sh_id = w.get("sh_account_id")
     sh_balance: float | None = None
     if sh_id:
         sh_balance = await get_sh_subaccount_balance(sh_id)
         if sh_balance * 100 < total:
             raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}.")
+    elif w["available_balance"] < total:
+        # Fallback: no SH account linked — use Mongo mirror
+        raise HTTPException(400, f"Insufficient balance. Available: ₦{(w['available_balance']/100):,.2f}, Need: ₦{(total/100):,.2f}")
     signals = fraud_check(amt)
     if signals:
         await db.fraud_alerts.insert_one({
@@ -202,13 +202,11 @@ async def send_money(req: TransferReq, request: Request):
         "balance_after_kobo": int((sh_balance - total / 100) * 100) if sh_balance is not None else w["available_balance"] - total,
         "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()
     })
-    updated = await db.wallets.find_one_and_update(
-        {"user_id": user["_id"], "available_balance": {"$gte": total}},
-        {"$inc": {"available_balance": -total, "ledger_balance": -total}}, return_document=True
+    # SHADOW: Mirror debit — SH is the financial authority; this keeps Mongo mirror in sync
+    await db.wallets.update_one(
+        {"user_id": user["_id"]},
+        {"$inc": {"available_balance": -total, "ledger_balance": -total}}
     )
-    if not updated:
-        await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
-        raise HTTPException(400, "Insufficient funds")
     try:
         transfer_provider = await get_service_provider("TRANSFER")
         if transfer_provider == "STROWALLET":
