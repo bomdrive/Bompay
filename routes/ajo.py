@@ -677,19 +677,44 @@ async def ajo_pay_arrears(group_id: str, req: AjoContributeReq, request: Request
         await db.ajo_members.update_one({"group_id": group_id, "user_id": user["_id"]},
                                         {"$set": {"consecutive_default_days": 0}})
     else:
-        wallet = await db.wallets.find_one_and_update(
-            {"user_id": user["_id"], "available_balance": {"$gte": total_due}},
-            {"$inc": {"available_balance": -total_due, "ledger_balance": -total_due}},
-            return_document=True
-        )
-        if not wallet:
-            raise HTTPException(400, f"Insufficient balance. You owe ₦{total_due/100:,.2f} (contributions + defaulter fees)")
+        # ── PRIMARY: Live SH balance check ──────────────────────────────────
+        wallet = await db.wallets.find_one({"user_id": user["_id"]})
+        sh_id_pa  = (wallet or {}).get("sh_account_id", "")
+        user_sh_pa = (wallet or {}).get("sh_account_number", "")
+        if not sh_id_pa or not user_sh_pa:
+            raise HTTPException(400, "Safe Haven account not configured. Please complete KYC.")
+        sh_bal_pa = await get_sh_subaccount_balance(sh_id_pa)
+        if sh_bal_pa * 100 < total_due:
+            raise HTTPException(400, f"Insufficient balance. You owe ₦{total_due/100:,.2f} (contributions + defaulter fees). Available: ₦{sh_bal_pa:,.2f}")
+        # ── PRIMARY: SH transfer — user → AJO bucket ────────────────────────
+        sh_ajo_acct_pa = await get_service_bucket_account("AJO")
+        if not sh_ajo_acct_pa:
+            raise HTTPException(503, "Ajo service account not configured. Please contact support.")
         txn_id = f"TXN{secrets.token_hex(12).upper()}"
+        ne_ref = await sh_name_enquiry(sh_ajo_acct_pa)
+        try:
+            await call_sh("POST", "/transfers", body={
+                "nameEnquiryReference": ne_ref,
+                "debitAccountNumber": user_sh_pa,
+                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                "beneficiaryAccountNumber": sh_ajo_acct_pa,
+                "amount": total_due / 100,
+                "saveBeneficiary": False,
+                "narration": f"Ajo arrears — {group['name'][:25]}",
+                "paymentReference": txn_id,
+            })
+        except Exception as e:
+            raise HTTPException(502, f"Payment failed. Please try again. ({e})")
+        # SHADOW: Mongo mirror debit (unconditional — SH is the authority)
+        asyncio.create_task(db.wallets.update_one(
+            {"user_id": user["_id"]},
+            {"$inc": {"available_balance": -total_due, "ledger_balance": -total_due}}
+        ))
         now_iso = datetime.now(timezone.utc).isoformat()
         await db.transactions.insert_one({
             "transaction_id": txn_id, "user_id": user["_id"],
             "type": "AJO_ARREARS", "direction": "DEBIT", "amount": total_due, "fee": 0, "vat": 0,
-            "currency": "NGN", "status": "COMPLETED", "provider": "INTERNAL",
+            "currency": "NGN", "status": "COMPLETED", "provider": "SAFEHAVEN",
             "description": f"Ajo arrears payment — {group['name']}",
             "metadata": {"group_id": group_id}, "created_at": now_iso, "updated_at": now_iso
         })

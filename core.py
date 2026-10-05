@@ -2156,34 +2156,56 @@ async def _run_auto_save(run_id: str):
         idem = f"autosave-{goal['goal_id']}-{run_id}"
         if await db.transactions.find_one({"idempotency_key": idem}):
             continue
-        # ─── Atomic debit ───
-        updated_w = await db.wallets.find_one_and_update(
-            {"user_id": user_id, "available_balance": {"$gte": amt}},
-            {"$inc": {"available_balance": -amt, "ledger_balance": -amt}},
-            return_document=True
-        )
-        if not updated_w:
-            # ─── Defaulter fee ───
+        # ─── PRIMARY: Live SH balance check ─────────────────────────────────
+        wallet_doc = await db.wallets.find_one({"user_id": user_id})
+        sh_id_local = (wallet_doc or {}).get("sh_account_id", "")
+        user_sh     = (wallet_doc or {}).get("sh_account_number", "")
+        sh_bal: float | None = None
+        if sh_id_local:
+            try:
+                sh_bal = await get_sh_subaccount_balance(sh_id_local)
+            except Exception as _e:
+                logger.warning(f"[AutoSave] SH balance fetch failed user={user_id}: {_e}")
+        if sh_bal is None:
+            logger.warning(f"[AutoSave] Skipping user={user_id}: SH balance unavailable")
+            continue
+        if sh_bal * 100 < amt:
+            # ─── Defaulter fee via SH ──────────────────────────────────────
             fee_type = cfg.get("defaulter_fee_type", "FLAT")
             fee_amt = int(cfg.get("defaulter_fee_amount", 200.0) * 100) if fee_type == "FLAT" \
                 else int(amt * cfg.get("defaulter_fee_percentage", 2.0) / 100)
-            if fee_amt > 0:
-                fee_deducted = await db.wallets.find_one_and_update(
-                    {"user_id": user_id, "available_balance": {"$gte": fee_amt}},
-                    {"$inc": {"available_balance": -fee_amt, "ledger_balance": -fee_amt}},
-                    return_document=True
-                )
-                if fee_deducted:
-                    fee_txn_id = f"TXN{secrets.token_hex(12).upper()}"
-                    await db.transactions.insert_one({
-                        "transaction_id": fee_txn_id, "idempotency_key": f"fee-{idem}",
-                        "user_id": user_id, "type": "SAVINGS_DEFAULTER_FEE", "direction": "DEBIT",
-                        "amount": fee_amt, "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
-                        "provider": "INTERNAL", "description": f"Missed auto-save defaulter fee: {goal['name']}",
-                        "metadata": {"goal_id": goal["goal_id"]},
-                        "created_at": now.isoformat(), "updated_at": now.isoformat()
-                    })
-            await notify(user_id, "Auto-Save Missed", f"Insufficient balance for '{goal['name']}'. Defaulter fee applied.", "warning")
+            if fee_amt > 0 and sh_bal * 100 >= fee_amt and user_sh:
+                savings_acct_f = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
+                sh_dest_f = (savings_acct_f or {}).get("sh_account_number", "")
+                if sh_dest_f:
+                    try:
+                        await call_sh("POST", "/transfers", body={
+                            "debitAccountNumber": user_sh,
+                            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                            "beneficiaryAccountNumber": sh_dest_f,
+                            "amount": fee_amt / 100,
+                            "saveBeneficiary": False,
+                            "narration": f"BOMPAY defaulter fee {goal['name'][:20]}",
+                            "paymentReference": f"fee-{idem}",
+                        })
+                        asyncio.create_task(db.wallets.update_one(
+                            {"user_id": user_id},
+                            {"$inc": {"available_balance": -fee_amt, "ledger_balance": -fee_amt}}
+                        ))
+                        fee_txn_id = f"TXN{secrets.token_hex(12).upper()}"
+                        await db.transactions.insert_one({
+                            "transaction_id": fee_txn_id, "idempotency_key": f"fee-{idem}",
+                            "user_id": user_id, "type": "SAVINGS_DEFAULTER_FEE", "direction": "DEBIT",
+                            "amount": fee_amt, "fee": 0, "vat": 0, "currency": "NGN", "status": "COMPLETED",
+                            "provider": "SAFEHAVEN",
+                            "description": f"Missed auto-save defaulter fee: {goal['name']}",
+                            "metadata": {"goal_id": goal["goal_id"]},
+                            "created_at": now.isoformat(), "updated_at": now.isoformat()
+                        })
+                    except Exception as _fe:
+                        logger.warning(f"[AutoSave] Defaulter fee SH transfer failed user={user_id}: {_fe}")
+            await notify(user_id, "Auto-Save Missed",
+                         f"Insufficient balance for '{goal['name']}'. Defaulter fee applied.", "warning")
             continue
         txn_id = f"TXN{secrets.token_hex(12).upper()}"
         await db.transactions.insert_one({
@@ -2195,12 +2217,10 @@ async def _run_auto_save(run_id: str):
         })
         await db.savings_goals.update_one({"goal_id": goal["goal_id"]},
             {"$inc": {"current_amount": amt}, "$set": {"last_auto_save": now.isoformat()}})
-        # SH sweep
+        # SH sweep (user SH → SAVINGS_PROCEEDS bucket)
         try:
             savings_acct = await db.charge_accounts.find_one({"category": "SAVINGS_PROCEEDS"})
             sh_dest = (savings_acct or {}).get("sh_account_number", "")
-            wallet_doc = await db.wallets.find_one({"user_id": user_id})
-            user_sh = (wallet_doc or {}).get("sh_account_number", "")
             if sh_dest and user_sh:
                 await call_sh("POST", "/transfers", body={
                     "debitAccountNumber": user_sh, "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
@@ -2210,6 +2230,11 @@ async def _run_auto_save(run_id: str):
                 })
         except Exception as e:
             logger.warning(f"[AutoSave] SH sweep failed: {e}")
+        # SHADOW: Mongo mirror debit (unconditional — SH is the authority)
+        asyncio.create_task(db.wallets.update_one(
+            {"user_id": user_id},
+            {"$inc": {"available_balance": -amt, "ledger_balance": -amt}}
+        ))
         await notify(user_id, "Auto-Save Complete", f"₦{amt/100:,.2f} auto-saved to '{goal['name']}'.", "success")
 
 

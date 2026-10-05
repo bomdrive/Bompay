@@ -1365,11 +1365,34 @@ async def ziiropay_card_webhook(request: Request):
         merchant_name = (payload.get("merchant") or {}).get("name", "Merchant")
         fee_amt   = float(payload.get("fee", 0))
         amt       = float(payload.get("merchantAmount", amount))
-        # Deduct from shadow USD balance
+        currency  = payload.get("currency", "USD")
+        # Deduct from shadow USD balance (spend + provider fee)
         await db.virtual_cards.update_one({"card_id": card_id}, {"$inc": {"balance": -(amt + fee_amt)}})
-        await _record_card_txn(card_id, event, amt, payload.get("currency","USD"), merchant_name, ref, "success")
+        await _record_card_txn(card_id, event, amt, currency, merchant_name, ref, "success")
+        if fee_amt > 0:
+            await _record_card_txn(card_id, "provider_fee", fee_amt, currency, "Provider Fee", ref, "success")
         await _notify_card_user(card_id, "USD Card Debit",
                                 f"${amt:.2f} spent at {merchant_name}", {"amount": amt})
+        # Apply BOMPAY admin-configured USD spend fee (% of transaction, deducted from Naira wallet)
+        cfg_local = await _card_cfg()
+        spend_fee_pct = cfg_local.get("usd_spend_fee_pct", 0.0)
+        if spend_fee_pct > 0 and amt > 0:
+            # Convert USD spend to NGN for fee deduction using exchange rate
+            try:
+                ex_cfg = cfg_local.get("usd_exchange_rate") or 0
+                if not ex_cfg:
+                    ex_cfg = await _exchange_rate_ngn_usd()
+                fee_ngn = round(amt * float(ex_cfg) * spend_fee_pct / 100, 2)
+                rec_card = await db.virtual_cards.find_one({"card_id": card_id})
+                if rec_card and fee_ngn > 0:
+                    from bson import ObjectId as _BID
+                    user_doc = await db.users.find_one({"_id": _BID(rec_card["user_id"])})
+                    if user_doc:
+                        await _sh_deduct(user_doc, fee_ngn,
+                                         f"Card spend fee {spend_fee_pct}% on ${amt:.2f} at {merchant_name}")
+                        await _record_card_txn(card_id, "spend_fee", fee_ngn, "NGN", "BOMPAY Fee", ref, "success")
+            except Exception as _e:
+                logger.warning("[ZIIRO] USD spend fee deduction failed card=%s: %s", card_id, _e)
 
     elif event == "transaction.refund":
         card_id   = payload.get("card_Id", card_id)
