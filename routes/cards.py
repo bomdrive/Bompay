@@ -144,6 +144,37 @@ async def _sh_deduct(user: dict, amount_ngn: float, narration: str):
     )
 
 
+async def _sh_refund_to_user(user: dict, amount_ngn: float, narration: str):
+    """Refund from CARD service bucket back to user — used when provider fails after debit."""
+    wallet = await db.wallets.find_one({"user_id": str(user["_id"])})
+    if not wallet:
+        return
+    bucket_acct_num = await get_service_bucket_account("CARD")
+    if not bucket_acct_num:
+        return
+    user_acct_num = wallet.get("sh_account_number", "")
+    name_enquiry_ref = ""
+    try:
+        name_enquiry_ref = await sh_name_enquiry(user_acct_num, "090286")
+    except Exception:
+        pass
+    try:
+        await sh_internal_transfer(
+            from_account_number=bucket_acct_num,
+            to_account_number=user_acct_num,
+            amount_ngn=amount_ngn,
+            narration=f"REFUND: {narration}",
+            ref=f"REFUND_{uuid.uuid4().hex[:12]}",
+            name_enquiry_ref=name_enquiry_ref,
+        )
+        await db.wallets.update_one(
+            {"user_id": str(user["_id"])},
+            {"$inc": {"available_balance": int(amount_ngn * 100), "ledger_balance": int(amount_ngn * 100)}}
+        )
+    except Exception:
+        pass  # Log and handle manually via admin
+
+
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
 class CreateNairaCardReq(BaseModel):
     brand: str          # "Verve" or "Mastercard"
@@ -282,11 +313,7 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
             "created_at": datetime.now(timezone.utc),
         })
 
-    # Step 2 – Deduct from Safe Haven
-    if total_ngn > 0:
-        await _sh_deduct(user, total_ngn, f"BOMPAY {brand} Card creation fee")
-
-    # Step 3 – Create card
+    # Step 2 – Create card FIRST (before any debit — avoid charge without card)
     resp = await _strow("POST", "naira_createcard", {
         "customerId": sw_cust_id,
         "type": "virtual",
@@ -296,7 +323,30 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
     card_data = resp.get("data") or {}
     card_id   = card_data.get("card_id") or card_data.get("id")
     if not card_id:
-        raise HTTPException(502, "Card creation response invalid")
+        raise HTTPException(502, "Card creation failed with provider. You have NOT been charged.")
+
+    # Step 3 – Deduct ONLY after provider confirms card created
+    if total_ngn > 0:
+        try:
+            await _sh_deduct(user, total_ngn, f"BOMPAY {brand} Card creation fee")
+        except Exception as debit_err:
+            # Card was issued but debit failed — flag for admin, still give card
+            await db.virtual_cards.insert_one({
+                **{
+                    "card_id": card_id, "user_id": uid, "provider": "strowallet",
+                    "card_type": f"naira_{brand.lower()}", "currency": "NGN",
+                    "brand": brand.upper(),
+                    "masked_pan": card_data.get("maskedPan", ""),
+                    "last4": (card_data.get("maskedPan") or "")[-4:] or "****",
+                    "expiry_month": card_data.get("expiryMonth", ""),
+                    "expiry_year": card_data.get("expiryYear", ""),
+                    "status": card_data.get("status", "processing"),
+                    "balance": 0.0,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "debit_failed": True, "debit_error": str(debit_err),
+            })
+            raise HTTPException(400, f"Card was created but debit failed: {debit_err}. Contact support.")
 
     doc = {
         "card_id": card_id,
@@ -364,9 +414,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
             from bson import ObjectId as _OID
             await db.users.update_one({"_id": _OID(uid)}, {"$set": update})
 
-    # Deduct from Safe Haven first
-    await _sh_deduct(user, total_ngn, f"BOMPAY USD {req.card_type.title()} Card creation")
-
+    # ── Provider call FIRST (no debit yet) ──────────────────────────────────
     if req.card_type == "onetime":
         # Lite card – no KYC customer needed
         resp = await _ziiro("POST", "create_litecard", {
@@ -387,7 +435,6 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         elif cust_doc and cust_doc.get("kyc_status") == "pending":
             raise HTTPException(400, "Your USD card KYC is pending review (usually 24h). Try again soon.")
         else:
-            # Submit KYC — id_front_image is required; we use a 1x1 transparent PNG placeholder
             PLACEHOLDER_IMG = (
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
             )
@@ -418,6 +465,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
                 upsert=True
             )
             if kyc_data.get("status") != "approved":
+                # KYC pending — no debit, no card yet
                 raise HTTPException(202, "KYC submitted successfully! Review takes up to 24 hours. "
                                          "Come back to create your card once approved.")
 
@@ -430,7 +478,10 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         card_id   = card_data.get("card_id")
 
     if not card_id:
-        raise HTTPException(502, "Card creation response invalid")
+        raise HTTPException(502, "Card creation failed with provider. You have NOT been charged.")
+
+    # ── Deduct ONLY after provider confirms card created ─────────────────────
+    await _sh_deduct(user, total_ngn, f"BOMPAY USD {req.card_type.title()} Card creation")
 
     doc = {
         "card_id": card_id,
@@ -1025,3 +1076,25 @@ async def ziiropay_card_webhook(request: Request):
         logger.info("[ZIIRO WEBHOOK] unhandled event=%s card=%s", event, card_id)
 
     return {"status": "ok"}
+
+
+
+@router.post("/admin/cards/refund-user")
+async def admin_refund_card_debit(request: Request):
+    """Admin: manually refund a user who was debited but card creation failed."""
+    admin = await get_current_user(request)
+    if admin.get("role") != "admin":
+        raise HTTPException(403, "Admin only")
+    body = await request.json()
+    phone   = body.get("phone", "").strip()
+    amount  = float(body.get("amount", 0))
+    reason  = body.get("reason", "Card creation failed — manual refund")
+    if not phone or amount <= 0:
+        raise HTTPException(400, "phone and amount required")
+    # Find user
+    norm = phone.lstrip("+").lstrip("234").lstrip("0")
+    target = await db.users.find_one({"phone": {"$regex": norm}})
+    if not target:
+        raise HTTPException(404, "User not found")
+    await _sh_refund_to_user(target, amount, reason)
+    return {"success": True, "message": f"Refunded ₦{amount:,.2f} to {phone}"}
