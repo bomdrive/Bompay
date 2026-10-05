@@ -104,12 +104,18 @@ async def _ziiro(method: str, path: str, params: dict) -> dict:
             r = await c.get(url, params=params)
         elif method == "POST":
             r = await c.post(url, params=params)
-    logger.info("Ziiropay %s /%s → HTTP %s | body: %s", method, path, r.status_code, r.text[:400])
+    logger.info("Ziiropay %s /%s → HTTP %s | body: %s", method, path, r.status_code, r.text[:800])
     if r.status_code >= 500:
         raise HTTPException(502, f"Card provider error (HTTP {r.status_code}): {r.text[:200]}")
     data = r.json()
     if not data.get("success", True) and data.get("message"):
-        raise HTTPException(400, f"Card provider: {data['message']} (code: {r.status_code})")
+        import json as _json
+        raise HTTPException(400, _json.dumps({
+            "provider": "ziiropay",
+            "http_status": r.status_code,
+            "message": data.get("message"),
+            "errors": data.get("errors"),
+        }))
     return data
 
 
