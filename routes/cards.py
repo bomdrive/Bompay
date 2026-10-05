@@ -261,6 +261,7 @@ async def get_card_config_public(request: Request):
     return {
         "naira_creation_fee":  cfg.get("naira_creation_fee", 0.0),
         "naira_fund_fee":      cfg.get("naira_fund_fee", 0.0),
+        "naira_spend_fee_pct": cfg.get("naira_spend_fee_pct", 0.0),
         "usd_creation_fee_usd": cfg.get("usd_creation_fee_usd", 2.0),
         "usd_initial_load_usd": cfg.get("usd_initial_load_usd", 3.0),
         "usd_fund_fee_usd":    cfg.get("usd_fund_fee_usd", 0.0),
@@ -613,8 +614,9 @@ async def fund_card(card_id: str, req: FundCardReq, request: Request):
         rate = await _exchange_rate_ngn_usd()
         amount_usd = req.amount
         amount_ngn = amount_usd * rate
-        fund_fee   = cfg.get("usd_fund_fee_ngn", 0.0)
-        total_ngn  = amount_ngn + fund_fee
+        fund_fee_usd = cfg.get("usd_fund_fee_usd", 0.0)
+        fund_fee_ngn = fund_fee_usd * rate
+        total_ngn  = amount_ngn + fund_fee_ngn
         await _sh_deduct(user, total_ngn, f"USD card funding ****{rec.get('last4','')}")
         await _ziiro("POST", "fund-withdraw-nfccard", {
             "card_id": card_id, "amount": str(amount_usd), "type": "fund"
@@ -721,6 +723,35 @@ async def get_exchange_rate(request: Request):
     return {"rate": rate, "base": "USD", "quote": "NGN"}
 
 
+@router.get("/cards/{card_id}/balance")
+async def refresh_card_balance(card_id: str, request: Request):
+    """Fetch live balance from provider and update stored record."""
+    user = await get_current_user(request)
+    uid  = str(user["_id"])
+    rec  = await db.virtual_cards.find_one({"card_id": card_id, "user_id": uid})
+    if not rec:
+        raise HTTPException(404, "Card not found")
+
+    balance = float(rec.get("balance", 0.0))
+    try:
+        if rec["provider"] == "strowallet":
+            data = await _strow("GET", "naira_viewcard", {"card_id": card_id})
+            live = (data.get("data") or {}).get("balance")
+            if live is not None:
+                balance = float(live)
+        else:
+            # Ziiropay — try nfc-card-balance endpoint
+            data = await _ziiro("GET", "nfc-card-balance", {"card_id": card_id})
+            live = (data.get("response") or {}).get("balance")
+            if live is not None:
+                balance = float(live)
+    except Exception as e:
+        logger.warning("Balance refresh failed card=%s: %s", card_id, e)
+
+    await db.virtual_cards.update_one({"card_id": card_id}, {"$set": {"balance": balance}})
+    return {"card_id": card_id, "balance": balance, "currency": rec["currency"]}
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ADMIN ENDPOINTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -803,6 +834,7 @@ async def admin_get_card_config(request: Request):
     doc.setdefault("usd_spend_fee_pct", 0.0)
     doc.setdefault("naira_creation_fee", 0.0)
     doc.setdefault("naira_fund_fee", 0.0)
+    doc.setdefault("naira_spend_fee_pct", 0.0)
     return doc
 
 
@@ -813,7 +845,7 @@ async def admin_update_card_config(request: Request):
     allowed = {
         "strowallet_public_key", "strowallet_secret_key",
         "ziiropay_public_key",
-        "naira_creation_fee", "naira_fund_fee",
+        "naira_creation_fee", "naira_fund_fee", "naira_spend_fee_pct",
         "usd_creation_fee_usd", "usd_initial_load_usd",
         "usd_fund_fee_usd", "usd_spend_fee_pct",
         # legacy fields kept for backward compat
@@ -993,6 +1025,22 @@ async def strowallet_card_webhook(request: Request):
         await _record_card_txn(card_id, event, amt, payload.get("currency","NGN"), merchant_name, ref, "success")
         await _notify_card_user(card_id, "Card Debit",
                                 f"₦{amt:,.2f} spent at {merchant_name}", {"amount": amt, "fee": fee})
+        # Apply admin-configured spend fee (% of transaction amount)
+        cfg_local = await _card_cfg()
+        spend_fee_pct = cfg_local.get("naira_spend_fee_pct", 0.0)
+        if spend_fee_pct > 0 and amt > 0:
+            fee_ngn = round(amt * spend_fee_pct / 100, 2)
+            try:
+                rec_card = await db.virtual_cards.find_one({"card_id": card_id})
+                if rec_card:
+                    from bson import ObjectId as _BID
+                    user_doc = await db.users.find_one({"_id": _BID(rec_card["user_id"])})
+                    if user_doc:
+                        await _sh_deduct(user_doc, fee_ngn,
+                                         f"Card spend fee {spend_fee_pct}% on ₦{amt:.2f} at {merchant_name}")
+                        await _record_card_txn(card_id, "spend_fee", fee_ngn, "NGN", "BOMPAY Fee", ref, "success")
+            except Exception as _e:
+                logger.warning("Spend fee deduction failed card=%s: %s", card_id, _e)
 
     elif event == "transaction.refund":
         card_id  = payload.get("card_Id", card_id)
