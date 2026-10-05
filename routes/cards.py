@@ -197,6 +197,13 @@ class CreateUSDCardReq(BaseModel):
     nin: Optional[str] = None
     bvn: Optional[str] = None
     date_of_birth: Optional[str] = None   # YYYY-MM-DD
+    # Ziiropay KYC fields — required for reusable card customer creation
+    occupation: Optional[str] = "Employee"
+    employment_status: Optional[str] = "employed"
+    account_purpose: Optional[str] = "personal"
+    annual_salary: Optional[str] = "1200000"
+    expected_monthly_volume: Optional[str] = "100000"
+    place_of_birth: Optional[str] = "Lagos"
 
 class FundCardReq(BaseModel):
     amount: float
@@ -453,6 +460,13 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
                 "state": "Lagos",
                 "postal_code": "100001",
                 "country": "NGA",
+                # Required KYC compliance fields
+                "occupation": req.occupation or "Employee",
+                "employment_status": req.employment_status or "employed",
+                "account_purpose": req.account_purpose or "personal",
+                "annual_salary": req.annual_salary or "1200000",
+                "expected_monthly_volume": req.expected_monthly_volume or "100000",
+                "place_of_birth": req.place_of_birth or "Lagos",
             })
             kyc_data = resp_kyc.get("data") or {}
             ziiro_cust_id = kyc_data.get("customer_id")
