@@ -871,6 +871,8 @@ async def send_event_sms(user_id: str, event_type: str, metadata: dict):
             "FAMILY_WITHDRAW": lambda m: f"BOMPAY Family: NGN{m.get('amount',0):,.0f} returned from {m.get('family','')} Family Wallet to your main wallet.",
             "FAMILY_ALLOCATION": lambda m: f"BOMPAY Family: NGN{m.get('amount',0):,.0f} allocated to your {m.get('family','')} family spending balance.",
             "FAMILY_REQUEST_APPROVED": lambda m: f"BOMPAY Family: Your NGN{m.get('amount',0):,.0f} request from {m.get('family','')} was approved. Your family balance: NGN{m.get('balance',0):,.0f}",
+            # ─── Transfer reversal ───────────────────────────────────────────
+            "TRANSFER_REVERSAL": lambda m: f"BOMPAY Alert: NGN{m.get('amount',0):,.0f} refunded to your wallet — your transfer was reversed. New Bal: NGN{m.get('balance',0):,.0f}",
         }
         fn = templates.get(event_type)
         if not fn:
@@ -1495,6 +1497,8 @@ class FeeConfigReq(BaseModel):
 
 class SupportMessageReq(BaseModel):
     message: str
+    ticket_type: str = "general"   # "general" | "dispute"
+    subject:     str = ""
 
 class AdminReplyReq(BaseModel):
     message: str
@@ -2040,6 +2044,12 @@ async def _handle_sh_transfer_reversal(data: dict, eid: str) -> None:
         await notify(user_id, "Transfer Reversed",
                      f"₦{total_refund/100:,.2f} refunded — your earlier transfer was reversed by the bank. "
                      f"New balance: ₦{bal_display:,.2f}", "info")
+        await send_push_notification(user_id, "Transfer Reversed",
+                                     f"₦{total_refund/100:,.2f} has been refunded to your BOMPAY wallet.", "/dashboard")
+        asyncio.create_task(send_event_sms(user_id, "TRANSFER_REVERSAL", {
+            "amount": total_refund / 100,
+            "balance": bal_display,
+        }))
         logger.info(f"[SH Reversal] Processed: uid={user_id} refund=₦{total_refund/100:,.2f} rev_ref={rev_ref}")
     except Exception as e:
         logger.error(f"[SH Reversal] Handler error eid={eid}: {e}")
@@ -2092,9 +2102,23 @@ async def _handle_sh_transfer_failure(data: dict, eid: str) -> None:
         await db.wallets.update_one({"user_id": user_id},
             {"$inc": {"available_balance": total_refund, "ledger_balance": total_refund}})
         w = await get_wallet(user_id)
+        await ledger_entry(user_id, w["_id"], fail_txn_id, "CREDIT", total_refund, "Transfer Failed — Refund")
+        bal_display = w["available_balance"] / 100
+        try:
+            sh_id = w.get("sh_account_id")
+            if sh_id:
+                bal_display = await get_sh_subaccount_balance(sh_id)
+        except Exception:
+            pass
         await notify(user_id, "Transfer Failed — Refunded",
                      f"₦{total_refund/100:,.2f} refunded — your transfer could not be completed. "
-                     f"New balance: ₦{w['available_balance']/100:,.2f}", "warning")
+                     f"New balance: ₦{bal_display:,.2f}", "warning")
+        await send_push_notification(user_id, "Transfer Failed — Refunded",
+                                     f"₦{total_refund/100:,.2f} has been refunded to your BOMPAY wallet.", "/dashboard")
+        asyncio.create_task(send_event_sms(user_id, "TRANSFER_REVERSAL", {
+            "amount": total_refund / 100,
+            "balance": bal_display,
+        }))
         logger.info(f"[SH Failure] Refund processed: uid={user_id} refund=₦{total_refund/100:,.2f}")
     except Exception as e:
         logger.error(f"[SH Failure] Handler error eid={eid}: {e}")

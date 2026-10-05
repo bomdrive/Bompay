@@ -149,21 +149,38 @@ async def send_support_message(req: SupportMessageReq, request: Request):
     user = await get_current_user(request)
     if not req.message.strip():
         raise HTTPException(400, "Message cannot be empty")
-    ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN"})
-    if not ticket:
+
+    # Disputes always create a fresh ticket (never appended to general open ticket)
+    if req.ticket_type == "dispute":
         ticket_id = str(uuid.uuid4())
+        subject = req.subject or "Card Transaction Dispute"
         await db.support_tickets.insert_one({
             "ticket_id": ticket_id, "user_id": user["_id"],
             "user_name": f"{user.get('first_name','')} {user.get('last_name','')}".strip(),
             "user_email": user.get("email", ""), "status": "OPEN",
+            "ticket_type": "dispute", "subject": subject,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "unread_admin": 1, "unread_user": 0
+            "unread_admin": 1, "unread_user": 0,
         })
     else:
-        ticket_id = ticket["ticket_id"]
-        await db.support_tickets.update_one({"ticket_id": ticket_id},
-            {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$inc": {"unread_admin": 1}})
+        ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN", "ticket_type": {"$ne": "dispute"}})
+        if not ticket:
+            ticket_id = str(uuid.uuid4())
+            await db.support_tickets.insert_one({
+                "ticket_id": ticket_id, "user_id": user["_id"],
+                "user_name": f"{user.get('first_name','')} {user.get('last_name','')}".strip(),
+                "user_email": user.get("email", ""), "status": "OPEN",
+                "ticket_type": "general", "subject": req.subject or "Support Request",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "unread_admin": 1, "unread_user": 0
+            })
+        else:
+            ticket_id = ticket["ticket_id"]
+            await db.support_tickets.update_one({"ticket_id": ticket_id},
+                {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$inc": {"unread_admin": 1}})
+
     msg_id = str(uuid.uuid4())
     await db.support_messages.insert_one({
         "message_id": msg_id, "ticket_id": ticket_id, "user_id": user["_id"],
@@ -171,6 +188,17 @@ async def send_support_message(req: SupportMessageReq, request: Request):
         "read": False, "created_at": datetime.now(timezone.utc).isoformat()
     })
     return {"message_id": msg_id, "ticket_id": ticket_id}
+
+
+@router.get("/support/tickets")
+async def list_user_tickets(request: Request, ticket_type: str = ""):
+    """List all support tickets for the logged-in user. Optional ?ticket_type=dispute filter."""
+    user = await get_current_user(request)
+    q: dict = {"user_id": user["_id"]}
+    if ticket_type:
+        q["ticket_type"] = ticket_type
+    tickets = await db.support_tickets.find(q, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return {"tickets": tickets}
 
 @router.get("/support/messages")
 async def get_support_messages(request: Request):
@@ -195,7 +223,14 @@ async def get_support_ticket_messages(ticket_id: str, request: Request):
     if not ticket:
         raise HTTPException(404, "Ticket not found")
     msgs = await db.support_messages.find({"ticket_id": ticket_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
-    return {"messages": msgs, "status": ticket.get("status"), "created_at": ticket.get("created_at")}
+    # Reset unread_user count now that user has opened the conversation
+    await db.support_tickets.update_one({"ticket_id": ticket_id}, {"$set": {"unread_user": 0}})
+    return {
+        "messages": msgs,
+        "status": ticket.get("status"),
+        "ticket_type": ticket.get("ticket_type", "general"),
+        "created_at": ticket.get("created_at"),
+    }
 
 
 async def get_support_unread(request: Request):
@@ -256,11 +291,54 @@ async def admin_reply_ticket(ticket_id: str, req: AdminReplyReq, request: Reques
         await notify(ticket["user_id"], "Support Reply", "You have a new reply from Bompay support.", "info")
     return {"message_id": msg_id}
 
+async def _send_dispute_resolution_email(ticket: dict):
+    """Send a dispute resolution email when admin closes a dispute ticket."""
+    try:
+        user_id = ticket.get("user_id")
+        if not user_id:
+            return
+        from bson import ObjectId as _OID
+        user = await db.users.find_one({"_id": _OID(user_id)}, {"email": 1, "first_name": 1})
+        if not user or not user.get("email"):
+            return
+        email = user["email"]
+        name = user.get("first_name", "Customer")
+        subject_ticket = ticket.get("subject", "Card Dispute")
+        # Get last admin reply for outcome summary
+        last_admin = await db.support_messages.find_one(
+            {"ticket_id": ticket["ticket_id"], "sender": {"$in": ["ADMIN", "admin"]}},
+            sort=[("created_at", -1)]
+        )
+        outcome = (last_admin or {}).get("text") or (last_admin or {}).get("message") or \
+                  "Your dispute has been reviewed and closed by our team."
+        html = _email_html(
+            f"Hi {name}, Your Dispute Has Been Resolved",
+            [
+                ("Reference", ticket["ticket_id"][:8].upper()),
+                ("Subject", subject_ticket),
+                ("Status", "RESOLVED"),
+                ("Outcome", outcome),
+            ],
+            "If you have further questions, please open a new support ticket in the BOMPAY app."
+        )
+        await send_email(to=email, subject=f"BOMPAY: Dispute Resolved — {subject_ticket}", html=html)
+        logger.info("[Support] Dispute resolution email sent ticket=%s to=%s", ticket["ticket_id"], email)
+    except Exception as e:
+        logger.error("[Support] Dispute resolution email failed: %s", e)
+
+
 @router.patch("/admin/support/{ticket_id}/close")
 async def admin_close_ticket(ticket_id: str, request: Request):
     await get_admin_user(request)
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id})
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    now_iso = datetime.now(timezone.utc).isoformat()
     await db.support_tickets.update_one({"ticket_id": ticket_id},
-        {"$set": {"status": "RESOLVED", "resolved_at": datetime.now(timezone.utc).isoformat()}})
+        {"$set": {"status": "RESOLVED", "resolved_at": now_iso}})
+    # Send resolution email for dispute tickets
+    if ticket.get("ticket_type") == "dispute" and ticket.get("user_id"):
+        asyncio.create_task(_send_dispute_resolution_email(ticket))
     return {"status": "RESOLVED"}
 
 # ===== CRON ENDPOINTS =====

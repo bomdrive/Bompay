@@ -11,7 +11,7 @@ Funding always goes through Safe Haven virtual account balance.
 """
 
 import os, uuid, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -22,7 +22,7 @@ from database import db
 from core import (
     get_current_user, verify_transaction_pin,
     get_sh_subaccount_balance, sh_name_enquiry, sh_internal_transfer,
-    send_event_notification, send_event_sms,
+    send_event_notification, send_event_sms, send_push_notification,
     get_service_bucket_account,
 )
 
@@ -218,6 +218,9 @@ class FundCardReq(BaseModel):
 class CardPinReq(BaseModel):
     new_pin: str
     transaction_pin: str
+
+class DailyLimitReq(BaseModel):
+    limit: float = 0.0  # NGN; 0 = remove limit
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -582,13 +585,56 @@ async def get_card_history(card_id: str, request: Request):
     if not rec:
         raise HTTPException(404, "Card not found")
 
-    if rec["provider"] == "strowallet":
-        data = await _strow("GET", "naira_cardhistory", {"card_id": card_id})
-        txns = data.get("data") or []
-    else:
-        data = await _ziiro("GET", "nfc-card-transactions", {"card_id": card_id})
-        txns = (data.get("response") or {}).get("card_transactions") or []
-    return {"success": True, "transactions": txns}
+    # ── Provider transactions ─────────────────────────────────────────────────
+    provider_txns: list = []
+    try:
+        if rec["provider"] == "strowallet":
+            data = await _strow("GET", "naira_cardhistory", {"card_id": card_id})
+            for t in (data.get("data") or []):
+                provider_txns.append({
+                    "narrative": t.get("narrative") or t.get("description") or "Transaction",
+                    "amount": float(t.get("amount", 0)),
+                    "type": (t.get("type") or "debit").lower(),
+                    "date": t.get("createdAt") or t.get("created_at", ""),
+                    "status": t.get("status", "success"),
+                    "is_fee": False,
+                    "source": "provider",
+                })
+        else:
+            data = await _ziiro("GET", "nfc-card-transactions", {"card_id": card_id})
+            for t in ((data.get("response") or {}).get("card_transactions") or []):
+                provider_txns.append({
+                    "narrative": t.get("description") or t.get("narrative") or "Transaction",
+                    "amount": float(t.get("amount", 0)),
+                    "type": (t.get("type") or "debit").lower(),
+                    "date": t.get("created_at") or t.get("createdAt", ""),
+                    "status": t.get("status", "success"),
+                    "is_fee": False,
+                    "source": "provider",
+                })
+    except Exception as e:
+        logger.warning("Provider history failed card=%s: %s", card_id, e)
+
+    # ── Internal BOMPAY fee records ──────────────────────────────────────────
+    fee_raw = await db.card_transactions.find(
+        {"card_id": card_id, "event": "spend_fee"}
+    ).sort("created_at", -1).limit(50).to_list(50)
+    fee_txns = [{
+        "narrative": f"BOMPAY Spend Fee — {t.get('merchant', '')}",
+        "amount": float(t.get("amount", 0)),
+        "type": "fee",
+        "date": t.get("created_at", ""),
+        "status": t.get("status", "success"),
+        "is_fee": True,
+        "source": "bompay",
+    } for t in fee_raw]
+
+    all_txns = provider_txns + fee_txns
+    try:
+        all_txns.sort(key=lambda x: x.get("date") or "", reverse=True)
+    except Exception:
+        pass
+    return {"success": True, "transactions": all_txns}
 
 
 @router.post("/cards/{card_id}/fund")
@@ -721,6 +767,25 @@ async def get_exchange_rate(request: Request):
     await get_current_user(request)
     rate = await _exchange_rate_ngn_usd()
     return {"rate": rate, "base": "USD", "quote": "NGN"}
+
+
+@router.put("/cards/{card_id}/daily-limit")
+async def set_daily_spend_limit(card_id: str, req: DailyLimitReq, request: Request):
+    """Set (or remove) a daily spend limit for a Naira virtual card."""
+    user = await get_current_user(request)
+    uid  = str(user["_id"])
+    rec  = await db.virtual_cards.find_one({"card_id": card_id, "user_id": uid})
+    if not rec:
+        raise HTTPException(404, "Card not found")
+    if rec.get("currency") != "NGN":
+        raise HTTPException(400, "Daily spend limit is only available for Naira cards")
+    limit = max(0.0, float(req.limit))
+    await db.virtual_cards.update_one(
+        {"card_id": card_id},
+        {"$set": {"daily_spend_limit": limit}}
+    )
+    msg = f"Daily spend limit set to ₦{limit:,.2f}" if limit > 0 else "Daily spend limit removed"
+    return {"success": True, "message": msg, "daily_spend_limit": limit}
 
 
 @router.get("/cards/{card_id}/balance")
@@ -869,7 +934,7 @@ async def admin_update_card_config(request: Request):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def _notify_card_user(card_id: str, title: str, body_text: str, meta: dict):
-    """Look up the card owner and send push + SMS notification."""
+    """Look up the card owner and send push + SMS + in-app notification."""
     try:
         rec = await db.virtual_cards.find_one({"card_id": card_id})
         if not rec:
@@ -877,6 +942,7 @@ async def _notify_card_user(card_id: str, title: str, body_text: str, meta: dict
         uid = rec["user_id"]
         await send_event_notification(uid, "CARD_EVENT", {"title": title, "body": body_text, **meta})
         await send_event_sms(uid, "CARD_EVENT", {"title": title, "body": body_text, **meta})
+        await send_push_notification(uid, f"BOMPAY: {title}", body_text, "/cards")
     except Exception as e:
         logger.warning("Card notification failed card=%s: %s", card_id, e)
 
@@ -940,6 +1006,30 @@ async def strowallet_card_webhook(request: Request):
                 content=f'{{"APPROVE":"NO","reason":"{reason}"}}',
                 media_type="application/json"
             )
+
+        # ── Daily spend limit check ──────────────────────────────────────────
+        daily_limit = float(rec.get("daily_spend_limit", 0))
+        if daily_limit > 0:
+            wat_tz = timezone(timedelta(hours=1))  # WAT = UTC+1
+            today  = datetime.now(wat_tz).strftime("%Y-%m-%d")
+            spent_date = rec.get("daily_spent_date", "")
+            daily_spent = float(rec.get("daily_spent", 0)) if spent_date == today else 0.0
+            if daily_spent + amount > daily_limit:
+                reason = f"Daily spend limit of NGN{daily_limit:,.0f} reached"
+                logger.info("[STROW AUTH] DECLINED (daily limit) card=%s limit=%.2f spent=%.2f req=%.2f",
+                            card_id, daily_limit, daily_spent, amount)
+                return Response(
+                    content=f'{{"APPROVE":"NO","reason":"{reason}"}}',
+                    media_type="application/json"
+                )
+            # Update daily spend tracker atomically
+            if spent_date == today:
+                await db.virtual_cards.update_one({"card_id": card_id}, {"$inc": {"daily_spent": amount}})
+            else:
+                await db.virtual_cards.update_one(
+                    {"card_id": card_id},
+                    {"$set": {"daily_spent": amount, "daily_spent_date": today}}
+                )
 
         # All good — approve
         logger.info("[STROW AUTH] APPROVED card=%s amount=%.2f%s merchant=%s", card_id, amount, currency, merchant)
