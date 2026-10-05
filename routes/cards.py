@@ -85,11 +85,12 @@ async def _strow(method: str, path: str, params: dict) -> dict:
             r = await c.put(url, params=params)
         else:
             raise ValueError(f"Unknown method {method}")
+    logger.info("Strowallet %s /%s → HTTP %s | body: %s", method, path, r.status_code, r.text[:400])
     if r.status_code >= 500:
-        raise HTTPException(502, f"Card provider error ({r.status_code})")
+        raise HTTPException(502, f"Card provider error (HTTP {r.status_code}): {r.text[:200]}")
     data = r.json()
     if not data.get("success", True) and data.get("message"):
-        raise HTTPException(400, data["message"])
+        raise HTTPException(400, f"Card provider: {data['message']} (code: {r.status_code})")
     return data
 
 
@@ -103,11 +104,12 @@ async def _ziiro(method: str, path: str, params: dict) -> dict:
             r = await c.get(url, params=params)
         elif method == "POST":
             r = await c.post(url, params=params)
+    logger.info("Ziiropay %s /%s → HTTP %s | body: %s", method, path, r.status_code, r.text[:400])
     if r.status_code >= 500:
-        raise HTTPException(502, f"Card provider error ({r.status_code})")
+        raise HTTPException(502, f"Card provider error (HTTP {r.status_code}): {r.text[:200]}")
     data = r.json()
     if not data.get("success", True) and data.get("message"):
-        raise HTTPException(400, data["message"])
+        raise HTTPException(400, f"Card provider: {data['message']} (code: {r.status_code})")
     return data
 
 
