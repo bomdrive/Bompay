@@ -253,6 +253,21 @@ async def get_identity_status(request: Request):
     }
 
 
+@router.get("/cards/config/public")
+async def get_card_config_public(request: Request):
+    """Return non-sensitive card fee config for display in the app (no admin required)."""
+    await get_current_user(request)  # must be logged in
+    cfg = await _card_cfg()
+    return {
+        "naira_creation_fee":  cfg.get("naira_creation_fee", 0.0),
+        "naira_fund_fee":      cfg.get("naira_fund_fee", 0.0),
+        "usd_creation_fee_usd": cfg.get("usd_creation_fee_usd", 2.0),
+        "usd_initial_load_usd": cfg.get("usd_initial_load_usd", 3.0),
+        "usd_fund_fee_usd":    cfg.get("usd_fund_fee_usd", 0.0),
+        "usd_spend_fee_pct":   cfg.get("usd_spend_fee_pct", 0.0),
+    }
+
+
 @router.post("/cards/naira")
 async def create_naira_card(req: CreateNairaCardReq, request: Request):
     user = await get_current_user(request)
@@ -394,10 +409,12 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         raise HTTPException(400, "card_type must be reusable or onetime")
 
     cfg = await _card_cfg()
-    creation_fee_ngn = cfg.get("usd_creation_fee_ngn", 1500.0)
+    # Use USD-denominated config fields (fall back to legacy NGN field for existing deployments)
+    creation_fee_usd = cfg.get("usd_creation_fee_usd", 2.0)
+    initial_load_usd = cfg.get("usd_initial_load_usd", 3.0)
     rate = await _exchange_rate_ngn_usd()
-    load_ngn = req.initial_load_usd * rate
-    total_ngn = creation_fee_ngn + load_ngn
+    total_usd = creation_fee_usd + initial_load_usd
+    total_ngn = total_usd * rate
 
     # Pull KYC identity data — request body overrides (for pre-fix users), then stored fields
     stored_id_type   = user.get("kyc_identity_type", "")
@@ -436,7 +453,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
     if req.card_type == "onetime":
         # Lite card – no KYC customer needed
         resp = await _ziiro("POST", "create_litecard", {
-            "amount": str(req.initial_load_usd),
+            "amount": str(initial_load_usd),
             "brand": "VISA",
             "name_on_card": name_on_card,
             "id_number": id_number,
@@ -497,7 +514,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         resp = await _ziiro("POST", "create-nfc-card", {
             "name": name_on_card,
             "customer_id": ziiro_cust_id,
-            "amount": str(req.initial_load_usd),
+            "amount": str(initial_load_usd),
         })
         card_data = resp.get("response") or {}
         card_id   = card_data.get("card_id")
@@ -519,7 +536,7 @@ async def create_usd_card(req: CreateUSDCardReq, request: Request):
         "last4": "****",
         "expiry": "",
         "status": card_data.get("card_status", "processing"),
-        "balance": req.initial_load_usd,
+        "balance": initial_load_usd,
         "name_on_card": name_on_card,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -779,6 +796,13 @@ async def admin_get_card_config(request: Request):
     if doc.get("strowallet_secret_key"):
         sk = doc["strowallet_secret_key"]
         doc["strowallet_secret_key"] = sk[:8] + "..." + sk[-4:]
+    # Fill defaults for new USD fields
+    doc.setdefault("usd_creation_fee_usd", 2.0)
+    doc.setdefault("usd_initial_load_usd", 3.0)
+    doc.setdefault("usd_fund_fee_usd", 0.0)
+    doc.setdefault("usd_spend_fee_pct", 0.0)
+    doc.setdefault("naira_creation_fee", 0.0)
+    doc.setdefault("naira_fund_fee", 0.0)
     return doc
 
 
@@ -789,8 +813,11 @@ async def admin_update_card_config(request: Request):
     allowed = {
         "strowallet_public_key", "strowallet_secret_key",
         "ziiropay_public_key",
-        "naira_creation_fee", "usd_creation_fee_ngn",
-        "naira_fund_fee", "usd_fund_fee_ngn",
+        "naira_creation_fee", "naira_fund_fee",
+        "usd_creation_fee_usd", "usd_initial_load_usd",
+        "usd_fund_fee_usd", "usd_spend_fee_pct",
+        # legacy fields kept for backward compat
+        "usd_creation_fee_ngn", "usd_fund_fee_ngn",
     }
     update = {k: v for k, v in body.items() if k in allowed}
     if not update:
