@@ -144,6 +144,36 @@ async def guest_chat_send(ticket_id: str, req: GuestChatMessageReq, token: str):
     return {"ok": True}
 
 
+@router.post("/support/tickets/{ticket_id}/message")
+async def user_reply_to_ticket(ticket_id: str, request: Request):
+    """Let the owner of a ticket send a follow-up message (reply) on an open dispute."""
+    user = await get_current_user(request)
+    body = await request.json()
+    message = (body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(400, "Message cannot be empty")
+    ticket = await db.support_tickets.find_one({"ticket_id": ticket_id, "user_id": user["_id"]})
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    if ticket.get("status") == "RESOLVED":
+        raise HTTPException(400, "This dispute has been resolved. Please open a new dispute if needed.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    msg_doc = {
+        "message_id": str(uuid.uuid4()),
+        "ticket_id":  ticket_id,
+        "sender":     str(user["_id"]),
+        "text":       message,
+        "created_at": now_iso,
+    }
+    await db.support_messages.insert_one(msg_doc)
+    await db.support_tickets.update_one(
+        {"ticket_id": ticket_id},
+        {"$set": {"updated_at": now_iso}, "$inc": {"unread_admin": 1}}
+    )
+    msg_doc.pop("_id", None)
+    return {"success": True, "message": msg_doc}
+
+
 @router.post("/support/send")
 async def send_support_message(req: SupportMessageReq, request: Request):
     user = await get_current_user(request)
