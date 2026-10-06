@@ -711,8 +711,9 @@ async def fund_card(card_id: str, req: FundCardReq, request: Request):
         amount_ngn = req.amount
         fund_fee   = cfg.get("naira_fund_fee", 0.0)
         total_ngn  = amount_ngn + fund_fee
-        await _sh_deduct(user, total_ngn, f"Naira card funding ****{rec.get('last4','')}")
+        # ── Provider call FIRST — debit only if it succeeds ──
         await _strow("POST", "naira_fundcard", {"card_id": card_id, "amount": str(int(amount_ngn * 100))})
+        await _sh_deduct(user, total_ngn, f"Naira card funding ****{rec.get('last4','')}")
     else:
         # USD card – convert NGN to USD
         rate = await _exchange_rate_ngn_usd()
@@ -721,10 +722,11 @@ async def fund_card(card_id: str, req: FundCardReq, request: Request):
         fund_fee_usd = cfg.get("usd_fund_fee_usd", 0.0)
         fund_fee_ngn = fund_fee_usd * rate
         total_ngn  = amount_ngn + fund_fee_ngn
-        await _sh_deduct(user, total_ngn, f"USD card funding ****{rec.get('last4','')}")
+        # ── Provider call FIRST — debit only if it succeeds ──
         await _ziiro("POST", "fund-withdraw-nfccard", {
             "card_id": card_id, "amount": str(amount_usd), "type": "fund"
         })
+        await _sh_deduct(user, total_ngn, f"USD card funding ****{rec.get('last4','')}")
         await db.virtual_cards.update_one(
             {"card_id": card_id},
             {"$inc": {"balance": amount_usd}}
