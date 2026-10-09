@@ -256,10 +256,18 @@ async def admin_block_user(user_id: str, request: Request):
     reason = body.get("reason", "MANUAL_BLOCK")
     hours = int(body.get("hours", 24))
     blocked_until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+    # Save previous KYC status so it can be restored on unblock
+    user = await db.users.find_one({"_id": ObjectId(user_id)}, {"kyc_status": 1})
+    prev_kyc = (user or {}).get("kyc_status", "PENDING")
+
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {
         "status": "SUSPENDED", "blocked_until": blocked_until,
         "blocked_reason": reason, "blocked_at": datetime.now(timezone.utc).isoformat(),
-        "blocked_by": str(admin["_id"])
+        "blocked_by": str(admin["_id"]),
+        # Demote KYC to PENDING and save previous value for restoration
+        "kyc_status": "PENDING",
+        "prev_kyc_status": prev_kyc,
     }})
     await db.fraud_alerts.insert_one({
         "alert_id": str(uuid.uuid4()), "user_id": user_id,
@@ -268,23 +276,31 @@ async def admin_block_user(user_id: str, request: Request):
         "metadata": {"reason": reason, "hours": hours, "admin": str(admin["_id"])},
         "created_at": datetime.now(timezone.utc).isoformat()
     })
-    await audit(str(admin["_id"]), "BLOCK_USER", "fraud", {"user_id": user_id, "reason": reason, "hours": hours})
+    await audit(str(admin["_id"]), "BLOCK_USER", "fraud", {"user_id": user_id, "reason": reason, "hours": hours, "prev_kyc_status": prev_kyc})
     return {"message": f"User blocked for {hours} hours", "blocked_until": blocked_until}
 
 @router.post("/admin/fraud/unblock-user/{user_id}")
 async def admin_unblock_user(user_id: str, request: Request):
     admin = await get_admin_user(request)
+
+    # Restore previous KYC status saved at block time
+    user = await db.users.find_one({"_id": ObjectId(user_id)}, {"prev_kyc_status": 1})
+    restored_kyc = (user or {}).get("prev_kyc_status") or "APPROVED"
+
     await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {
         "status": "ACTIVE", "blocked_until": None,
-        "blocked_reason": None, "pin_failed_attempts": 0, "pin_locked_until": None
-    }})
+        "blocked_reason": None, "pin_failed_attempts": 0, "pin_locked_until": None,
+        # Restore KYC status
+        "kyc_status": restored_kyc,
+    }, "$unset": {"prev_kyc_status": ""}})
+
     # Resolve any open fraud alerts for this user
     await db.fraud_alerts.update_many(
         {"user_id": user_id, "status": "OPEN"},
         {"$set": {"status": "RESOLVED", "resolved_by": str(admin["_id"]), "resolved_at": datetime.now(timezone.utc).isoformat()}}
     )
-    await audit(str(admin["_id"]), "UNBLOCK_USER", "fraud", {"user_id": user_id})
-    return {"message": "User unblocked and all open alerts resolved"}
+    await audit(str(admin["_id"]), "UNBLOCK_USER", "fraud", {"user_id": user_id, "restored_kyc_status": restored_kyc})
+    return {"message": "User unblocked and all open alerts resolved", "kyc_status_restored": restored_kyc}
 
 @router.get("/admin/fraud/user/{user_id}/activity")
 async def admin_fraud_user_activity(user_id: str, request: Request):
@@ -363,10 +379,15 @@ async def admin_bulk_block(request: Request):
     success, failed = [], []
     for uid in user_ids:
         try:
+            # Save previous KYC before blocking
+            user = await db.users.find_one({"_id": ObjectId(uid)}, {"kyc_status": 1})
+            prev_kyc = (user or {}).get("kyc_status", "PENDING")
             await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {
                 "status": "SUSPENDED", "blocked_until": blocked_until,
                 "blocked_reason": reason, "blocked_at": datetime.now(timezone.utc).isoformat(),
-                "blocked_by": str(admin["_id"])
+                "blocked_by": str(admin["_id"]),
+                "kyc_status": "PENDING",
+                "prev_kyc_status": prev_kyc,
             }})
             await db.fraud_alerts.insert_one({
                 "alert_id": str(uuid.uuid4()), "user_id": uid,
@@ -392,10 +413,14 @@ async def admin_bulk_unblock(request: Request):
     success = 0
     for uid in user_ids:
         try:
+            # Restore previous KYC status
+            user = await db.users.find_one({"_id": ObjectId(uid)}, {"prev_kyc_status": 1})
+            restored_kyc = (user or {}).get("prev_kyc_status") or "APPROVED"
             await db.users.update_one({"_id": ObjectId(uid)}, {"$set": {
                 "status": "ACTIVE", "blocked_until": None, "blocked_reason": None,
-                "pin_failed_attempts": 0, "pin_locked_until": None
-            }})
+                "pin_failed_attempts": 0, "pin_locked_until": None,
+                "kyc_status": restored_kyc,
+            }, "$unset": {"prev_kyc_status": ""}})
             await db.fraud_alerts.update_many(
                 {"user_id": uid, "status": "OPEN"},
                 {"$set": {"status": "RESOLVED", "resolved_by": str(admin["_id"]),
