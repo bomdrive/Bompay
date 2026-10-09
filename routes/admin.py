@@ -1836,7 +1836,7 @@ async def meter_validate(req: MeterValidateReq, request: Request):
 
 
 # ===== VAS ROUTING (per-service provider selection) =====
-VAS_SERVICES  = ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING", "TRANSFER"]
+VAS_SERVICES  = ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING", "EDUCATION", "TRANSFER"]
 VAS_PROVIDERS = ["CDH", "PAIRGATE", "STROWALLET", "SAFEHAVEN"]
 
 @router.get("/admin/vas-routing")
@@ -1865,8 +1865,11 @@ async def set_vas_routing(request: Request):
         if svc == "TRANSFER" and prov not in ("SAFEHAVEN", "STROWALLET"):
             raise HTTPException(400, "Transfer provider must be SAFEHAVEN or STROWALLET")
         # Validate VAS services cannot use SAFEHAVEN
-        if svc != "TRANSFER" and prov == "SAFEHAVEN":
+        if svc not in ("TRANSFER",) and prov == "SAFEHAVEN":
             raise HTTPException(400, "SAFEHAVEN is only valid for TRANSFER service")
+        # Education must use STROWALLET
+        if svc == "EDUCATION" and prov not in ("STROWALLET",):
+            raise HTTPException(400, "Education service only supports STROWALLET provider")
         await db.vas_routing.update_one(
             {"service": svc},
             {"$set": {"service": svc, "provider": prov, "updated_at": datetime.now(timezone.utc).isoformat()}},
@@ -1874,6 +1877,150 @@ async def set_vas_routing(request: Request):
         )
     return {"message": "VAS routing updated", "routing": updates}
 
+
+# ===== SERVICE FLAGS (enable/disable app services) =====
+ALL_MANAGED_SERVICES = [
+    {"key": "AIRTIME",      "label": "Airtime",          "category": "Bills & Top-ups", "icon": "phone"},
+    {"key": "DATA",         "label": "Data Bundles",      "category": "Bills & Top-ups", "icon": "wifi"},
+    {"key": "CABLE",        "label": "Cable TV",          "category": "Bills & Top-ups", "icon": "tv"},
+    {"key": "ELECTRICITY",  "label": "Electricity",       "category": "Bills & Top-ups", "icon": "zap"},
+    {"key": "BETTING",      "label": "Betting",           "category": "Bills & Top-ups", "icon": "gamepad"},
+    {"key": "EDUCATION",    "label": "Education",         "category": "Bills & Top-ups", "icon": "book"},
+    {"key": "TRANSFERS",    "label": "Bank Transfer",     "category": "Transfers",        "icon": "arrow-up-right"},
+    {"key": "CARDS",        "label": "Virtual Cards",     "category": "Business",         "icon": "credit-card"},
+    {"key": "SAVINGS",      "label": "Savings",           "category": "Save & Grow",      "icon": "piggy-bank"},
+    {"key": "LOANS",        "label": "Loans",             "category": "Save & Grow",      "icon": "landmark"},
+    {"key": "AJO",          "label": "Ajo Groups",        "category": "Save & Grow",      "icon": "users-round"},
+    {"key": "FAMILY",       "label": "Family Wallet",     "category": "Family",           "icon": "heart-handshake"},
+    {"key": "EPOS",         "label": "e-POS",             "category": "Business",         "icon": "smartphone"},
+    {"key": "BUSINESS",     "label": "Business Account",  "category": "Business",         "icon": "building2"},
+    {"key": "AJO_WALLET",   "label": "Ajo (Thrift)",      "category": "Save & Grow",      "icon": "users-round"},
+]
+
+
+@router.get("/admin/service-flags")
+async def get_service_flags_admin(request: Request):
+    """Admin: get all service flags with enable/disable state."""
+    await get_admin_user(request)
+    docs = await db.service_flags.find({}).to_list(None)
+    flags_map = {d["service"]: d.get("enabled", True) for d in docs}
+    result = []
+    for svc in ALL_MANAGED_SERVICES:
+        result.append({
+            **svc,
+            "enabled": flags_map.get(svc["key"], True),
+            "updated_at": next((d.get("updated_at") for d in docs if d["service"] == svc["key"]), None),
+        })
+    return {"services": result}
+
+
+@router.put("/admin/service-flags/{service}")
+async def toggle_service_flag(service: str, request: Request):
+    """Admin: enable or disable a service."""
+    await get_admin_user(request)
+    body = await request.json()
+    enabled = bool(body.get("enabled", True))
+    service = service.upper()
+    valid_keys = {s["key"] for s in ALL_MANAGED_SERVICES}
+    if service not in valid_keys:
+        raise HTTPException(400, f"Unknown service: {service}")
+    await db.service_flags.update_one(
+        {"service": service},
+        {"$set": {"service": service, "enabled": enabled, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    state = "enabled" if enabled else "disabled"
+    return {"service": service, "enabled": enabled, "message": f"Service {service} {state}"}
+
+
+@router.get("/service-flags")
+async def get_service_flags_public(request: Request = None):
+    """Public: returns enabled/disabled state for all managed services (no auth)."""
+    docs = await db.service_flags.find({}).to_list(None)
+    flags = {d["service"]: d.get("enabled", True) for d in docs}
+    # Ensure all managed services appear (default True)
+    for svc in ALL_MANAGED_SERVICES:
+        if svc["key"] not in flags:
+            flags[svc["key"]] = True
+    return {"flags": flags}
+
+
+# ===== STROWALLET SMS CONFIG =====
+@router.get("/admin/strowallet-sms-config")
+async def get_strowallet_sms_config(request: Request):
+    await get_admin_user(request)
+    doc = await db.settings.find_one({"key": "strowallet_sms_config"})
+    val = (doc or {}).get("value", {})
+    return {
+        "sender_id": val.get("sender_id", "BOMPAY"),
+        "configured": bool((await db.card_config.find_one({"_id": "global"}) or {}).get("strowallet_public_key") or os.environ.get("STROWALLET_PUBLIC_KEY")),
+    }
+
+
+@router.put("/admin/strowallet-sms-config")
+async def update_strowallet_sms_config(request: Request):
+    await get_admin_user(request)
+    body = await request.json()
+    sender_id = (body.get("sender_id") or "BOMPAY").strip()[:11]
+    await db.settings.update_one(
+        {"key": "strowallet_sms_config"},
+        {"$set": {"key": "strowallet_sms_config", "value": {"sender_id": sender_id}, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return {"message": "Strowallet SMS config saved", "sender_id": sender_id}
+
+
+# ===== EDUCATION CONFIG =====
+@router.get("/admin/education-config")
+async def get_education_config(request: Request):
+    """Admin: get education product pricing."""
+    await get_admin_user(request)
+    from routes.strowallet import EDUCATION_PRODUCTS
+    doc = await db.education_config.find_one({"_id": "prices"}) or {}
+    overrides = doc.get("prices", {})
+    products = []
+    for p in EDUCATION_PRODUCTS:
+        products.append({**p, "amount": overrides.get(p["id"], p["default_amount"])})
+    return {"products": products}
+
+
+@router.put("/admin/education-config")
+async def update_education_config(request: Request):
+    """Admin: update education product pricing."""
+    await get_admin_user(request)
+    body = await request.json()
+    prices = {k: float(v) for k, v in (body.get("prices") or {}).items() if v}
+    await db.education_config.update_one(
+        {"_id": "prices"},
+        {"$set": {"_id": "prices", "prices": prices, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return {"message": "Education pricing updated", "prices": prices}
+
+
+# ===== EDUCATION TRANSACTIONS (admin view) =====
+@router.get("/admin/education/transactions")
+async def get_education_transactions(request: Request, page: int = 1, limit: int = 50):
+    """Admin: list all education purchase transactions."""
+    await get_admin_user(request)
+    skip = (page - 1) * limit
+    cursor = db.transactions.find(
+        {"type": "EDUCATION"},
+        {"_id": 0, "transaction_id": 1, "user_id": 1, "amount": 1, "status": 1,
+         "description": 1, "metadata": 1, "created_at": 1, "provider_ref": 1}
+    ).sort("created_at", -1).skip(skip).limit(limit)
+    txns = await cursor.to_list(limit)
+    total = await db.transactions.count_documents({"type": "EDUCATION"})
+    # Enrich with user info
+    enriched = []
+    for t in txns:
+        user = await db.users.find_one({"_id": ObjectId(t["user_id"])}, {"first_name": 1, "last_name": 1, "phone": 1})
+        enriched.append({
+            **t,
+            "user_name": f"{(user or {}).get('first_name', '')} {(user or {}).get('last_name', '')}".strip(),
+            "user_phone": (user or {}).get("phone", ""),
+        })
+    return {"transactions": enriched, "total": total, "page": page, "pages": (total + limit - 1) // limit}
 
 
 # ===== CHARGE ACCOUNTS =====
@@ -2623,8 +2770,8 @@ async def get_active_sms_provider(request: Request):
 @router.put("/admin/sms-provider")
 async def set_active_sms_provider(req: SmsProviderReq, request: Request):
     await get_admin_user(request)
-    if req.provider not in ("SENDORA", "BULKSMSLIVE"):
-        raise HTTPException(400, "Provider must be SENDORA or BULKSMSLIVE")
+    if req.provider not in ("SENDORA", "BULKSMSLIVE", "STROWALLET"):
+        raise HTTPException(400, "Provider must be SENDORA, BULKSMSLIVE, or STROWALLET")
     await db.settings.update_one(
         {"key": "sms_provider"},
         {"$set": {"key": "sms_provider", "value": req.provider}},

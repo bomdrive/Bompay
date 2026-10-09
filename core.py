@@ -594,8 +594,8 @@ async def mock_sh(path: str, body: dict = None) -> dict:
             "status": "SUCCESS",
             "otpId": f"OTPID{secrets.token_hex(12).upper()}"
         }}
-    # Sub-account creation
-    if "/accounts/v2/subaccount" in path:
+    # Sub-account creation — matches both /accounts/subaccount and /accounts/v2/subaccount
+    if "/accounts" in path and "subaccount" in path and "subaccounts" not in path:
         phone = (body or {}).get("phoneNumber", "+2340000000000")
         email = (body or {}).get("emailAddress", "user@bompay.ng")
         name_part = email.split("@")[0].upper()[:12]
@@ -616,7 +616,7 @@ async def mock_sh(path: str, body: dict = None) -> dict:
         }}
     return {"statusCode": 200, "data": {}}
 
-async def call_sh(method: str, path: str, body: dict = None) -> dict:
+async def call_sh(method: str, path: str, body: dict = None, params: dict = None) -> dict:
     settings = await db.provider_settings.find_one({"provider": "safehaven"})
     cid  = (settings or {}).get("client_id",     "") or os.environ.get("SAFEHAVEN_CLIENT_ID",     "")
     csec = (settings or {}).get("client_secret", "") or os.environ.get("SAFEHAVEN_CLIENT_SECRET", "")
@@ -673,7 +673,7 @@ async def call_sh(method: str, path: str, body: dict = None) -> dict:
             "Content-Type": "application/json"
         }
         async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.request(method, base + path, json=body, headers=hdrs)
+            r = await c.request(method, base + path, json=body, params=params, headers=hdrs)
 
         if r.status_code == 401:
             _sh_token.clear()   # Force token refresh on next request
@@ -824,6 +824,54 @@ async def _send_via_bulksms(phone: str, body: str) -> dict:
     ok = r.status_code < 400 and status_code == 1
     return {"ok": ok, "ref": resp.get("msgid") or resp.get("messageid") or resp.get("id"), "status_code": status_code, "raw": resp}
 
+
+async def get_strowallet_sms_sender_id() -> str:
+    doc = await db.settings.find_one({"key": "strowallet_sms_config"})
+    if doc and doc.get("value", {}).get("sender_id"):
+        return doc["value"]["sender_id"]
+    return os.environ.get("STROWALLET_SMS_SENDER_ID", "BOMPAY")
+
+
+async def _send_via_strowallet_sms(phone: str, body: str) -> dict:
+    """Send SMS via Strowallet bulk-sms endpoint."""
+    cfg = await db.card_config.find_one({"_id": "global"})
+    pub_key = (cfg or {}).get("strowallet_public_key") or os.environ.get("STROWALLET_PUBLIC_KEY", "")
+    if not pub_key:
+        return {"ok": False, "error": "Strowallet public key not configured"}
+    sender_id = await get_strowallet_sms_sender_id()
+    # Strowallet expects 080-format phone numbers
+    phone_norm = phone
+    if phone.startswith("+234"):
+        phone_norm = "0" + phone[4:]
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post("https://strowallet.com/api/bulk-sms/", params={
+            "public_key": pub_key,
+            "sender_id": sender_id,
+            "message": body,
+            "phone": phone_norm,
+        })
+    resp = {}
+    try:
+        resp = r.json()
+    except Exception:
+        pass
+    ok = r.status_code < 400 and resp.get("success", False)
+    return {"ok": ok, "ref": resp.get("message"), "raw": resp}
+
+
+# ===== SERVICE FLAGS =====
+async def get_service_flags() -> dict:
+    """Returns dict of service_key -> enabled. Defaults True if not explicitly set."""
+    docs = await db.service_flags.find({}).to_list(None)
+    return {d["service"]: d.get("enabled", True) for d in docs}
+
+
+async def check_service_enabled(service: str) -> bool:
+    doc = await db.service_flags.find_one({"service": service.upper()})
+    if doc is None:
+        return True  # Default: enabled
+    return doc.get("enabled", True)
+
 async def send_event_sms(user_id: str, event_type: str, metadata: dict):
     """Fire-and-forget SMS notification. Logs to sms_logs. Never raises."""
     try:
@@ -873,6 +921,7 @@ async def send_event_sms(user_id: str, event_type: str, metadata: dict):
             "FAMILY_REQUEST_APPROVED": lambda m: f"BOMPAY Family: Your NGN{m.get('amount',0):,.0f} request from {m.get('family','')} was approved. Your family balance: NGN{m.get('balance',0):,.0f}",
             # ─── Transfer reversal ───────────────────────────────────────────
             "TRANSFER_REVERSAL": lambda m: f"BOMPAY Alert: NGN{m.get('amount',0):,.0f} refunded to your wallet — your transfer was reversed. New Bal: NGN{m.get('balance',0):,.0f}",
+            "EDUCATION": lambda m: f"BOMPAY: {m.get('product','')} purchased successfully. Ref: {m.get('ref','')}. Amount: NGN{m.get('amount',0):,.0f}",
         }
         fn = templates.get(event_type)
         if not fn:
@@ -891,6 +940,8 @@ async def send_event_sms(user_id: str, event_type: str, metadata: dict):
         try:
             if active_provider == "BULKSMSLIVE":
                 result = await _send_via_bulksms(phone, body)
+            elif active_provider == "STROWALLET":
+                result = await _send_via_strowallet_sms(phone, body)
             else:
                 result = await _send_via_sendora(phone, body)
             status = "SENT" if result.get("ok") else "FAILED"
@@ -1468,6 +1519,15 @@ class BetVerifyReq(BaseModel):
     platform: str   # slug e.g. "sportybet"
     customer_id: str
 
+class EducationReq(BaseModel):
+    service_name: str       # waec, jamb, neco, nabteb
+    variation_code: str     # waecdirect, utme, neco-result-checker, etc.
+    amount: float
+    phone: str
+    quantity: int = 1
+    transaction_pin: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
 class BompayTransferReq(BaseModel):
     recipient: str          # phone number OR Safe Haven virtual account number
     amount: float
@@ -1522,7 +1582,7 @@ class BulkSmsCredentialsReq(BaseModel):
     sender_id: str = "BOMPAY"
 
 class SmsProviderReq(BaseModel):
-    provider: str  # SENDORA or BULKSMSLIVE
+    provider: str  # SENDORA, BULKSMSLIVE, or STROWALLET
 
 class CableValidateReq(BaseModel):
     smartcard_number: str

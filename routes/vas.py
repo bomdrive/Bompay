@@ -59,13 +59,14 @@ from core import (  # noqa: F401,F403,F405
 )
 from core import (  # noqa: F401
     AirtimeReq, DataReq, CableReq, ElectricityReq, VerifyReq, BetVerifyReq,
-    BettingReq, CableValidateReq, MeterValidateReq,
+    BettingReq, EducationReq, CableValidateReq, MeterValidateReq,
     require_virtual_account, verify_transaction_pin, calculate_fee, get_nip_fee,
     vas_debit, vas_complete, vas_refund,
     _credit_cashback_bg, _check_referral_bg,
 )
 from routes.strowallet import (
-    strow_buy_airtime, strow_buy_data, strow_buy_cable,
+    strow_buy_airtime, strow_buy_data, strow_buy_cable, strow_buy_education,
+    EDUCATION_PRODUCTS,
 )
 import ledger as pg_ledger
 
@@ -604,4 +605,117 @@ async def meter_validate(req: MeterValidateReq, request: Request):
 # ===== VAS ROUTING (per-service provider selection) =====
 VAS_SERVICES = ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING"]
 VAS_PROVIDERS = ["CDH", "PAIRGATE"]
+
+
+# ===== EDUCATION VAS =====
+
+@router.get("/vas/education-plans")
+async def get_education_plans(request: Request):
+    """Return available education products (WAEC, JAMB, NECO, NABTEB)."""
+    await get_current_user(request)
+    # Allow admin-configured prices from DB
+    overrides = {}
+    try:
+        cfg = await db.education_config.find_one({"_id": "prices"}) or {}
+        overrides = cfg.get("prices", {})
+    except Exception:
+        pass
+    products = []
+    for p in EDUCATION_PRODUCTS:
+        product = dict(p)
+        product["amount"] = overrides.get(p["id"], p["default_amount"])
+        products.append(product)
+    # Group by exam body
+    grouped = {}
+    for p in products:
+        body = p["exam_body"]
+        if body not in grouped:
+            grouped[body] = []
+        grouped[body].append(p)
+    return {"products": products, "grouped": grouped}
+
+
+@router.post("/vas/education")
+async def buy_education(req: EducationReq, request: Request):
+    """Purchase an education scratch card (WAEC, JAMB, NECO, NABTEB)."""
+    user = await get_current_user(request)
+    await require_virtual_account(user)
+    await verify_transaction_pin(user["_id"], req.transaction_pin)
+
+    # Validate product
+    product = next((p for p in EDUCATION_PRODUCTS if p["variation_code"] == req.variation_code and p["service_name"] == req.service_name), None)
+    if not product:
+        raise HTTPException(400, "Invalid education product")
+
+    qty = max(1, min(req.quantity or 1, 5))
+    unit_amount = req.amount
+    total = unit_amount * qty
+    amt_kobo = int(total * 100)
+
+    idem = req.idempotency_key or str(uuid.uuid4())
+    label = f"{product['label']} x{qty}" if qty > 1 else product["label"]
+    txn_id, was_existing = await vas_debit(
+        user["_id"], amt_kobo, idem, "EDUCATION",
+        label,
+        {"service_name": req.service_name, "variation_code": req.variation_code, "quantity": qty, "phone": req.phone}
+    )
+    if was_existing:
+        return {"transaction_id": txn_id, "status": "COMPLETED"}
+
+    try:
+        result = await strow_buy_education(
+            phone=req.phone,
+            amount=unit_amount,
+            service_name=req.service_name,
+            variation_code=req.variation_code,
+        )
+        pref = result["reference"]
+        raw = result.get("raw", {})
+
+        # Try to extract PIN from response
+        pin_data = raw.get("data") or raw.get("pin") or raw.get("pins") or raw.get("cards") or ""
+        if isinstance(pin_data, list):
+            pin_str = " | ".join([str(p) for p in pin_data[:qty]])
+        elif isinstance(pin_data, dict):
+            pin_str = str(pin_data.get("pin") or pin_data.get("serial") or "")
+        else:
+            pin_str = str(pin_data) if pin_data else ""
+
+        # Store pin in transaction metadata
+        await db.transactions.update_one(
+            {"transaction_id": txn_id},
+            {"$set": {"metadata.pin": pin_str, "metadata.edu_ref": pref, "metadata.exam_body": product["exam_body"]}}
+        )
+
+        pts = max(1, int(total * 0.01))
+        await vas_complete(
+            user["_id"], txn_id, amt_kobo, pref,
+            f"{product['label']} Purchased",
+            f"Reference: {pref}",
+            pts,
+            sms_event_type="EDUCATION",
+            sms_meta={"product": product["label"], "phone": req.phone, "ref": txn_id, "amount": total}
+        )
+        asyncio.create_task(send_event_notification(user["_id"], "EDUCATION", {
+            "product": product["label"], "phone": req.phone, "ref": txn_id, "amount": total
+        }))
+        asyncio.create_task(_credit_cashback_bg(user["_id"], total, "EDUCATION", product["label"]))
+        asyncio.create_task(_check_referral_bg(user["_id"], total))
+
+        return {
+            "transaction_id": txn_id,
+            "status": "COMPLETED",
+            "amount": total,
+            "product": product["label"],
+            "reference": pref,
+            "pin": pin_str,
+            "points_earned": pts,
+        }
+    except HTTPException:
+        await vas_refund(user["_id"], txn_id, amt_kobo, f"{product['label']} Failed")
+        raise
+    except Exception as e:
+        logger.error(f"[EDUCATION] purchase error: {e}")
+        await vas_refund(user["_id"], txn_id, amt_kobo, f"{product['label']} Failed")
+        raise HTTPException(500, f"{product['label']} purchase failed. Funds reversed.")
 
