@@ -43,10 +43,15 @@ from database import db
 logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
-JWT_SECRET = os.environ.get("JWT_SECRET", "bompay-secret-change-in-prod")
+_jwt_secret = os.environ.get("JWT_SECRET", "")
+if not _jwt_secret:
+    raise RuntimeError("JWT_SECRET environment variable is required")
+JWT_SECRET: str = _jwt_secret
 JWT_ALGORITHM = "HS256"
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "percosoerp@gmail.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "BomPay@2024!")
+JWT_ACCESS_TTL = int(os.environ.get("JWT_ACCESS_TTL_HOURS", "24"))      # hours
+JWT_REFRESH_TTL = int(os.environ.get("JWT_REFRESH_TTL_DAYS", "30"))     # days
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://bompay-ledger.preview.emergentagent.com")
 WEBHOOK_CRON_SECRET = os.environ.get("WEBHOOK_CRON_SECRET", "")
 SAFEHAVEN_BASE_URL = os.environ.get("SAFEHAVEN_BASE_URL", "https://api.sandbox.safehavenmfb.com")
@@ -227,15 +232,16 @@ def verify_pin_hash(pin: str, encoded_hash: str) -> bool:
         return False
 
 def create_access_token(uid: str, email: str) -> str:
-    # No expiry — session lives until the user explicitly logs out
+    exp = datetime.now(timezone.utc) + timedelta(hours=JWT_ACCESS_TTL)
     return pyjwt.encode(
-        {"sub": uid, "email": email, "type": "access"},
+        {"sub": uid, "email": email, "type": "access", "exp": exp},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
 def create_refresh_token(uid: str) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(days=JWT_REFRESH_TTL)
     return pyjwt.encode(
-        {"sub": uid, "type": "refresh"},
+        {"sub": uid, "type": "refresh", "exp": exp},
         JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
@@ -248,8 +254,7 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(401, "Not authenticated")
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
-                               options={"verify_exp": False})
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(401, "Invalid token type")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
@@ -290,10 +295,11 @@ async def get_admin_user(request: Request) -> dict:
     return user
 
 def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
-    # 10-year cookie lifetime — effectively never expires
+    access_ttl = JWT_ACCESS_TTL * 3600          # hours → seconds
+    refresh_ttl = JWT_REFRESH_TTL * 86400       # days  → seconds
     opts = dict(httponly=True, secure=True, samesite="none", path="/")
-    response.set_cookie("access_token", access_token, max_age=315360000, **opts)
-    response.set_cookie("refresh_token", refresh_token, max_age=315360000, **opts)
+    response.set_cookie("access_token", access_token, max_age=access_ttl, **opts)
+    response.set_cookie("refresh_token", refresh_token, max_age=refresh_ttl, **opts)
 
 # ===== WALLET / LEDGER UTILS =====
 def gen_account_number() -> str:

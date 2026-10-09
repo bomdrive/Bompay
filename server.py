@@ -9,10 +9,13 @@ from pathlib import Path
 from bson import ObjectId
 import cloudinary
 
-from fastapi import FastAPI, APIRouter, Request
+from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
 import ledger as pg_ledger
 
 from database import db, db_client
@@ -20,16 +23,29 @@ from core import (
     hash_password, verify_password, gen_account_number,
     ADMIN_EMAIL, ADMIN_PASSWORD, SAFEHAVEN_BASE_URL, FRONTEND_URL,
     WEBAUTHN_RP_ID, WEBAUTHN_ORIGIN, WEBAUTHN_RP_NAME,
-    APP_NAME, EMERGENT_LLM_KEY,
+    APP_NAME, EMERGENT_LLM_KEY, get_current_user,
 )
+from rate_limit import limiter
 
 # ===== APP SETUP =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).parent
 
-app = FastAPI(title="Bompay API", version="1.0.0")
+app = FastAPI(
+    title="Bompay API", version="1.0.0",
+    docs_url=None, redoc_url=None, openapi_url=None,  # disabled — protected endpoints below
+)
 api_router = APIRouter(prefix="/api")
+
+# ===== RATE LIMITER =====
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Too many requests. Please try again later."})
+
+app.add_middleware(SlowAPIMiddleware)
 
 # ===== CORS =====
 # EXTRA_ORIGINS: comma-separated list of additional allowed origins (set in Railway env)
@@ -46,15 +62,61 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "X-CSRF-Token"],
     expose_headers=["Set-Cookie"],
 )
+
+# ===== SECURITY HEADERS =====
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+    response.headers.setdefault("Cache-Control", "no-store")
+    # Prevent server fingerprinting
+    if "server" in response.headers:
+        del response.headers["server"]
+    return response
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
     msgs = [f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": "; ".join(msgs)})
+
+# ===== PROTECTED API DOCS (admin only) =====
+ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "false").lower() == "true"
+
+@app.get("/api/docs", include_in_schema=False)
+async def admin_swagger(request: Request):
+    if not ENABLE_DOCS:
+        raise HTTPException(404, "Not found")
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Bompay API Docs")
+
+@app.get("/api/redoc", include_in_schema=False)
+async def admin_redoc(request: Request):
+    if not ENABLE_DOCS:
+        raise HTTPException(404, "Not found")
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return get_redoc_html(openapi_url="/api/openapi.json", title="Bompay API ReDoc")
+
+@app.get("/api/openapi.json", include_in_schema=False)
+async def admin_openapi(request: Request):
+    if not ENABLE_DOCS:
+        raise HTTPException(404, "Not found")
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return JSONResponse(app.openapi())
 
 # ===== REGISTER ROUTERS =====
 from routes import (

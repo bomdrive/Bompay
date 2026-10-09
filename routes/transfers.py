@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import csv, io
 from fpdf import FPDF
 
+from rate_limit import limiter
 from database import db
 from core import (  # noqa: F401,F403,F405
     # auth
@@ -110,7 +111,8 @@ async def name_enquiry(req: NameEnquiryReq, request: Request):
             "bank_code": req.bank_code, "session_id": sid}
 
 @router.post("/transfers/send")
-async def send_money(req: TransferReq, request: Request):
+@limiter.limit("10/minute")
+async def send_money(request: Request, req: TransferReq):
     user = await get_current_user(request)
     await require_virtual_account(user)
     await require_service_enabled("TRANSFERS")
@@ -501,7 +503,8 @@ async def cron_scheduled_reminders(request: Request):
     return {"reminded": reminded, "date": today}
 
 @router.post("/transfers/bompay-send")
-async def bompay_transfer(req: BompayTransferReq, request: Request):
+@limiter.limit("10/minute")
+async def bompay_transfer(request: Request, req: BompayTransferReq):
     """Transfer funds from sender's SA subaccount directly to receiver's SA subaccount."""
     user = await get_current_user(request)
     await require_virtual_account(user)

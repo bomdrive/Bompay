@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import csv, io
 from fpdf import FPDF
 
+from rate_limit import limiter
 from database import db
 from core import (  # noqa: F401,F403,F405
     # auth
@@ -89,7 +90,8 @@ async def health():
 
 # ===== AUTH ROUTES =====
 @router.post("/auth/register")
-async def register(req: RegisterReq, response: Response):
+@limiter.limit("10/hour")
+async def register(request: Request, req: RegisterReq, response: Response):
     email = req.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(400, "Email already registered")
@@ -123,9 +125,30 @@ async def register(req: RegisterReq, response: Response):
             "reward_points": 500, "referral_code": ref_code, "account_number": acct}
 
 @router.post("/auth/login")
-async def login(req: LoginReq, request: Request, response: Response):
+@limiter.limit("15/minute")
+async def login(request: Request, req: LoginReq, response: Response):
     email = req.email.lower().strip()
-    ip = request.client.host
+    ip = _get_client_ip(request)
+
+    # ── IP-based lockout (10 attempts/5 min) ─────────────────────────
+    ip_key = f"ip:{ip}"
+    ip_rec = await db.login_attempts.find_one({"identifier": ip_key})
+    if ip_rec:
+        ip_locked = ip_rec.get("locked_at")
+        if ip_locked:
+            try:
+                if (datetime.now(timezone.utc) - datetime.fromisoformat(ip_locked)) < timedelta(minutes=5):
+                    raise HTTPException(429, "Too many login attempts from this IP. Try again in 5 minutes.")
+                else:
+                    await db.login_attempts.delete_one({"identifier": ip_key})
+                    ip_rec = None
+            except (ValueError, TypeError):
+                raise HTTPException(429, "Too many login attempts from this IP. Try again in 5 minutes.")
+        elif ip_rec.get("count", 0) >= 10:
+            await db.login_attempts.update_one({"identifier": ip_key},
+                {"$set": {"locked_at": datetime.now(timezone.utc).isoformat()}})
+            raise HTTPException(429, "Too many login attempts from this IP. Try again in 5 minutes.")
+
     identifier = email  # Use email-only (not ip:email) to work correctly in multi-pod deployments
     attempts = await db.login_attempts.find_one({"identifier": identifier})
     if attempts:
@@ -153,6 +176,12 @@ async def login(req: LoginReq, request: Request, response: Response):
             {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc).isoformat()}},
             upsert=True
         )
+        # Also track IP-based failure
+        await db.login_attempts.update_one(
+            {"identifier": ip_key},
+            {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc).isoformat()}},
+            upsert=True
+        )
         count = (attempts.get("count", 0) + 1) if attempts else 1
         if count >= 5:
             await db.login_attempts.update_one({"identifier": identifier},
@@ -162,6 +191,9 @@ async def login(req: LoginReq, request: Request, response: Response):
     if user.get("status") == "SUSPENDED":
         raise HTTPException(403, "Account suspended. Contact support.")
     await db.login_attempts.delete_one({"identifier": identifier})
+    # Clear IP-based tracking on successful login
+    if ip_rec:
+        await db.login_attempts.delete_one({"identifier": ip_key})
     uid = str(user["_id"])
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"last_login": datetime.now(timezone.utc).isoformat()}})
     set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
@@ -313,6 +345,7 @@ async def reset_pin_endpoint(req: ResetPinReq, request: Request):
 
 
 @router.post("/auth/forgot-pin")
+@limiter.limit("5/hour")
 async def forgot_pin(request: Request):
     """Send PIN reset OTP to authenticated user's registered phone."""
     user = await get_current_user(request)
@@ -401,19 +434,17 @@ async def check_phone(req: CheckPhoneReq):
     }
 
 @router.post("/auth/send-phone-otp")
-async def send_phone_otp(req: SendPhoneOtpReq):
-    """Send OTP to phone via BulkSMSLive. Rate-limited to 1 per minute."""
+@limiter.limit("6/minute")
+async def send_phone_otp(request: Request, req: SendPhoneOtpReq):
+    """Send OTP to phone via BulkSMSLive. Rate-limited to 3 per 10 minutes per phone."""
     phone = _normalize_phone(req.phone)
-    # Rate limit: 1 per minute per phone
-    recent = await db.otp_sessions.find_one({"phone": phone, "type": "SMS"})
-    if recent:
-        sent_at = recent.get("sent_at", "")
-        try:
-            sent_dt = datetime.fromisoformat(sent_at)
-            if (datetime.now(timezone.utc) - sent_dt) < timedelta(seconds=60):
-                raise HTTPException(429, "Please wait 60 seconds before requesting another OTP")
-        except (ValueError, TypeError):
-            pass
+    # Rate limit: 3 per 10 minutes per phone (per-account check)
+    ten_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    recent_count = await db.otp_sessions.count_documents({
+        "phone": phone, "type": "SMS", "sent_at": {"$gte": ten_min_ago}
+    })
+    if recent_count >= 3:
+        raise HTTPException(429, "Too many OTP requests. Please wait 10 minutes before requesting another.")
     otp_code = "".join(secrets.choice("0123456789") for _ in range(6))
     otp_hash = hashlib.sha256(otp_code.encode()).hexdigest()
     expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
