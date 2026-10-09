@@ -63,6 +63,7 @@ from core import (  # noqa: F401
     calculate_stamp_duty,
     get_sh_subaccount_balance, get_nip_fee, _sweep_fee_margin,
     _credit_cashback_bg, _check_referral_bg, _complete_epos_txn_bg,
+    require_service_enabled,
 )
 import ledger as pg_ledger
 from routes.strowallet import strow_name_enquiry, strow_bank_transfer
@@ -112,6 +113,7 @@ async def name_enquiry(req: NameEnquiryReq, request: Request):
 async def send_money(req: TransferReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("TRANSFERS")
     if req.amount < 100 or req.amount > 5_000_000:
         raise HTTPException(400, "Transfer amount must be between ₦100 and ₦5,000,000")
     await verify_transaction_pin(user["_id"], req.transaction_pin, getattr(req, "biometric_token", None))
@@ -503,6 +505,7 @@ async def bompay_transfer(req: BompayTransferReq, request: Request):
     """Transfer funds from sender's SA subaccount directly to receiver's SA subaccount."""
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("TRANSFERS")
     if req.amount < 100 or req.amount > 5_000_000:
         raise HTTPException(400, "Transfer amount must be between ₦100 and ₦5,000,000")
     await verify_transaction_pin(user["_id"], req.transaction_pin, getattr(req, "biometric_token", None))

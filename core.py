@@ -255,6 +255,26 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(401, "User not found")
+        # ── Block check ──────────────────────────────────────────────────────
+        status = user.get("status", "ACTIVE")
+        if status == "SUSPENDED":
+            blocked_until = user.get("blocked_until")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if blocked_until and blocked_until > now_iso:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "USER_BLOCKED",
+                        "message": "Your account has been suspended. Please contact support.",
+                        "blocked_until": blocked_until,
+                    }
+                )
+            # Block period expired — automatically restore
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"status": "ACTIVE", "blocked_until": None}}
+            )
+        # ─────────────────────────────────────────────────────────────────────
         user["_id"] = str(user["_id"])
         user.pop("password_hash", None)
         return user
@@ -871,6 +891,16 @@ async def check_service_enabled(service: str) -> bool:
     if doc is None:
         return True  # Default: enabled
     return doc.get("enabled", True)
+
+
+async def require_service_enabled(service: str) -> None:
+    """Raise 503 if an admin has disabled this service."""
+    doc = await db.service_flags.find_one({"service": service.upper()})
+    if doc and not doc.get("enabled", True):
+        raise HTTPException(
+            status_code=503,
+            detail=f"The {service.capitalize()} service is currently unavailable. Please check back later."
+        )
 
 async def send_event_sms(user_id: str, event_type: str, metadata: dict):
     """Fire-and-forget SMS notification. Logs to sms_logs. Never raises."""
@@ -1660,11 +1690,25 @@ class EposActivateReq(BaseModel):
 async def verify_transaction_pin(user_id: str, pin: Optional[str], biometric_token: Optional[str] = None) -> None:
     """Verify transaction PIN or biometric token. Admin users exempt."""
     doc = await db.users.find_one({"_id": ObjectId(user_id)},
-        {"role": 1, "pin_hash": 1, "pin_failed_attempts": 1, "pin_locked_until": 1})
+        {"role": 1, "pin_hash": 1, "pin_failed_attempts": 1, "pin_locked_until": 1,
+         "status": 1, "blocked_until": 1})
     if not doc:
         raise HTTPException(404, "User not found")
     if doc.get("role") == "admin":
         return
+    # Block check — suspended users cannot use their PIN
+    if doc.get("status") == "SUSPENDED":
+        blocked_until = doc.get("blocked_until")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if blocked_until and blocked_until > now_iso:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "USER_BLOCKED",
+                    "message": "Your account is suspended. Contact support.",
+                    "blocked_until": blocked_until,
+                }
+            )
     if not doc.get("pin_hash"):
         return  # No PIN set, allow transaction
     # Check biometric token (short-lived, 90s)
