@@ -208,3 +208,76 @@ async def strow_buy_cable(
     })
     ref = data.get("reference") or data.get("transaction_id") or "STROW_CABLE"
     return {"reference": str(ref), "raw": data}
+
+
+# ── Education ─────────────────────────────────────────────────────────────────
+
+EDUCATION_PRODUCTS = [
+    {
+        "id": "waec-direct",
+        "exam_body": "WAEC",
+        "label": "WAEC Result Checker",
+        "description": "Purchase WAEC scratch card to check your result",
+        "service_name": "waec",
+        "variation_code": "waecdirect",
+        "default_amount": 3700,
+        "icon": "waec",
+    },
+    {
+        "id": "jamb-utme",
+        "exam_body": "JAMB",
+        "label": "JAMB UTME Mock Test",
+        "description": "JAMB Unified Tertiary Matriculation Examination mock test",
+        "service_name": "jamb",
+        "variation_code": "utme",
+        "default_amount": 3500,
+        "icon": "jamb",
+    },
+    {
+        "id": "jamb-de",
+        "exam_body": "JAMB",
+        "label": "JAMB Direct Entry",
+        "description": "JAMB Direct Entry examination",
+        "service_name": "jamb",
+        "variation_code": "de-original",
+        "default_amount": 3500,
+        "icon": "jamb",
+    },
+    {
+        "id": "neco-checker",
+        "exam_body": "NECO",
+        "label": "NECO Result Checker",
+        "description": "NECO result checker scratch card",
+        "service_name": "neco",
+        "variation_code": "neco-result-checker",
+        "default_amount": 1500,
+        "icon": "neco",
+    },
+    {
+        "id": "nabteb-checker",
+        "exam_body": "NABTEB",
+        "label": "NABTEB Result Checker",
+        "description": "NABTEB result checker scratch card",
+        "service_name": "nabteb",
+        "variation_code": "nabteb",
+        "default_amount": 1500,
+        "icon": "nabteb",
+    },
+]
+
+
+async def strow_buy_education(
+    phone: str,
+    amount: float,
+    service_name: str,
+    variation_code: str,
+) -> dict:
+    """Purchase education scratch card (WAEC, JAMB, NECO, NABTEB) via Strowallet."""
+    data = await _call("POST", "educational/request", body={
+        "amount": str(int(amount)),
+        "phone": phone,
+        "service_name": service_name,
+        "variation_code": variation_code,
+    })
+    ref = data.get("reference") or data.get("transaction_id") or data.get("requestId") or f"EDU_{service_name.upper()}"
+    return {"reference": str(ref), "raw": data}
