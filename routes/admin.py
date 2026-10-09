@@ -1970,6 +1970,61 @@ async def update_strowallet_sms_config(request: Request):
     return {"message": "Strowallet SMS config saved", "sender_id": sender_id}
 
 
+# ===== CONSOLE PIN (Master Admin 2nd factor) =====
+@router.get("/admin/console/pin-status")
+async def console_pin_status(request: Request):
+    """Returns whether the logged-in admin has a console PIN configured."""
+    admin = await get_admin_user(request)
+    has_pin = bool((await db.users.find_one({"_id": ObjectId(admin["_id"])}, {"console_pin_hash": 1}) or {}).get("console_pin_hash"))
+    return {"has_pin": has_pin}
+
+
+@router.post("/admin/console/set-pin")
+async def set_console_pin(request: Request):
+    """Admin sets or changes their console PIN (6 digits)."""
+    admin = await get_admin_user(request)
+    body = await request.json()
+    pin = str(body.get("pin", "")).strip()
+    if not pin.isdigit() or len(pin) != 6:
+        raise HTTPException(400, "Console PIN must be exactly 6 digits")
+    pin_hash = hash_pin(pin)
+    await db.users.update_one(
+        {"_id": ObjectId(admin["_id"])},
+        {"$set": {"console_pin_hash": pin_hash, "console_pin_updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"message": "Console PIN set successfully"}
+
+
+@router.post("/admin/console/remove-pin")
+async def remove_console_pin(request: Request):
+    """Admin removes their console PIN."""
+    admin = await get_admin_user(request)
+    await db.users.update_one(
+        {"_id": ObjectId(admin["_id"])},
+        {"$unset": {"console_pin_hash": "", "console_pin_updated_at": ""}}
+    )
+    return {"message": "Console PIN removed"}
+
+
+@router.post("/admin/console/verify-pin")
+async def verify_console_pin(request: Request):
+    """Verify admin's console PIN (called after login). No auth cookie needed yet."""
+    # We still need to verify they're logged in as admin
+    admin = await get_admin_user(request)
+    body = await request.json()
+    pin = str(body.get("pin", "")).strip()
+    if not pin.isdigit() or len(pin) != 6:
+        raise HTTPException(400, "Console PIN must be exactly 6 digits")
+    doc = await db.users.find_one({"_id": ObjectId(admin["_id"])}, {"console_pin_hash": 1})
+    stored_hash = (doc or {}).get("console_pin_hash")
+    if not stored_hash:
+        # No PIN configured — auto-pass
+        return {"message": "No PIN configured", "verified": True}
+    if not verify_pin_hash(pin, stored_hash):
+        raise HTTPException(403, "Incorrect console PIN. Please try again.")
+    return {"message": "PIN verified", "verified": True}
+
+
 # ===== EDUCATION CONFIG =====
 @router.get("/admin/education-config")
 async def get_education_config(request: Request):
