@@ -23,7 +23,7 @@ from core import (
     get_current_user, verify_transaction_pin,
     get_sh_subaccount_balance, sh_name_enquiry, sh_internal_transfer,
     send_event_notification, send_event_sms, send_push_notification,
-    get_service_bucket_account, _verify_cron,
+    get_service_bucket_account, _verify_cron, require_service_enabled,
 )
 
 router = APIRouter()
@@ -280,6 +280,7 @@ async def get_card_config_public(request: Request):
 async def create_naira_card(req: CreateNairaCardReq, request: Request):
     user = await get_current_user(request)
     uid  = str(user["_id"])
+    await require_service_enabled("NAIRA_CARD")
     await verify_transaction_pin(uid, req.transaction_pin)
 
     brand = req.brand.strip().title()  # "Verve" or "Mastercard"
@@ -444,6 +445,7 @@ async def create_naira_card(req: CreateNairaCardReq, request: Request):
 async def create_usd_card(req: CreateUSDCardReq, request: Request):
     user = await get_current_user(request)
     uid  = str(user["_id"])
+    await require_service_enabled("USD_CARD")
     await verify_transaction_pin(uid, req.transaction_pin)
 
     if req.card_type not in ("reusable", "onetime"):
