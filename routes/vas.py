@@ -213,20 +213,36 @@ async def pay_cable(req: CableReq, request: Request):
     try:
         svc_provider = await get_service_provider("CABLE")
         if svc_provider == "PAIRGATE":
-            r = await call_pg("POST", "/cable/purchase", body={
-                "provider_id": req.provider.upper(),
-                "plan_id": req.package_id,
-                "smartcard": req.smartcard_number,
-                "reference": txn_id,
-            })
-            pref = str(r.get("reference", r.get("transaction_ref", txn_id)))
+            if req.package_id.startswith("cdh-"):
+                # CDH fallback plan (PairGate plans unavailable for this provider) — route to CDH
+                try:
+                    cdh_plan_id = int(req.package_id[4:])
+                except (ValueError, TypeError):
+                    raise HTTPException(400, "Invalid cable plan ID")
+                r = await call_cdh("POST", "/cable/purchase/", body={
+                    "plan_id": cdh_plan_id,
+                    "smart_card_number": req.smartcard_number,
+                    "phone_number": req.smartcard_number,
+                })
+                pref = str(r.get("reference", r.get("transaction_id", txn_id)))
+            else:
+                r = await call_pg("POST", "/cable/purchase", body={
+                    "provider_id": req.provider.lower(),   # PairGate requires lowercase: "dstv", "gotv", "startimes"
+                    "plan_id": req.package_id,             # PairGate plan_id e.g. "57"
+                    "smartcard": req.smartcard_number,
+                    "recipient_name": req.customer_name or "",  # subscriber name from cable-validate
+                    "reference": txn_id,
+                })
+                pref = str(r.get("reference", r.get("transaction_ref", txn_id)))
         elif svc_provider == "CHEAPDATAHUB":
             try:
                 plan_id = int(req.package_id)
             except (ValueError, TypeError):
                 raise HTTPException(400, "Invalid cable plan ID for CheapDataHub provider")
             r = await call_cdh("POST", "/cable/purchase/", body={
-                "plan_id": plan_id, "cardnumber": req.smartcard_number, "phone": req.smartcard_number
+                "plan_id": plan_id,
+                "smart_card_number": req.smartcard_number,
+                "phone_number": req.smartcard_number,
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
         elif svc_provider == "STROWALLET":
@@ -463,11 +479,69 @@ async def preview_transfer_fee(amount: float, request: Request):
     return {"amount": amount, "fee": bompay_fee, "total": amount + bompay_fee,
             "sh_fee": sh_fee, "bompay_margin": margin}
 
+import time as _time_mod
+
+# In-memory cache for PairGate cable plans (TTL 1 hour to avoid rate-limiting)
+# Keyed per provider slug so partial results don't block other providers
+_pg_cable_cache: dict = {}
+
+async def _fetch_pg_cable_plans() -> dict:
+    """Fetch DStv/GOtv/StarTimes plans from PairGate's /cable-plans endpoint.
+    Returns grouped dict; any provider that fails falls back to CDH static plans."""
+    api_key = os.environ.get("PAIRGATE_API_KEY", "")
+    grouped: dict = {}
+    now = _time_mod.time()
+    for slug, label in [("dstv", "DSTV"), ("gotv", "GOTV"), ("startimes", "STARTIMES")]:
+        cached = _pg_cable_cache.get(slug)
+        if cached and now < cached["expires"]:
+            if cached["plans"]:
+                grouped[label] = cached["plans"]
+            continue
+        # Fetch from PairGate
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(f"{PAIRGATE_BASE_URL}/cable-plans",
+                    params={"provider_id": slug},
+                    headers={"Authorization": f"Bearer {api_key}"})
+            if r.status_code == 200:
+                body = r.json()
+                raw = (body.get("data") or {}).get(label, [])
+                plans = [
+                    {"id": str(p["plan_id"]), "name": p.get("name", ""), "amount": float(p.get("price") or 0)}
+                    for p in raw if p.get("plan_id")
+                ]
+                # Cache for 1 hour whether plans found or not (empty = PairGate has none for this provider)
+                _pg_cable_cache[slug] = {"plans": plans, "expires": now + 3600}
+                if plans:
+                    grouped[label] = plans
+            else:
+                # Rate-limited or error — cache negative for 5 min, use CDH fallback
+                _pg_cable_cache[slug] = {"plans": [], "expires": now + 300}
+                logger.warning(f"[PG] cable-plans {slug} HTTP {r.status_code} — falling back to CDH")
+        except Exception as exc:
+            _pg_cable_cache[slug] = {"plans": [], "expires": now + 300}
+            logger.warning(f"[PG] cable-plans {slug} failed: {exc}")
+    # Fill any missing providers with CDH static plans
+    # Prefix CDH fallback IDs with "cdh-" so the purchase endpoint can route them to CDH instead of PairGate
+    cdh_fallback = {"DSTV": CDH_CABLE_PLANS.get("DSTV", []), "GOTV": CDH_CABLE_PLANS.get("GOTV", []),
+                    "STARTIMES": CDH_CABLE_PLANS.get("STARTIMES", [])}
+    for label in ["DSTV", "GOTV", "STARTIMES"]:
+        if label not in grouped and cdh_fallback.get(label):
+            grouped[label] = [{**p, "id": f"cdh-{p['id']}"} for p in cdh_fallback[label]]
+    return grouped
+
+
 # ===== CDH PLANS & VALIDATION =====
 @router.get("/vas/plans")
 async def get_vas_plans(plan_type: str = "data"):
     """Return data or cable plans for the active provider."""
     if plan_type == "cable":
+        cable_provider = await get_service_provider("CABLE")
+        if cable_provider == "PAIRGATE":
+            pg_plans = await _fetch_pg_cable_plans()
+            if pg_plans:
+                return {"plans": pg_plans}
+            logger.warning("[PG] cable-plans unavailable — falling back to CDH static plans")
         return {"plans": CDH_CABLE_PLANS}
 
     # DATA — fetch from active provider so plan IDs match what the purchase endpoint expects

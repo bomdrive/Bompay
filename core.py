@@ -1404,6 +1404,7 @@ class CableReq(BaseModel):
     package_id: str
     amount: float
     provider: str
+    customer_name: Optional[str] = None   # subscriber name from cable-validate (for PairGate recipient_name)
     idempotency_key: Optional[str] = None
     transaction_pin: Optional[str] = None
 
