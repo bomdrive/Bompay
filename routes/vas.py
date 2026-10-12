@@ -63,6 +63,7 @@ from core import (  # noqa: F401
     require_virtual_account, verify_transaction_pin, calculate_fee, get_nip_fee,
     vas_debit, vas_complete, vas_refund,
     _credit_cashback_bg, _check_referral_bg,
+    require_service_enabled,
 )
 from routes.strowallet import (
     strow_buy_airtime, strow_buy_data, strow_buy_cable, strow_buy_education,
@@ -77,6 +78,7 @@ logger = logging.getLogger(__name__)
 async def buy_airtime(req: AirtimeReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("AIRTIME")
     await verify_transaction_pin(user["_id"], req.transaction_pin)
     if req.amount < 50 or req.amount > 50000:
         raise HTTPException(400, "Amount must be ₦50–₦50,000")
@@ -129,6 +131,7 @@ async def buy_airtime(req: AirtimeReq, request: Request):
 async def buy_data(req: DataReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("DATA")
     await verify_transaction_pin(user["_id"], req.transaction_pin)
     amt = int(req.amount * 100)
     idem = req.idempotency_key or str(uuid.uuid4())
@@ -187,6 +190,7 @@ async def buy_data(req: DataReq, request: Request):
 async def pay_cable(req: CableReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("CABLE")
     await verify_transaction_pin(user["_id"], req.transaction_pin)
     amt = int(req.amount * 100)
     idem = req.idempotency_key or str(uuid.uuid4())
@@ -245,6 +249,7 @@ async def pay_cable(req: CableReq, request: Request):
 async def pay_electricity(req: ElectricityReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("ELECTRICITY")
     await verify_transaction_pin(user["_id"], req.transaction_pin)
     if req.amount < 1000:
         raise HTTPException(400, "Minimum electricity payment is ₦1,000")
@@ -361,6 +366,7 @@ BETTING_PLATFORMS = {
 async def fund_betting_wallet(req: BettingReq, request: Request):
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("BETTING")
     platform = req.platform.upper()
     if platform not in BETTING_PLATFORMS:
         raise HTTPException(400, f"Unsupported betting platform. Choose: {', '.join(BETTING_PLATFORMS.keys())}")
@@ -490,14 +496,17 @@ async def cable_validate(req: CableValidateReq, request: Request):
         except Exception as e:
             logger.warning(f"[PG] cable-validate failed: {e}")
     # Try CDH validation endpoint
+    # CDH cable validate requires plan_id (not provider name) + smart_card_number (not smartcard_number)
+    # Use first available plan_id per provider just to verify the subscriber exists
+    CDH_CABLE_DEFAULT_PLAN = {"DSTV": 3, "GOTV": 11, "STARTIMES": 5}
     cdh_reached = False
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             api_key = os.environ.get("CHEAPDATAHUB_API_KEY", "")
             r = await c.post(f"{CDH_BASE_URL}/cable/validate/",
-                headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
-                json={"provider": provider_map.get(prov_key, prov_key.lower()),
-                      "smartcard_number": req.smartcard_number})
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"plan_id": CDH_CABLE_DEFAULT_PLAN.get(prov_key, 3),
+                      "smart_card_number": req.smartcard_number})
         cdh_reached = True
         logger.info(f"[CDH] cable-validate status={r.status_code} body={r.text[:300]}")
         if r.status_code == 200:
@@ -570,7 +579,7 @@ async def meter_validate(req: MeterValidateReq, request: Request):
         async with httpx.AsyncClient(timeout=15) as c:
             api_key = os.environ.get("CHEAPDATAHUB_API_KEY", "")
             r = await c.post(f"{CDH_BASE_URL}/electricity/validate/",
-                headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"disco_id": disco_id, "meter_number": req.meter_number,
                       "meter_type": req.meter_type.lower()})
         cdh_reached = True
@@ -640,6 +649,7 @@ async def buy_education(req: EducationReq, request: Request):
     """Purchase an education scratch card (WAEC, JAMB, NECO, NABTEB)."""
     user = await get_current_user(request)
     await require_virtual_account(user)
+    await require_service_enabled("EDUCATION")
     await verify_transaction_pin(user["_id"], req.transaction_pin)
 
     # Validate product

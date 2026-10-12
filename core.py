@@ -108,8 +108,19 @@ PG_BET_SLUGS = {
 }
 CDH_AIRTIME_NETWORK_IDS = {"MTN": 1, "GLO": 2, "AIRTEL": 3, "9MOBILE": 4}
 CDH_ELECTRICITY_DISCO_IDS = {
-    "IKEDC": 1, "AEDC": 2, "BEDC": 3, "EKEDC": 4, "EEDC": 5,
-    "IBEDC": 6, "JEDC": 7, "KAEDCO": 8, "KAEDC": 9, "PHEDC": 10
+    # IDs from https://www.cheapdatahub.ng/api/plan-ids/ (verified Feb 2026)
+    "AEDC": 1,    # Abuja Electric AEDC
+    "EKEDC": 2,   # Eko Electric (EKEDC)
+    "IBEDC": 3,   # Ibadan Electric (IBEDC)
+    "IKEDC": 4,   # Ikeja Electric (IKEDC)
+    "KAEDC": 5,   # Kaduna Electric
+    "KAEDCO": 5,  # Kaduna Electric (alt key)
+    "PHEDC": 6,   # Port Harcourt Electric
+    "JEDC": 7,    # Jos Electricity Distribution PLC
+    "JEDPLC": 7,  # Jos (alt key)
+    "EEDC": 8,    # Enugu Electric
+    "YEDC": 9,    # Yola Electric
+    "BEDC": 10,   # Benin Electric
 }
 
 # CDH verified plan IDs from https://www.cheapdatahub.ng/api/plan-ids/
@@ -733,15 +744,32 @@ async def call_cdh(method: str, path: str, body: dict = None) -> dict:
     if not api_key:
         raise HTTPException(503, "VAS provider (CheapDataHub) is not configured.")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    url = f"{CDH_BASE_URL}{path}"
+    logger.info(f"[CDH] {method} {path} body={json.dumps(body or {})[:200]}")
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request(method, f"{CDH_BASE_URL}{path}", json=body, headers=headers)
-        try:
-            data = r.json()
-        except Exception:
-            raise HTTPException(500, f"CheapDataHub returned an invalid response ({r.status_code})")
-        if str(data.get("status", "")).lower() not in ("true", "success"):
-            raise HTTPException(400, data.get("message") or "VAS request failed")
-        return data
+        r = await c.request(method, url, json=body, headers=headers)
+    logger.info(f"[CDH] {method} {path} → HTTP {r.status_code} body={r.text[:400]}")
+    try:
+        data = r.json()
+    except Exception:
+        logger.error(f"[CDH] non-JSON response HTTP {r.status_code}: {r.text[:300]}")
+        raise HTTPException(500, f"CheapDataHub returned an invalid response (HTTP {r.status_code})")
+    if r.status_code == 401:
+        raise HTTPException(503, "CheapDataHub: API key is invalid or expired.")
+    if r.status_code == 402:
+        raise HTTPException(400, "CheapDataHub: Insufficient reseller balance. Please fund your CDH wallet.")
+    status_val = str(data.get("status", "")).lower()
+    if r.is_error or status_val not in ("true", "success"):
+        # Extract best error message from CDH response (message / detail / first field value)
+        msg = data.get("message") or data.get("detail") or data.get("error")
+        if not msg:
+            first_val = next(iter(data.values()), None) if data else None
+            msg = str(first_val) if first_val else "VAS request failed"
+        if isinstance(msg, list):
+            msg = "; ".join(str(m) for m in msg)
+        logger.error(f"[CDH] {method} {path} HTTP {r.status_code} status={status_val} msg={msg}")
+        raise HTTPException(400, str(msg))
+    return data
 
 async def get_vas_provider() -> str:
     """Return the active VAS provider: CHEAPDATAHUB (default) or SAFEHAVEN."""
