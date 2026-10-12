@@ -273,8 +273,12 @@ async def ajo_my_groups(request: Request):
         mc = await db.ajo_members.count_documents({"group_id": g["group_id"], "status": {"$ne": "LEFT"}})
         my_member = await db.ajo_members.find_one({"group_id": g["group_id"], "user_id": user["_id"]}, {"payout_position": 1})
         pending_payout = await db.ajo_payouts.find_one(
-            {"group_id": g["group_id"], "recipient_user_id": user["_id"], "status": "PENDING"}, {"amount": 1})
-        result.append({**g, "member_count": mc,
+            {"group_id": g["group_id"], "recipient_user_id": str(user["_id"]), "status": "PENDING"}, {"amount": 1})
+        result.append({**g,
+                       "my_user_id": str(user["_id"]),
+                       "creator_id": str(g.get("creator_id", "")),
+                       "is_creator": str(g.get("creator_id", "")) == str(user["_id"]),
+                       "member_count": mc,
                        "my_payout_position": (my_member or {}).get("payout_position"),
                        "has_pending_payout": pending_payout is not None,
                        "pending_payout_amount": (pending_payout or {}).get("amount")})
@@ -317,8 +321,11 @@ async def ajo_detail(group_id: str, request: Request):
     member = await db.ajo_members.find_one({"group_id": group_id, "user_id": user["_id"]})
     if not member:
         raise HTTPException(403, "You are not a member of this group")
-    detail = await _build_ajo_detail(group, user["_id"])
+    detail = await _build_ajo_detail(group, str(user["_id"]))
     detail["my_payout_position"] = member.get("payout_position")
+    detail["my_user_id"] = str(user["_id"])
+    detail["creator_id"] = str(group.get("creator_id", ""))
+    detail["is_creator"] = str(group.get("creator_id", "")) == str(user["_id"])
     return detail
 
 @router.post("/ajo/{group_id}/contribute")
@@ -441,7 +448,7 @@ async def ajo_contribute(group_id: str, req: AjoContributeReq, request: Request)
     if paid_count >= total_members:
         payout_order = group.get("payout_order", [])
         if len(payout_order) > period_idx:
-            recipient_id = payout_order[period_idx]
+            recipient_id = str(payout_order[period_idx])   # always string
             existing_payout = await db.ajo_payouts.find_one(
                 {"group_id": group_id, "round": group["current_round"], "period_index": period_idx})
             if not existing_payout:
@@ -516,14 +523,14 @@ async def ajo_set_order(group_id: str, req: AjoSetOrderReq, request: Request):
     group = await db.ajo_groups.find_one({"group_id": group_id})
     if not group:
         raise HTTPException(404, "Group not found")
-    if group["creator_id"] != user["_id"]:
+    if str(group["creator_id"]) != str(user["_id"]):
         raise HTTPException(403, "Only the group creator can set the payout order")
     if group["payout_order_method"] != "CREATOR":
         raise HTTPException(400, "This group uses a different payout order method")
     if group["status"] != "ORDERING":
         raise HTTPException(400, "Payout order can only be set while group is in ORDERING state")
     members_raw = await db.ajo_members.find({"group_id": group_id, "status": {"$ne": "LEFT"}}, {"user_id": 1}).to_list(50)
-    member_ids = {m["user_id"] for m in members_raw}
+    member_ids = {str(m["user_id"]) for m in members_raw}   # always strings
     if set(req.order) != member_ids or len(req.order) != group["max_members"]:
         raise HTTPException(400, "Order must include all members exactly once")
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -578,7 +585,7 @@ async def ajo_collect(group_id: str, req: AjoContributeReq, request: Request):
     user = await get_current_user(request)
     await verify_transaction_pin(user["_id"], req.transaction_pin)
     payout = await db.ajo_payouts.find_one(
-        {"group_id": group_id, "recipient_user_id": user["_id"], "status": "PENDING"})
+        {"group_id": group_id, "recipient_user_id": str(user["_id"]), "status": "PENDING"})
     if not payout:
         raise HTTPException(404, "No pending payout found for you in this group")
     group = await db.ajo_groups.find_one({"group_id": group_id}, {"_id": 0})

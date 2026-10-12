@@ -708,7 +708,16 @@ async def call_sh(method: str, path: str, body: dict = None, params: dict = None
 
         if r.is_error:
             logger.error(f"[SafeHaven] API error {r.status_code}: {r.text[:300]}")
-            raise HTTPException(502, f"Safe Haven API error ({r.status_code}): {r.text[:200]}")
+            # 4xx = business/client rejection (bad request, invalid params) → return 400 so
+            # Cloudflare/Railway proxy forwards JSON instead of swapping it for an HTML error page.
+            # 5xx = Safe Haven server fault → keep 502.
+            err_code = 400 if 400 <= r.status_code < 500 else 502
+            try:
+                err_body = r.json()
+                err_msg = err_body.get("message") or err_body.get("error") or f"Safe Haven error ({r.status_code})"
+            except Exception:
+                err_msg = f"Safe Haven API error ({r.status_code})"
+            raise HTTPException(err_code, err_msg)
 
         return r.json()
 
