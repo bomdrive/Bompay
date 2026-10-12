@@ -157,11 +157,23 @@ async def buy_data(req: DataReq, request: Request):
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
         elif provider == "STROWALLET":
-            result = await strow_buy_data(
-                phone=req.phone_number, amount=req.amount,
-                network=req.network, variation_code=req.plan_id,
-            )
-            pref = result["reference"]
+            # CDH fallback plans use integer IDs — if plan_id is all digits it came from CDH fallback,
+            # so route to CDH. Strowallet variation codes are non-numeric strings.
+            if req.plan_id.isdigit():
+                try:
+                    bundle_id = int(req.plan_id)
+                except (ValueError, TypeError):
+                    raise HTTPException(400, "Invalid data bundle ID")
+                r = await call_cdh("POST", "/data/purchase/", body={
+                    "bundle_id": bundle_id, "phone_number": req.phone_number
+                })
+                pref = str(r.get("reference", r.get("transaction_id", txn_id)))
+            else:
+                result = await strow_buy_data(
+                    phone=req.phone_number, amount=req.amount,
+                    network=req.network, variation_code=req.plan_id,
+                )
+                pref = result["reference"]
         else:
             r = await call_sh("POST", "/vas/pay/data", body={"serviceCategoryId": "data",
                 "bundleCode": req.plan_id, "amount": req.amount, "channel": "WEB",
@@ -454,9 +466,40 @@ async def preview_transfer_fee(amount: float, request: Request):
 # ===== CDH PLANS & VALIDATION =====
 @router.get("/vas/plans")
 async def get_vas_plans(plan_type: str = "data"):
-    """Return CDH verified data or cable plans."""
+    """Return data or cable plans for the active provider."""
     if plan_type == "cable":
         return {"plans": CDH_CABLE_PLANS}
+
+    # DATA — fetch from active provider so plan IDs match what the purchase endpoint expects
+    data_provider = await get_service_provider("DATA")
+    if data_provider == "STROWALLET":
+        from routes.strowallet import strow_get_data_plans
+        grouped = {}
+        for net in ["MTN", "GLO", "AIRTEL"]:
+            try:
+                raw_plans = await strow_get_data_plans(net)
+            except Exception as e:
+                logger.warning(f"[STROW] get_data_plans {net} failed: {e}")
+                raw_plans = []
+            if raw_plans:
+                normalized = []
+                for p in raw_plans:
+                    # Strowallet uses variation_code as the unique plan identifier
+                    vc = (p.get("variation_code") or p.get("code") or p.get("id") or "")
+                    if not vc:
+                        continue
+                    name = (p.get("name") or p.get("plan_name") or p.get("description") or str(vc))
+                    validity = (p.get("validity") or p.get("duration") or "")
+                    amount = float(p.get("amount") or p.get("price") or p.get("variation_amount") or 0)
+                    if amount <= 0:
+                        continue
+                    normalized.append({"id": vc, "name": name, "validity": validity, "amount": amount})
+                if normalized:
+                    grouped[net] = normalized
+        # Fallback to CDH plans if Strowallet returns nothing
+        if grouped:
+            return {"plans": grouped}
+        logger.warning("[STROW] get_data_plans returned empty for all networks — falling back to CDH")
     return {"plans": CDH_DATA_PLANS}
 
 @router.post("/vas/cable-validate")
