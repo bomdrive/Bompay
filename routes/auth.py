@@ -906,6 +906,9 @@ async def list_passkeys(request: Request):
 
 @router.post("/webauthn/register/options")
 async def webauthn_register_options(request: Request):
+    if not WEBAUTHN_RP_ID or not WEBAUTHN_ORIGIN:
+        raise HTTPException(503, "Biometric login is not configured for this environment. "
+                                 "Set WEBAUTHN_RP_ID and WEBAUTHN_ORIGIN in your server environment variables.")
     user = await get_current_user(request)
     existing = await db.webauthn_credentials.find(
         {"user_id": user["_id"]}, {"credential_id": 1}
