@@ -710,7 +710,16 @@ async def call_sh(method: str, path: str, body: dict = None, params: dict = None
             "Content-Type": "application/json"
         }
         async with httpx.AsyncClient(timeout=45) as c:
+            if "/vas/pay/" in path:
+                # Log VAS request body (mask account numbers partially for security)
+                safe_body = dict(body or {})
+                if "debitAccountNumber" in safe_body:
+                    acct = str(safe_body["debitAccountNumber"])
+                    safe_body["debitAccountNumber"] = acct[:4] + "****" + acct[-2:]
+                logger.info(f"[SafeHaven] VAS request {method} {path}: {safe_body}")
             r = await c.request(method, base + path, json=body, params=params, headers=hdrs)
+            if "/vas/pay/" in path:
+                logger.info(f"[SafeHaven] VAS response {r.status_code}: {r.text[:600]}")
 
         if r.status_code == 401:
             _sh_token.clear()   # Force token refresh on next request
@@ -718,19 +727,33 @@ async def call_sh(method: str, path: str, body: dict = None, params: dict = None
             raise HTTPException(502, "Safe Haven session expired. Please retry.")
 
         if r.is_error:
-            logger.error(f"[SafeHaven] API error {r.status_code}: {r.text[:300]}")
-            # 4xx = business/client rejection (bad request, invalid params) → return 400 so
-            # Cloudflare/Railway proxy forwards JSON instead of swapping it for an HTML error page.
-            # 5xx = Safe Haven server fault → keep 502.
+            logger.error(f"[SafeHaven] API error {r.status_code}: {r.text[:500]}")
             err_code = 400 if 400 <= r.status_code < 500 else 502
             try:
                 err_body = r.json()
                 err_msg = err_body.get("message") or err_body.get("error") or f"Safe Haven error ({r.status_code})"
+                if "errors" in err_body:
+                    logger.error(f"[SafeHaven] Validation errors: {err_body['errors']}")
+                if "data" in err_body and err_body["data"]:
+                    logger.error(f"[SafeHaven] Error data: {err_body['data']}")
             except Exception:
                 err_msg = f"Safe Haven API error ({r.status_code})"
             raise HTTPException(err_code, err_msg)
 
-        return r.json()
+        resp = r.json()
+
+        # Safe Haven VAS returns HTTP 201 even when the purchase fails — the real outcome
+        # is in the body: statusCode 4xx and data.status = "failed".  Detect and raise here
+        # so the calling VAS route can refund the user and not mark the txn as COMPLETED.
+        if "/vas/pay/" in path:
+            body_code = resp.get("statusCode", 200)
+            vas_status = (resp.get("data") or {}).get("status", "")
+            if str(body_code) not in ("200", "201") or vas_status == "failed":
+                err_msg = resp.get("message") or f"VAS purchase failed (status: {vas_status})"
+                logger.error(f"[SafeHaven] VAS body failure {path}: code={body_code} status={vas_status} msg={err_msg}")
+                raise HTTPException(400, err_msg)
+
+        return resp
 
     except HTTPException:
         raise   # Propagate meaningful errors — never silently mock when credentials are set
@@ -818,6 +841,114 @@ async def call_pg(method: str, path: str, body: dict = None) -> dict:
 async def get_sms_config() -> dict:
     doc = await db.settings.find_one({"key": "sms_config"})
     return (doc or {}).get("value", {"enabled": True, "unit_cost_ngn": 4.0, "billing_day": 1})
+
+
+# ===== SAFE HAVEN VAS HELPERS =====
+# Default service category IDs (from SH API docs examples — consistent across environments)
+SH_VAS_CAT_DEFAULTS: dict = {
+    "AIRTIME":     "61e988830e69308aa37a7a99",
+    "DATA":        "61e98a4dbce8e444a4976651",
+    "CABLE":       "61e98b3562d9b6a917f9302a",
+    "ELECTRICITY": "61e98c4390dbbfc905f48f0d",
+}
+
+async def get_sh_vas_cat_id(service: str, sub_key: str = "") -> str:
+    """Return the Safe Haven serviceCategoryId for a VAS service + optional sub_key (network/disco).
+    Lookup order: DB override → auto-fetched production IDs → hardcoded fallback."""
+    doc = await db.settings.find_one({"key": "sh_vas_cats"})
+    overrides = (doc or {}).get("value", {})
+    svc = service.upper()
+    sub = sub_key.upper() if sub_key else ""
+
+    # Try specific key first (e.g. AIRTIME_MTN)
+    if sub and overrides.get(f"{svc}_{sub}"):
+        return overrides[f"{svc}_{sub}"]
+    # Generic key (e.g. AIRTIME)
+    if overrides.get(svc):
+        return overrides[svc]
+    # Sub-key without generic (fallback first network entry)
+    if sub:
+        prefix = f"{svc}_{sub}"
+        # Try partial match
+        for k, v in overrides.items():
+            if k.startswith(f"{svc}_"):
+                return v  # first match for this service type
+
+    # Auto-fetch from live SH API and cache
+    try:
+        services_resp = await call_sh("GET", "/vas/services")
+        services = services_resp.get("data", [])
+        if isinstance(services, list) and services:
+            mapping: dict = {}
+            for s in services:
+                svc_id_sh = s.get("_id", "")
+                svc_name  = (s.get("name") or s.get("type") or "").upper().replace(" ", "_")
+                if not svc_id_sh:
+                    continue
+                try:
+                    cats_resp = await call_sh("GET", f"/vas/service/{svc_id_sh}/service-categories")
+                    cats = cats_resp.get("data", [])
+                except Exception:
+                    cats = []
+                for cat in cats:
+                    cat_id   = cat.get("_id", "")
+                    cat_ident= (cat.get("identifier") or cat.get("name") or "").upper()
+                    if cat_id and cat_ident:
+                        mapping[f"{svc_name}_{cat_ident}"] = cat_id
+            if mapping:
+                await db.settings.update_one(
+                    {"key": "sh_vas_cats"},
+                    {"$set": {"key": "sh_vas_cats", "value": mapping,
+                              "updated_at": datetime.now(timezone.utc).isoformat()}},
+                    upsert=True,
+                )
+                logger.info(f"[SH VAS] Auto-fetched {len(mapping)} category IDs from live API")
+                if sub and mapping.get(f"{svc}_{sub}"):
+                    return mapping[f"{svc}_{sub}"]
+                for k, v in mapping.items():
+                    if k.startswith(f"{svc}_"):
+                        return v
+    except Exception as e:
+        logger.warning(f"[SH VAS] Auto-fetch of category IDs failed: {e}")
+
+    # Final fallback: doc-example defaults (sandbox — may not deliver)
+    fallback = SH_VAS_CAT_DEFAULTS.get(svc, "")
+    logger.warning(f"[SH VAS] Using hardcoded default category ID for {svc}/{sub}: {fallback}")
+    return fallback
+
+async def get_sh_vas_fallback_enabled() -> bool:
+    """Return True if Safe Haven VAS should be tried as automatic fallback when primary fails."""
+    doc = await db.settings.find_one({"key": "sh_vas_fallback"})
+    return bool((doc or {}).get("enabled", False))
+
+
+async def get_sh_vas_products(service: str, sub_key: str) -> list:
+    """Return SH VAS product list for a service+network/provider key.
+    e.g. get_sh_vas_products('DATA', 'MTN') → list of {validity, bundleCode, amount}"""
+    doc = await db.settings.find_one({"key": "sh_vas_products"})
+    catalog = (doc or {}).get("value", {})
+    key = f"{service.upper()}_{sub_key.upper()}"
+    products = catalog.get(key, [])
+    if products:
+        return products
+    # Try fetching live if not cached
+    try:
+        cat_id = await get_sh_vas_cat_id(service, sub_key)
+        if cat_id:
+            r = await call_sh("GET", f"/vas/service-category/{cat_id}/products")
+            products = r.get("data", [])
+            if products:
+                # Cache it
+                catalog[key] = products
+                await db.settings.update_one(
+                    {"key": "sh_vas_products"},
+                    {"$set": {"key": "sh_vas_products", f"value.{key}": products,
+                              "updated_at": datetime.now(timezone.utc).isoformat()}},
+                    upsert=True,
+                )
+    except Exception as e:
+        logger.warning(f"[SH VAS] Failed to fetch products for {key}: {e}")
+    return products
 
 async def get_sms_provider() -> str:
     """Returns active SMS provider: SENDORA (default) or BULKSMSLIVE."""
@@ -2516,9 +2647,11 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
     """
     PRIMARY FLOW — Safe Haven is the gate.
     1. Check SH balance (live).
-    2. SH internal transfer: user SH → VAS bucket  (BLOCKING).
-    3. Record transaction.
-    4. Update BOMPAY wallet shadow (fire-and-forget).
+    2. Record transaction (PROCESSING).
+    3. Update BOMPAY wallet shadow (fire-and-forget).
+    NOTE: The SH sweep (user SH → VAS bucket) happens AFTER successful VAS delivery
+    via _vas_sweep_to_bucket_bg, NOT before. This ensures failed VAS purchases
+    never leave the user's real SH balance depleted without service delivery.
     """
     existing = await db.transactions.find_one({"idempotency_key": idem})
     if existing:
@@ -2541,34 +2674,7 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
     if sh_balance < amount_ngn:
         raise HTTPException(400, f"Insufficient balance. Available: ₦{sh_balance:,.2f}")
 
-    # ── VAS service bucket account ────────────────────────────────────────────
-    vas_bucket = await get_service_bucket_account("VAS")
-    if not vas_bucket:
-        vas_acct_doc = await db.charge_accounts.find_one({"category": "VAS_FEES"})
-        vas_bucket = (vas_acct_doc or {}).get("sh_account_number", "")
-    if not vas_bucket:
-        raise HTTPException(503,
-            "VAS service account not configured. Please contact support or configure "
-            "it in Admin → Service Accounts.")
-
     txn_id = f"TXN{secrets.token_hex(12).upper()}"
-
-    # ── PRIMARY: SH internal transfer (blocking) ──────────────────────────────
-    # Name enquiry is required by Safe Haven before any transfer
-    ne_ref = await sh_name_enquiry(vas_bucket)
-    try:
-        await call_sh("POST", "/transfers", body={
-            "nameEnquiryReference": ne_ref,
-            "debitAccountNumber":    user_sh_acct,
-            "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
-            "beneficiaryAccountNumber": vas_bucket,
-            "amount":            amount_ngn,
-            "saveBeneficiary":   False,
-            "narration":         f"BOMPAY {txn_type}",
-            "paymentReference":  f"VAS_{txn_id}",
-        })
-    except Exception as e:
-        raise HTTPException(502, f"Payment failed — please try again. ({e})")
 
     # ── Record transaction ────────────────────────────────────────────────────
     bal_before_kobo = int(sh_balance * 100)
@@ -2576,7 +2682,8 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
         "transaction_id": txn_id, "idempotency_key": idem, "user_id": user_id,
         "type": txn_type, "direction": "DEBIT", "amount": amount_kobo, "fee": 0,
         "vat": 0, "currency": "NGN", "status": "PROCESSING", "provider": "SAFEHAVEN",
-        "description": desc, "metadata": meta,
+        "description": desc,
+        "metadata": {**meta, "_sh_acct": user_sh_acct},
         "balance_before_kobo": bal_before_kobo,
         "balance_after_kobo":  bal_before_kobo - amount_kobo,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2587,6 +2694,36 @@ async def vas_debit(user_id: str, amount_kobo: int, idem: str, txn_type: str, de
     asyncio.create_task(_shadow_wallet_debit(user_id, amount_kobo))
 
     return txn_id, False
+
+
+async def _vas_sweep_to_bucket_bg(user_id: str, amount_kobo: int, txn_id: str):
+    """Post-VAS-success sweep: transfer user SH → VAS bucket for BOMPAY revenue collection.
+    Fire-and-forget — failure is logged but does NOT affect the user's completed transaction."""
+    try:
+        wallet_doc = await db.wallets.find_one({"user_id": user_id})
+        user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                        or (wallet_doc or {}).get("account_number", ""))
+        vas_bucket = await get_service_bucket_account("VAS")
+        if not vas_bucket:
+            vas_acct_doc = await db.charge_accounts.find_one({"category": "VAS_FEES"})
+            vas_bucket = (vas_acct_doc or {}).get("sh_account_number", "")
+        if not vas_bucket or not user_sh_acct:
+            logger.warning(f"[VAS Sweep] No VAS bucket or user SH account — sweep skipped for txn={txn_id}")
+            return
+        ne_ref = await sh_name_enquiry(vas_bucket)
+        await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
+            "debitAccountNumber":    user_sh_acct,
+            "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": vas_bucket,
+            "amount":            amount_kobo / 100,
+            "saveBeneficiary":   False,
+            "narration":         "BOMPAY VAS revenue",
+            "paymentReference":  f"VSWEEP_{txn_id}",
+        })
+        logger.info(f"[VAS Sweep] ✅ user SH → VAS bucket ₦{amount_kobo/100:.2f} for txn={txn_id}")
+    except Exception as e:
+        logger.warning(f"[VAS Sweep] ⚠️ Sweep failed for txn={txn_id}: {e}")
 
 
 async def _shadow_wallet_debit(user_id: str, amount_kobo: int):
@@ -2622,7 +2759,7 @@ async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
     if points > 0:
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$inc": {"reward_points": points}})
     await notify(user_id, notif_title, notif_msg, "success")
-    # SH debit already done in vas_debit — no sweep needed here
+    # SH sweep (user → VAS bucket) is triggered after vas_complete via _vas_sweep_to_bucket_bg
     if sms_event_type:
         sh_bal = -1.0
         try:
@@ -2637,34 +2774,20 @@ async def vas_complete(user_id: str, txn_id: str, amount_kobo: int, pref: str,
 
 
 async def vas_refund(user_id: str, txn_id: str, amount_kobo: int, title: str):
-    """Refund a failed VAS payment: credit SH back to user (primary) + BOMPAY wallet shadow."""
-    await db.transactions.update_one({"transaction_id": txn_id}, {"$set": {"status": "FAILED"}})
-    # PRIMARY: SH refund — VAS bucket → user SH
-    try:
-        wallet_doc = await db.wallets.find_one({"user_id": user_id})
-        user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
-                        or (wallet_doc or {}).get("account_number", ""))
-        vas_bucket = await get_service_bucket_account("VAS")
-        if not vas_bucket:
-            vas_acct_doc = await db.charge_accounts.find_one({"category": "VAS_FEES"})
-            vas_bucket = (vas_acct_doc or {}).get("sh_account_number", "")
-        if vas_bucket and user_sh_acct:
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber":    vas_bucket,
-                "beneficiaryBankCode":   SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": user_sh_acct,
-                "amount":           amount_kobo / 100,
-                "saveBeneficiary":  False,
-                "narration":        f"VAS refund {txn_id[:20]}",
-                "paymentReference": f"REF_{txn_id}",
-            })
-        else:
-            logger.warning(f"[VAS Refund] No VAS bucket or user SH — SH refund skipped for {txn_id}")
-    except Exception as e:
-        logger.warning(f"[VAS Refund] SH refund failed for txn={txn_id}: {e}")
-    # SHADOW: BOMPAY wallet mirror
+    """
+    Mark a failed VAS transaction as FAILED and restore the BOMPAY wallet shadow.
+    Since vas_debit no longer pre-sweeps user funds to the VAS bucket, the user's
+    Safe Haven balance was never actually moved — we only need to reverse the shadow
+    debit in Mongo and notify the user.
+    """
+    await db.transactions.update_one(
+        {"transaction_id": txn_id},
+        {"$set": {"status": "FAILED", "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    # SHADOW: Restore the BOMPAY wallet mirror (SH balance was never debited)
     asyncio.create_task(_shadow_wallet_credit(user_id, amount_kobo))
-    await notify(user_id, title, "Payment failed. Funds reversed.", "error")
+    await notify(user_id, title, "Payment failed. Your balance has been restored.", "error")
+    logger.info(f"[VAS Refund] txn={txn_id} marked FAILED — shadow wallet credited ₦{amount_kobo/100:.2f}")
 
 
 # ===== REWARDS / REFERRAL HELPERS =====
@@ -2703,14 +2826,22 @@ async def _credit_cashback_bg(user_id: str, amount_naira: float, txn_type: str, 
             wallet_doc = await db.wallets.find_one({"user_id": user_id})
             user_sh = (wallet_doc or {}).get("sh_account_number", "")
             if cashback_sh and user_sh:
-                await call_sh("POST", "/transfers", body={
-                    "debitAccountNumber": cashback_sh,
-                    "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                    "beneficiaryAccountNumber": user_sh,
-                    "amount": cashback_naira, "saveBeneficiary": False,
-                    "narration": f"BOMPAY cashback {txn_type[:10]}",
-                    "paymentReference": f"CB{secrets.token_hex(10).upper()}"
+                # SH transfers require name-enquiry first to obtain nameEnquiryRef
+                ne = await call_sh("POST", "/transfers/name-enquiry", body={
+                    "accountNumber": user_sh,
+                    "bankCode": SAFEHAVEN_OWN_BANK_CODE,
                 })
+                ne_ref = (ne.get("data") or ne).get("nameEnquiryReference", "")
+                if ne_ref:
+                    await call_sh("POST", "/transfers", body={
+                        "debitAccountNumber": cashback_sh,
+                        "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                        "beneficiaryAccountNumber": user_sh,
+                        "amount": cashback_naira, "saveBeneficiary": False,
+                        "narration": f"BOMPAY cashback {txn_type[:10]}",
+                        "paymentReference": f"CB{secrets.token_hex(10).upper()}",
+                        "nameEnquiryReference": ne_ref,
+                    })
             else:
                 logger.info(f"[Cashback] No SH source configured — cashback tracked internally only")
         except Exception as sh_e:
@@ -2726,14 +2857,22 @@ async def _sh_referral_sweep(user_id: str, amount_naira: float):
         wallet_doc = await db.wallets.find_one({"user_id": user_id})
         user_sh = (wallet_doc or {}).get("sh_account_number", "")
         if referral_sh and user_sh:
-            await call_sh("POST", "/transfers", body={
-                "debitAccountNumber": referral_sh,
-                "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
-                "beneficiaryAccountNumber": user_sh,
-                "amount": amount_naira, "saveBeneficiary": False,
-                "narration": "BOMPAY referral bonus",
-                "paymentReference": f"REF{secrets.token_hex(10).upper()}"
+            # Name enquiry first
+            ne = await call_sh("POST", "/transfers/name-enquiry", body={
+                "accountNumber": user_sh,
+                "bankCode": SAFEHAVEN_OWN_BANK_CODE,
             })
+            ne_ref = (ne.get("data") or ne).get("nameEnquiryReference", "")
+            if ne_ref:
+                await call_sh("POST", "/transfers", body={
+                    "debitAccountNumber": referral_sh,
+                    "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+                    "beneficiaryAccountNumber": user_sh,
+                    "amount": amount_naira, "saveBeneficiary": False,
+                    "narration": "BOMPAY referral bonus",
+                    "paymentReference": f"REF{secrets.token_hex(10).upper()}",
+                    "nameEnquiryReference": ne_ref,
+                })
         else:
             logger.info("[Referral] No REFERRAL SH bucket configured — balance tracked internally only")
     except Exception as e:

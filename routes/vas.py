@@ -29,6 +29,7 @@ from core import (  # noqa: F401,F403,F405
     # providers
     call_sh, mock_sh, call_cdh, call_pg,
     get_vas_provider, get_service_provider, get_sms_config,
+    get_sh_vas_cat_id, get_sh_vas_fallback_enabled, get_sh_vas_products,
     get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
     # private helpers (explicitly imported)
     _cloudinary_upload, _cloudinary_delete, _email_html,
@@ -61,9 +62,9 @@ from core import (  # noqa: F401
     AirtimeReq, DataReq, CableReq, ElectricityReq, VerifyReq, BetVerifyReq,
     BettingReq, EducationReq, CableValidateReq, MeterValidateReq,
     require_virtual_account, verify_transaction_pin, calculate_fee, get_nip_fee,
-    vas_debit, vas_complete, vas_refund,
+    vas_debit, vas_complete, vas_refund, _vas_sweep_to_bucket_bg,
     _credit_cashback_bg, _check_referral_bg,
-    require_service_enabled,
+    require_service_enabled, get_service_bucket_account,
 )
 from routes.strowallet import (
     strow_buy_airtime, strow_buy_data, strow_buy_cable, strow_buy_education,
@@ -73,6 +74,14 @@ import ledger as pg_ledger
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+async def _get_vas_bucket() -> str:
+    """Return the VAS service bucket account number (where vas_debit already sent money)."""
+    bucket = await get_service_bucket_account("VAS")
+    if not bucket:
+        acct = await db.charge_accounts.find_one({"category": "VAS_FEES"})
+        bucket = (acct or {}).get("sh_account_number", "")
+    return bucket
 
 @router.post("/vas/airtime")
 async def buy_airtime(req: AirtimeReq, request: Request):
@@ -88,6 +97,11 @@ async def buy_airtime(req: AirtimeReq, request: Request):
         f"{req.network} Airtime — {req.phone_number}", {"network": req.network, "phone_number": req.phone_number})
     if was_existing:
         return {"transaction_id": txn_id, "status": "COMPLETED"}
+
+    provider = "CDH"
+    pref = txn_id
+    fallback_used = False
+    primary_err: Exception = None  # type: ignore[assignment]
     try:
         provider = await get_service_provider("AIRTIME")
         if provider == "PAIRGATE":
@@ -105,27 +119,59 @@ async def buy_airtime(req: AirtimeReq, request: Request):
         elif provider == "STROWALLET":
             result = await strow_buy_airtime(req.phone_number, req.amount, req.network)
             pref = result["reference"]
+        elif provider == "SAFEHAVEN":
+            wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+            user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                            or (wallet_doc or {}).get("account_number", ""))
+            if not user_sh_acct:
+                raise HTTPException(400, "Safe Haven account not found")
+            cat_id = await get_sh_vas_cat_id("AIRTIME", req.network)
+            r = await call_sh("POST", "/vas/pay/airtime", body={
+                "serviceCategoryId": cat_id, "amount": req.amount,
+                "channel": "WEB", "debitAccountNumber": user_sh_acct,
+                "phoneNumber": req.phone_number, "externalReference": txn_id,
+            })
+            pref = r.get("data", {}).get("reference") or r.get("data", {}).get("id") or txn_id
         else:
-            r = await call_sh("POST", "/vas/pay/airtime", body={"serviceCategoryId": "airtime",
-                "amount": req.amount, "channel": "WEB", "phoneNumber": req.phone_number, "network": req.network})
-            pref = r.get("data", {}).get("transactionReference", "")
-        pts = max(1, int(req.amount * 0.02))
-        await vas_complete(user["_id"], txn_id, amt, pref,
-            "Airtime Purchased", f"₦{req.amount:,.0f} {req.network} airtime → {req.phone_number}", pts,
-            sms_event_type="AIRTIME",
-            sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id})
-        asyncio.create_task(send_event_notification(user["_id"], "AIRTIME", {
-            "amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id
-        }))
-        asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "AIRTIME", f"{req.network} airtime"))
-        asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
-        return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "points_earned": pts}
-    except HTTPException:
-        await vas_refund(user["_id"], txn_id, amt, "Airtime Purchase Failed")
-        raise
-    except Exception:
-        await vas_refund(user["_id"], txn_id, amt, "Airtime Purchase Failed")
-        raise HTTPException(500, "Airtime purchase failed. Funds reversed.")
+            raise HTTPException(503, f"No provider configured for AIRTIME")
+    except (HTTPException, Exception) as exc:
+        primary_err = exc
+        if provider != "SAFEHAVEN" and await get_sh_vas_fallback_enabled():
+            try:
+                wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+                fb_user_sh = ((wallet_doc or {}).get("sh_account_number")
+                              or (wallet_doc or {}).get("account_number", ""))
+                if fb_user_sh:
+                    cat_id = await get_sh_vas_cat_id("AIRTIME", req.network)
+                    r = await call_sh("POST", "/vas/pay/airtime", body={
+                        "serviceCategoryId": cat_id, "amount": req.amount,
+                        "channel": "WEB", "debitAccountNumber": fb_user_sh,
+                        "phoneNumber": req.phone_number, "externalReference": txn_id,
+                    })
+                    pref = r.get("data", {}).get("reference") or r.get("data", {}).get("id") or txn_id
+                    fallback_used = True
+                    logger.warning(f"[VAS] AIRTIME: Primary={provider} failed, SH fallback succeeded txn={txn_id}")
+            except Exception as fb_err:
+                logger.error(f"[VAS] AIRTIME: SH fallback also failed: {fb_err}")
+        if not fallback_used:
+            await vas_refund(user["_id"], txn_id, amt, "Airtime Purchase Failed")
+            if isinstance(primary_err, HTTPException):
+                raise primary_err
+            raise HTTPException(500, "Airtime purchase failed. Funds reversed.")
+
+    pts = max(1, int(req.amount * 0.02))
+    await vas_complete(user["_id"], txn_id, amt, pref,
+        "Airtime Purchased", f"₦{req.amount:,.0f} {req.network} airtime → {req.phone_number}", pts,
+        sms_event_type="AIRTIME",
+        sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id})
+    asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt, txn_id))
+    asyncio.create_task(send_event_notification(user["_id"], "AIRTIME", {
+        "amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_id
+    }))
+    asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "AIRTIME", f"{req.network} airtime"))
+    asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
+    return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "points_earned": pts,
+            "fallback_used": fallback_used}
 
 @router.post("/vas/data")
 async def buy_data(req: DataReq, request: Request):
@@ -139,6 +185,11 @@ async def buy_data(req: DataReq, request: Request):
         f"{req.network} Data — {req.phone_number}", {"network": req.network, "phone_number": req.phone_number, "plan_id": req.plan_id})
     if was_existing:
         return {"transaction_id": txn_id, "status": "COMPLETED"}
+
+    provider = "CDH"
+    pref = txn_id
+    fallback_used = False
+    primary_err: Exception = None  # type: ignore[assignment]
     try:
         provider = await get_service_provider("DATA")
         if provider == "PAIRGATE":
@@ -157,8 +208,6 @@ async def buy_data(req: DataReq, request: Request):
             })
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
         elif provider == "STROWALLET":
-            # CDH fallback plans use integer IDs — if plan_id is all digits it came from CDH fallback,
-            # so route to CDH. Strowallet variation codes are non-numeric strings.
             if req.plan_id.isdigit():
                 try:
                     bundle_id = int(req.plan_id)
@@ -174,29 +223,44 @@ async def buy_data(req: DataReq, request: Request):
                     network=req.network, variation_code=req.plan_id,
                 )
                 pref = result["reference"]
+        elif provider == "SAFEHAVEN":
+            wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+            user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                            or (wallet_doc or {}).get("account_number", ""))
+            if not user_sh_acct:
+                raise HTTPException(400, "Safe Haven account not found")
+            cat_id = await get_sh_vas_cat_id("DATA", req.network)
+            r = await call_sh("POST", "/vas/pay/data", body={
+                "serviceCategoryId": cat_id, "bundleCode": req.plan_id,
+                "amount": req.amount, "channel": "WEB",
+                "debitAccountNumber": user_sh_acct,
+                "phoneNumber": req.phone_number, "externalReference": txn_id,
+            })
+            pref = r.get("data", {}).get("reference") or r.get("data", {}).get("id") or txn_id
         else:
-            r = await call_sh("POST", "/vas/pay/data", body={"serviceCategoryId": "data",
-                "bundleCode": req.plan_id, "amount": req.amount, "channel": "WEB",
-                "phoneNumber": req.phone_number})
-            pref = r.get("data", {}).get("transactionReference", "")
-        pts = max(1, int(req.amount * 0.02))
-        await vas_complete(user["_id"], txn_id, amt, pref,
-            "Data Purchased", f"₦{req.amount:,.0f} data bundle → {req.phone_number}", pts,
-            sms_event_type="DATA",
-            sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "plan": req.plan_id, "ref": txn_id})
-        asyncio.create_task(send_event_notification(user["_id"], "DATA", {
-            "amount": req.amount, "network": req.network, "phone": req.phone_number,
-            "plan": req.plan_id, "ref": txn_id
-        }))
-        asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "DATA", f"{req.network} data"))
-        asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
-        return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "points_earned": pts}
-    except HTTPException:
-        await vas_refund(user["_id"], txn_id, amt, "Data Purchase Failed")
-        raise
-    except Exception:
-        await vas_refund(user["_id"], txn_id, amt, "Data Purchase Failed")
-        raise HTTPException(500, "Data purchase failed. Funds reversed.")
+            raise HTTPException(503, f"No provider configured for DATA")
+    except (HTTPException, Exception) as exc:
+        primary_err = exc
+        # SH fallback for data is skipped (bundleCode is provider-specific)
+        if not fallback_used:
+            await vas_refund(user["_id"], txn_id, amt, "Data Purchase Failed")
+            if isinstance(primary_err, HTTPException):
+                raise primary_err
+            raise HTTPException(500, "Data purchase failed. Funds reversed.")
+
+    pts = max(1, int(req.amount * 0.02))
+    await vas_complete(user["_id"], txn_id, amt, pref,
+        "Data Purchased", f"₦{req.amount:,.0f} data bundle → {req.phone_number}", pts,
+        sms_event_type="DATA",
+        sms_meta={"amount": req.amount, "network": req.network, "phone": req.phone_number, "plan": req.plan_id, "ref": txn_id})
+    asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt, txn_id))
+    asyncio.create_task(send_event_notification(user["_id"], "DATA", {
+        "amount": req.amount, "network": req.network, "phone": req.phone_number,
+        "plan": req.plan_id, "ref": txn_id
+    }))
+    asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "DATA", f"{req.network} data"))
+    asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
+    return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "points_earned": pts}
 
 @router.post("/vas/cable")
 async def pay_cable(req: CableReq, request: Request):
@@ -210,11 +274,15 @@ async def pay_cable(req: CableReq, request: Request):
         f"{req.provider} — {req.smartcard_number}", {"provider": req.provider, "smartcard_number": req.smartcard_number, "package_id": req.package_id})
     if was_existing:
         return {"transaction_id": txn_id, "status": "COMPLETED"}
+
+    svc_provider = "CDH"
+    pref = txn_id
+    fallback_used = False
+    primary_err: Exception = None  # type: ignore[assignment]
     try:
         svc_provider = await get_service_provider("CABLE")
         if svc_provider == "PAIRGATE":
             if req.package_id.startswith("cdh-"):
-                # CDH fallback plan (PairGate plans unavailable for this provider) — route to CDH
                 try:
                     cdh_plan_id = int(req.package_id[4:])
                 except (ValueError, TypeError):
@@ -227,10 +295,10 @@ async def pay_cable(req: CableReq, request: Request):
                 pref = str(r.get("reference", r.get("transaction_id", txn_id)))
             else:
                 r = await call_pg("POST", "/cable/purchase", body={
-                    "provider_id": req.provider.lower(),   # PairGate requires lowercase: "dstv", "gotv", "startimes"
-                    "plan_id": req.package_id,             # PairGate plan_id e.g. "57"
+                    "provider_id": req.provider.lower(),
+                    "plan_id": req.package_id,
                     "smartcard": req.smartcard_number,
-                    "recipient_name": req.customer_name or "",  # subscriber name from cable-validate
+                    "recipient_name": req.customer_name or "",
                     "reference": txn_id,
                 })
                 pref = str(r.get("reference", r.get("transaction_ref", txn_id)))
@@ -252,26 +320,43 @@ async def pay_cable(req: CableReq, request: Request):
                 smartcard_number=req.smartcard_number,
             )
             pref = result["reference"]
+        elif svc_provider == "SAFEHAVEN":
+            wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+            user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                            or (wallet_doc or {}).get("account_number", ""))
+            if not user_sh_acct:
+                raise HTTPException(400, "Safe Haven account not found")
+            cat_id = await get_sh_vas_cat_id("CABLE_TV", req.provider)
+            r = await call_sh("POST", "/vas/pay/cable-tv", body={
+                "serviceCategoryId": cat_id, "bundleCode": req.package_id,
+                "amount": req.amount, "channel": "WEB",
+                "debitAccountNumber": user_sh_acct,
+                "cardNumber": req.smartcard_number,
+                "externalReference": txn_id,
+            })
+            pref = r.get("data", {}).get("reference") or r.get("data", {}).get("id") or txn_id
         else:
-            r = await call_sh("POST", "/vas/pay/cable-tv", body={"serviceCategoryId": "cable-tv",
-                "bundleCode": req.package_id, "amount": req.amount, "channel": "WEB", "cardNumber": req.smartcard_number})
-            pref = r.get("data", {}).get("transactionReference", "")
-        await vas_complete(user["_id"], txn_id, amt, pref,
-            "Cable TV Renewed", f"{req.provider} subscription renewed for {req.smartcard_number}",
-            sms_event_type="CABLE",
-            sms_meta={"plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id})
-        asyncio.create_task(send_event_notification(user["_id"], "CABLE", {
-            "plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id
-        }))
-        asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "CABLE_TV", f"{req.provider} cable TV"))
-        asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
-        return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount}
-    except HTTPException:
-        await vas_refund(user["_id"], txn_id, amt, "Cable TV Payment Failed")
-        raise
-    except Exception:
-        await vas_refund(user["_id"], txn_id, amt, "Cable TV Payment Failed")
-        raise HTTPException(500, "Cable TV payment failed. Funds reversed.")
+            raise HTTPException(503, f"No provider configured for CABLE")
+    except (HTTPException, Exception) as exc:
+        primary_err = exc
+        # No SH fallback for cable — bundleCode is provider-specific
+        if not fallback_used:
+            await vas_refund(user["_id"], txn_id, amt, "Cable TV Payment Failed")
+            if isinstance(primary_err, HTTPException):
+                raise primary_err
+            raise HTTPException(500, "Cable TV payment failed. Funds reversed.")
+
+    await vas_complete(user["_id"], txn_id, amt, pref,
+        "Cable TV Renewed", f"{req.provider} subscription renewed for {req.smartcard_number}",
+        sms_event_type="CABLE",
+        sms_meta={"plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id})
+    asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt, txn_id))
+    asyncio.create_task(send_event_notification(user["_id"], "CABLE", {
+        "plan": req.package_id, "smartcard": req.smartcard_number, "ref": txn_id
+    }))
+    asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "CABLE_TV", f"{req.provider} cable TV"))
+    asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
+    return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount}
 
 @router.post("/vas/electricity")
 async def pay_electricity(req: ElectricityReq, request: Request):
@@ -287,22 +372,26 @@ async def pay_electricity(req: ElectricityReq, request: Request):
         f"{req.disco} — {req.meter_number}", {"disco": req.disco, "meter_number": req.meter_number, "meter_type": req.meter_type})
     if was_existing:
         return {"transaction_id": txn_id, "status": "COMPLETED"}
+
+    svc_provider = "CDH"
+    pref = txn_id
+    token = "N/A"
+    units = ""
+    fallback_used = False
+    primary_err: Exception = None  # type: ignore[assignment]
     try:
         svc_provider = await get_service_provider("ELECTRICITY")
         if svc_provider == "PAIRGATE":
             meter_type_int = 1 if req.meter_type.upper() == "PREPAID" else 2
             pg_disco = PG_DISCO_SLUGS.get(req.disco.upper(), req.disco.lower())
-            # Purchase directly — meter was already validated by the frontend via /vas/meter-validate.
-            # Do NOT re-verify here to avoid redundant API calls and rate-limit (429) issues.
             r2 = await call_pg("POST", "/electricity/purchase", body={
                 "provider_id": pg_disco, "meter_number": req.meter_number,
                 "meter_type": meter_type_int,
-                "amount": int(req.amount),  # PairGate expects integer naira, not float
+                "amount": int(req.amount),
                 "reference": txn_id,
             })
             logger.info(f"[PG] electricity-purchase response keys={list(r2.keys())} data={str(r2)[:400]}")
             pref = str(r2.get("reference_code", r2.get("reference", r2.get("transaction_ref", txn_id))))
-            # PairGate delivers token as 'pin' asynchronously via webhook; also try sync fields
             token = r2.get("pin", r2.get("token", r2.get("receipt", "N/A")))
             units = str(r2.get("units", r2.get("unit", "")))
         elif svc_provider == "CHEAPDATAHUB":
@@ -315,32 +404,70 @@ async def pay_electricity(req: ElectricityReq, request: Request):
             pref = str(r.get("reference", r.get("transaction_id", txn_id)))
             token = data.get("token", data.get("receipt", "N/A")) if isinstance(data, dict) else "N/A"
             units = data.get("units", "") if isinstance(data, dict) else ""
-        else:
-            r = await call_sh("POST", "/vas/pay/utility", body={"serviceCategoryId": "electricity",
-                "amount": req.amount, "channel": "WEB", "meterNumber": req.meter_number,
-                "vendType": req.meter_type, "disco": req.disco})
+        elif svc_provider == "SAFEHAVEN":
+            wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+            user_sh_acct = ((wallet_doc or {}).get("sh_account_number")
+                            or (wallet_doc or {}).get("account_number", ""))
+            if not user_sh_acct:
+                raise HTTPException(400, "Safe Haven account not found")
+            cat_id = await get_sh_vas_cat_id("ELECTRICITY", req.disco)
+            r = await call_sh("POST", "/vas/pay/utility", body={
+                "serviceCategoryId": cat_id, "amount": req.amount,
+                "channel": "WEB", "debitAccountNumber": user_sh_acct,
+                "meterNumber": req.meter_number,
+                "vendType": req.meter_type.upper(),
+                "externalReference": txn_id,
+            })
             data = r.get("data", {})
-            pref = data.get("transactionReference", "")
-            token = data.get("token", "N/A")
-            units = data.get("units", "")
-        await db.transactions.update_one({"transaction_id": txn_id},
-            {"$set": {"metadata.token": token, "metadata.units": units, "metadata.pg_ref": pref}})
-        await vas_complete(user["_id"], txn_id, amt, pref,
-            "Electricity Purchased", f"Token: {token} | Units: {units}",
-            sms_event_type="ELECTRICITY",
-            sms_meta={"token": token, "units": units, "meter": req.meter_number, "disco": req.disco, "ref": txn_id})
-        asyncio.create_task(send_event_notification(user["_id"], "ELECTRICITY", {
-            "token": token, "units": units, "meter": req.meter_number
-        }))
-        asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "ELECTRICITY", f"{req.disco} electricity"))
-        asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
-        return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "token": token, "units": units}
-    except HTTPException:
-        await vas_refund(user["_id"], txn_id, amt, "Electricity Payment Failed")
-        raise
-    except Exception:
-        await vas_refund(user["_id"], txn_id, amt, "Electricity Payment Failed")
-        raise HTTPException(500, "Electricity payment failed. Funds reversed.")
+            pref = data.get("reference") or data.get("id") or txn_id
+            token = data.get("utilityToken", data.get("token", "N/A"))
+            units = str(data.get("units", ""))
+        else:
+            raise HTTPException(503, f"No provider configured for ELECTRICITY")
+    except (HTTPException, Exception) as exc:
+        primary_err = exc
+        if svc_provider != "SAFEHAVEN" and await get_sh_vas_fallback_enabled():
+            try:
+                wallet_doc = await db.wallets.find_one({"user_id": user["_id"]})
+                fb_user_sh = ((wallet_doc or {}).get("sh_account_number")
+                              or (wallet_doc or {}).get("account_number", ""))
+                if fb_user_sh:
+                    cat_id = await get_sh_vas_cat_id("ELECTRICITY", req.disco)
+                    r = await call_sh("POST", "/vas/pay/utility", body={
+                        "serviceCategoryId": cat_id, "amount": req.amount,
+                        "channel": "WEB", "debitAccountNumber": fb_user_sh,
+                        "meterNumber": req.meter_number,
+                        "vendType": req.meter_type.upper(),
+                        "externalReference": txn_id,
+                    })
+                    data = r.get("data", {})
+                    pref = data.get("reference") or data.get("id") or txn_id
+                    token = data.get("utilityToken", data.get("token", "N/A"))
+                    units = str(data.get("units", ""))
+                    fallback_used = True
+                    logger.warning(f"[VAS] ELECTRICITY: Primary={svc_provider} failed, SH fallback succeeded txn={txn_id}")
+            except Exception as fb_err:
+                logger.error(f"[VAS] ELECTRICITY: SH fallback also failed: {fb_err}")
+        if not fallback_used:
+            await vas_refund(user["_id"], txn_id, amt, "Electricity Payment Failed")
+            if isinstance(primary_err, HTTPException):
+                raise primary_err
+            raise HTTPException(500, "Electricity payment failed. Funds reversed.")
+
+    await db.transactions.update_one({"transaction_id": txn_id},
+        {"$set": {"metadata.token": token, "metadata.units": units, "metadata.pg_ref": pref}})
+    await vas_complete(user["_id"], txn_id, amt, pref,
+        "Electricity Purchased", f"Token: {token} | Units: {units}",
+        sms_event_type="ELECTRICITY",
+        sms_meta={"token": token, "units": units, "meter": req.meter_number, "disco": req.disco, "ref": txn_id})
+    asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt, txn_id))
+    asyncio.create_task(send_event_notification(user["_id"], "ELECTRICITY", {
+        "token": token, "units": units, "meter": req.meter_number
+    }))
+    asyncio.create_task(_credit_cashback_bg(user["_id"], req.amount, "ELECTRICITY", f"{req.disco} electricity"))
+    asyncio.create_task(_check_referral_bg(user["_id"], req.amount))
+    return {"transaction_id": txn_id, "status": "COMPLETED", "amount": req.amount, "token": token, "units": units,
+            "fallback_used": fallback_used}
 
 @router.post("/vas/verify")
 async def verify_vas(req: VerifyReq, request: Request):
@@ -432,6 +559,7 @@ async def fund_betting_wallet(req: BettingReq, request: Request):
             sms_event_type="BETTING",
             sms_meta={"amount": req.amount, "platform": BETTING_PLATFORMS[platform], "ref": txn_id}
         )
+        asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt, txn_id))
     except HTTPException:
         await vas_refund(user["_id"], txn_id, amt, "Betting Deposit Failed")
         raise
@@ -533,10 +661,22 @@ async def _fetch_pg_cable_plans() -> dict:
 
 # ===== CDH PLANS & VALIDATION =====
 @router.get("/vas/plans")
-async def get_vas_plans(plan_type: str = "data"):
+async def get_vas_plans(plan_type: str = "data", network: str = ""):
     """Return data or cable plans for the active provider."""
     if plan_type == "cable":
         cable_provider = await get_service_provider("CABLE")
+        if cable_provider == "SAFEHAVEN":
+            sh_cable: dict = {}
+            for prov in ["DSTV", "GOTV", "STARTIMES"]:
+                prods = await get_sh_vas_products("CABLE", prov)
+                if prods:
+                    sh_cable[prov] = [
+                        {"id": p["bundleCode"], "name": p.get("validity") or p.get("name") or p["bundleCode"],
+                         "amount": p["amount"], "provider": "SAFEHAVEN"}
+                        for p in prods if p.get("bundleCode")
+                    ]
+            if sh_cable:
+                return {"plans": sh_cable}
         if cable_provider == "PAIRGATE":
             pg_plans = await _fetch_pg_cable_plans()
             if pg_plans:
@@ -544,8 +684,20 @@ async def get_vas_plans(plan_type: str = "data"):
             logger.warning("[PG] cable-plans unavailable — falling back to CDH static plans")
         return {"plans": CDH_CABLE_PLANS}
 
-    # DATA — fetch from active provider so plan IDs match what the purchase endpoint expects
+    # DATA — return SH plans when SH is selected, else existing logic
     data_provider = await get_service_provider("DATA")
+    if data_provider == "SAFEHAVEN":
+        sh_data: dict = {}
+        for net in ["MTN", "AIRTEL", "GLO", "9MOBILE"]:
+            prods = await get_sh_vas_products("DATA", net)
+            if prods:
+                sh_data[net] = [
+                    {"id": p["bundleCode"], "name": p.get("validity") or p.get("name") or p["bundleCode"],
+                     "amount": p["amount"], "provider": "SAFEHAVEN"}
+                    for p in prods if p.get("bundleCode")
+                ]
+        if sh_data:
+            return {"plans": sh_data}
     if data_provider == "STROWALLET":
         from routes.strowallet import strow_get_data_plans
         grouped = {}
@@ -558,7 +710,6 @@ async def get_vas_plans(plan_type: str = "data"):
             if raw_plans:
                 normalized = []
                 for p in raw_plans:
-                    # Strowallet uses variation_code as the unique plan identifier
                     vc = (p.get("variation_code") or p.get("code") or p.get("id") or "")
                     if not vc:
                         continue
@@ -570,7 +721,6 @@ async def get_vas_plans(plan_type: str = "data"):
                     normalized.append({"id": vc, "name": name, "validity": validity, "amount": amount})
                 if normalized:
                     grouped[net] = normalized
-        # Fallback to CDH plans if Strowallet returns nothing
         if grouped:
             return {"plans": grouped}
         logger.warning("[STROW] get_data_plans returned empty for all networks — falling back to CDH")
@@ -823,6 +973,7 @@ async def buy_education(req: EducationReq, request: Request):
             sms_event_type="EDUCATION",
             sms_meta={"product": product["label"], "phone": req.phone, "ref": txn_id, "amount": total}
         )
+        asyncio.create_task(_vas_sweep_to_bucket_bg(user["_id"], amt_kobo, txn_id))
         asyncio.create_task(send_event_notification(user["_id"], "EDUCATION", {
             "product": product["label"], "phone": req.phone, "ref": txn_id, "amount": total
         }))

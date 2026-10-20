@@ -106,8 +106,11 @@ async def safehaven_webhook(request: Request):
     eid = data.get("_id") or str(uuid.uuid4())
 
     # ── Full payload log ──────────────────────────────────────────────
+    debit_acct  = data.get("debitAccountNumber") or data.get("debitAccount", "")
+    credit_acct = data.get("creditAccountNumber") or data.get("creditAccount", "")
+    pay_ref     = data.get("paymentReference", "")
     logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} "
-                f"acct={data.get('creditAccountNumber')} amt={data.get('amount')} "
+                f"acct={credit_acct or debit_acct} amt={data.get('amount')} "
                 f"status={data.get('status')!r} sessionId={data.get('sessionId')}")
 
     # ── Idempotent store ──────────────────────────────────────────────
@@ -212,89 +215,99 @@ async def safehaven_webhook(request: Request):
                 else:
                     logger.info(f"[SH-WEBHOOK] duplicate skipped session_id={session_id}")
             else:
-                logger.warning(f"[SH-WEBHOOK] ⚠️ no wallet found for creditAccountNumber={credit_acct_num!r}")
-                # ── Check if this is a business sub-account credit ─────────────
-                biz = await db.businesses.find_one(
-                    {"sh_account_number": credit_acct_num, "status": "active"}
+                # Check if this is a known internal BOMPAY service/charge account
+                internal = (
+                    await db.charge_accounts.find_one({"sh_account_number": credit_acct_num}) or
+                    await db.service_bucket_accounts.find_one({"sh_account_number": credit_acct_num})
                 )
-                if biz:
-                    biz_id = str(biz["_id"])
-                    dup = await db.transactions.find_one(
-                        {"provider_reference": session_id, "business_id": biz_id}
-                    )
-                    if not dup:
-                        amt_kobo = int(amount * 100)
-                        biz_txn_id = f"BTXN{secrets.token_hex(12).upper()}"
-                        debit_name = (data.get("debitAccountName") or data.get("senderName")
-                                      or data.get("debitName") or "External Transfer")
-                        narration = data.get("narration") or f"Transfer from {debit_name}"
-
-                        await db.transactions.insert_one({
-                            "transaction_id": biz_txn_id,
-                            "business_id": biz_id,
-                            "user_id": biz.get("owner_id", ""),
-                            "type": "WALLET_FUNDING", "direction": "CREDIT", "amount": amt_kobo,
-                            "fee": 0, "vat": 0, "currency": "NGN",
-                            "status": "COMPLETED", "provider": "SAFEHAVEN",
-                            "description": narration,
-                            "provider_reference": session_id,
-                            "metadata": {"event_type": event_type,
-                                         "debit_account": data.get("debitAccountNumber"),
-                                         "debit_name": debit_name},
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                        })
-                        await db.business_wallets.update_one(
-                            {"business_id": biz_id},
-                            {"$inc": {"available_balance": amt_kobo, "ledger_balance": amt_kobo}},
-                            upsert=True,
-                        )
-                        owner_id = biz.get("owner_id", "")
-                        biz_name = biz.get("name", "Your Business")
-                        if owner_id:
-                            await notify(owner_id, f"Business Credit — {biz_name}",
-                                         f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
-                            # Live SH balance for business account
-                            biz_sh_bal = None
-                            biz_sh_id = biz.get("sh_subaccount_id")
-                            if biz_sh_id:
-                                try:
-                                    biz_sh_bal = await get_sh_subaccount_balance(biz_sh_id)
-                                except Exception:
-                                    pass
-                            if biz_sh_bal is None:
-                                biz_w = await db.business_wallets.find_one({"business_id": biz_id}) or {}
-                                biz_sh_bal = biz_w.get("available_balance", 0) / 100
-                            # SMS + email to business owner on inbound credit
-                            asyncio.create_task(send_event_sms(owner_id, "BUSINESS_TRANSFER_CREDIT", {
-                                "amount": amount, "sender_biz": debit_name,
-                                "ref": session_id,
-                                "balance": biz_sh_bal,
-                            }))
-                            async def _send_biz_credit_email(oid=owner_id, bn=biz_name, amt=amount, dn=debit_name, sid=session_id):
-                                try:
-                                    owner_doc = await db.users.find_one({"_id": ObjectId(oid)})
-                                    owner_email = (owner_doc or {}).get("email", "")
-                                    owner_name  = f"{(owner_doc or {}).get('first_name','')} {(owner_doc or {}).get('last_name','')}".strip() or "Customer"
-                                    if owner_email:
-                                        html = _email_html(
-                                            f"Business Credit — ₦{amt:,.2f}",
-                                            [
-                                                f"Hi {owner_name}, your business <strong>{bn}</strong> received a credit.",
-                                                f"Amount: <strong>₦{amt:,.2f}</strong> from <strong>{dn}</strong>",
-                                                f"Reference: {sid}",
-                                            ],
-                                            "Log in to BOMPAY Business to view your balance and transactions."
-                                        )
-                                        await send_email(to=owner_email, subject=f"[BOMPAY] Business Credit — {bn}", html=html)
-                                except Exception as ex:
-                                    logger.warning(f"[BIZ-CREDIT-EMAIL] {ex}")
-                            asyncio.create_task(_send_biz_credit_email())
-                        logger.info(f"[SH-WEBHOOK] ✅ business credit ₦{amount} → {biz_name} ({biz_id})")
-                    else:
-                        logger.info(f"[SH-WEBHOOK] business duplicate skipped session_id={session_id}")
+                if internal:
+                    logger.info(f"[SH-WEBHOOK] credit to internal account "
+                                f"'{internal.get('category') or internal.get('service','?')}' "
+                                f"({credit_acct_num}) — no wallet action needed")
                 else:
-                    logger.warning(f"[SH-WEBHOOK] ⚠️ no business found for account={credit_acct_num!r}")
+                    logger.warning(f"[SH-WEBHOOK] ⚠️ no wallet found for creditAccountNumber={credit_acct_num!r}")
+                    # ── Check if this is a business sub-account credit ─────────────
+                    biz = await db.businesses.find_one(
+                        {"sh_account_number": credit_acct_num, "status": "active"}
+                    )
+                    if biz:
+                        biz_id = str(biz["_id"])
+                        dup = await db.transactions.find_one(
+                            {"provider_reference": session_id, "business_id": biz_id}
+                        )
+                        if not dup:
+                            amt_kobo = int(amount * 100)
+                            biz_txn_id = f"BTXN{secrets.token_hex(12).upper()}"
+                            debit_name = (data.get("debitAccountName") or data.get("senderName")
+                                          or data.get("debitName") or "External Transfer")
+                            narration = data.get("narration") or f"Transfer from {debit_name}"
+
+                            await db.transactions.insert_one({
+                                "transaction_id": biz_txn_id,
+                                "business_id": biz_id,
+                                "user_id": biz.get("owner_id", ""),
+                                "type": "WALLET_FUNDING", "direction": "CREDIT", "amount": amt_kobo,
+                                "fee": 0, "vat": 0, "currency": "NGN",
+                                "status": "COMPLETED", "provider": "SAFEHAVEN",
+                                "description": narration,
+                                "provider_reference": session_id,
+                                "metadata": {"event_type": event_type,
+                                             "debit_account": data.get("debitAccountNumber"),
+                                             "debit_name": debit_name},
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            await db.business_wallets.update_one(
+                                {"business_id": biz_id},
+                                {"$inc": {"available_balance": amt_kobo, "ledger_balance": amt_kobo}},
+                                upsert=True,
+                            )
+                            owner_id = biz.get("owner_id", "")
+                            biz_name = biz.get("name", "Your Business")
+                            if owner_id:
+                                await notify(owner_id, f"Business Credit — {biz_name}",
+                                             f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
+                                # Live SH balance for business account
+                                biz_sh_bal = None
+                                biz_sh_id = biz.get("sh_subaccount_id")
+                                if biz_sh_id:
+                                    try:
+                                        biz_sh_bal = await get_sh_subaccount_balance(biz_sh_id)
+                                    except Exception:
+                                        pass
+                                if biz_sh_bal is None:
+                                    biz_w = await db.business_wallets.find_one({"business_id": biz_id}) or {}
+                                    biz_sh_bal = biz_w.get("available_balance", 0) / 100
+                                # SMS + email to business owner on inbound credit
+                                asyncio.create_task(send_event_sms(owner_id, "BUSINESS_TRANSFER_CREDIT", {
+                                    "amount": amount, "sender_biz": debit_name,
+                                    "ref": session_id,
+                                    "balance": biz_sh_bal,
+                                }))
+                                async def _send_biz_credit_email(oid=owner_id, bn=biz_name, amt=amount, dn=debit_name, sid=session_id):
+                                    try:
+                                        owner_doc = await db.users.find_one({"_id": ObjectId(oid)})
+                                        owner_email = (owner_doc or {}).get("email", "")
+                                        owner_name  = f"{(owner_doc or {}).get('first_name','')} {(owner_doc or {}).get('last_name','')}".strip() or "Customer"
+                                        if owner_email:
+                                            html = _email_html(
+                                                f"Business Credit — ₦{amt:,.2f}",
+                                                [
+                                                    f"Hi {owner_name}, your business <strong>{bn}</strong> received a credit.",
+                                                    f"Amount: <strong>₦{amt:,.2f}</strong> from <strong>{dn}</strong>",
+                                                    f"Reference: {sid}",
+                                                ],
+                                                "Log in to BOMPAY Business to view your balance and transactions."
+                                            )
+                                            await send_email(to=owner_email, subject=f"[BOMPAY] Business Credit — {bn}", html=html)
+                                    except Exception as ex:
+                                        logger.warning(f"[BIZ-CREDIT-EMAIL] {ex}")
+                                asyncio.create_task(_send_biz_credit_email())
+                            logger.info(f"[SH-WEBHOOK] ✅ business credit ₦{amount} → {biz_name} ({biz_id})")
+                        else:
+                            logger.info(f"[SH-WEBHOOK] business duplicate skipped session_id={session_id}")
+                    else:
+                        logger.warning(f"[SH-WEBHOOK] ⚠️ no business found for account={credit_acct_num!r}")
         else:
             logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
                         f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
@@ -309,7 +322,21 @@ async def safehaven_webhook(request: Request):
         await _handle_sh_transfer_failure(data, eid)
 
     else:
-        logger.warning(f"[SH-WEBHOOK] unhandled eventType={event_type!r} — full event: {json.dumps(event)[:500]}")
+        # Suppress noisy "unhandled" for known internal service account debit events
+        # (VAS bucket, cashback, referral, fees) — these are expected and don't need wallet action
+        debit_acct_num = data.get("debitAccountNumber", "")
+        internal_debit = None
+        if debit_acct_num:
+            internal_debit = (
+                await db.charge_accounts.find_one({"sh_account_number": debit_acct_num}) or
+                await db.service_bucket_accounts.find_one({"sh_account_number": debit_acct_num})
+            )
+        if internal_debit:
+            logger.info(f"[SH-WEBHOOK] debit on internal account "
+                        f"'{internal_debit.get('category') or internal_debit.get('service','?')}' "
+                        f"({debit_acct_num}) — no action needed")
+        else:
+            logger.warning(f"[SH-WEBHOOK] unhandled eventType={event_type!r} — full event: {json.dumps(event)[:500]}")
 
     return {"received": True}
 

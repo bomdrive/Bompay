@@ -1889,9 +1889,6 @@ async def set_vas_routing(request: Request):
         # Validate TRANSFER can only use SAFEHAVEN or STROWALLET
         if svc == "TRANSFER" and prov not in ("SAFEHAVEN", "STROWALLET"):
             raise HTTPException(400, "Transfer provider must be SAFEHAVEN or STROWALLET")
-        # Validate VAS services cannot use SAFEHAVEN
-        if svc not in ("TRANSFER",) and prov == "SAFEHAVEN":
-            raise HTTPException(400, "SAFEHAVEN is only valid for TRANSFER service")
         # Education must use STROWALLET
         if svc == "EDUCATION" and prov not in ("STROWALLET",):
             raise HTTPException(400, "Education service only supports STROWALLET provider")
@@ -2222,7 +2219,281 @@ async def get_fee_revenue(request: Request, days: int = 30):
         "charge_balances": charge_balances,
     }
 
-@router.get("/admin/sh-fee-config")
+# ===== VAS REVENUE ANALYTICS =====
+
+@router.get("/admin/vas-revenue")
+async def get_vas_revenue(request: Request, days: int = 30):
+    """VAS revenue analytics: totals per service type and provider."""
+    await get_admin_user(request)
+    from collections import defaultdict
+    now = datetime.now(timezone.utc)
+    today_start  = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    month_start  = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    window_start = (now - timedelta(days=days)).isoformat()
+
+    vas_types = ["AIRTIME", "DATA", "CABLE_TV", "ELECTRICITY", "BETTING", "EDUCATION"]
+    txns = await db.transactions.find({
+        "type": {"$in": vas_types},
+        "status": "COMPLETED",
+        "direction": "DEBIT",
+        "created_at": {"$gte": window_start},
+    }).to_list(50000)
+
+    def _ngn(txn_list):
+        return round(sum(t.get("amount", 0) for t in txn_list) / 100, 2)
+
+    total_ngn = _ngn(txns)
+    today_ngn  = _ngn([t for t in txns if t.get("created_at", "") >= today_start])
+    month_ngn  = _ngn([t for t in txns if t.get("created_at", "") >= month_start])
+
+    by_service: dict = {}
+    for svc in vas_types:
+        svc_txns = [t for t in txns if t.get("type") == svc]
+        by_service[svc] = {
+            "total_ngn":  _ngn(svc_txns),
+            "today_ngn":  _ngn([t for t in svc_txns if t.get("created_at", "") >= today_start]),
+            "month_ngn":  _ngn([t for t in svc_txns if t.get("created_at", "") >= month_start]),
+            "count":      len(svc_txns),
+        }
+
+    by_provider: dict = defaultdict(lambda: {"total_ngn": 0.0, "count": 0})
+    for t in txns:
+        prov = (t.get("metadata", {}).get("provider") or "UNKNOWN").upper()
+        by_provider[prov]["total_ngn"] = round(by_provider[prov]["total_ngn"] + t.get("amount", 0) / 100, 2)
+        by_provider[prov]["count"] += 1
+
+    # Build daily series
+    daily: dict = defaultdict(lambda: {"total": 0.0})
+    for t in txns:
+        day = (t.get("created_at") or "")[:10]
+        svc = t.get("type", "UNKNOWN")
+        daily[day]["total"] = round(daily[day].get("total", 0) + t.get("amount", 0) / 100, 2)
+        daily[day][svc] = round(daily[day].get(svc, 0) + t.get("amount", 0) / 100, 2)
+    daily_series = sorted([{"date": d, **v} for d, v in daily.items()], key=lambda x: x["date"])
+
+    return {
+        "total_ngn":    total_ngn,
+        "today_ngn":    today_ngn,
+        "month_ngn":    month_ngn,
+        "count":        len(txns),
+        "by_service":   by_service,
+        "by_provider":  dict(by_provider),
+        "daily_series": daily_series,
+    }
+
+
+# ===== VAS CONFIG (markup %, collection account, SH fallback) =====
+
+@router.get("/admin/vas-config")
+async def get_vas_config(request: Request):
+    """Return VAS markup percentages, collection account, and SH fallback status."""
+    await get_admin_user(request)
+    doc   = await db.settings.find_one({"key": "vas_config"})
+    fb    = await db.settings.find_one({"key": "sh_vas_fallback"})
+    cats  = await db.settings.find_one({"key": "sh_vas_cats"})
+    config = (doc or {}).get("value", {})
+    return {
+        "markup_pct":         config.get("markup_pct", {}),
+        "collection_account": config.get("collection_account", ""),
+        "sh_fallback_enabled": bool((fb or {}).get("enabled", False)),
+        "sh_category_ids":     (cats or {}).get("value", {}),
+    }
+
+@router.put("/admin/vas-config")
+async def update_vas_config(request: Request):
+    """Update VAS markup percentages, collection/sweep account, and SH auto-fallback."""
+    await get_admin_user(request)
+    body = await request.json()
+    now  = datetime.now(timezone.utc).isoformat()
+
+    markup_pct = body.get("markup_pct")
+    if markup_pct is not None:
+        if not isinstance(markup_pct, dict):
+            raise HTTPException(400, "markup_pct must be a dict of service → percentage")
+        for svc, pct in markup_pct.items():
+            if not isinstance(pct, (int, float)) or pct < 0 or pct > 50:
+                raise HTTPException(400, f"Markup for {svc} must be 0–50 %")
+
+    # Build the config update
+    set_fields: dict = {"updated_at": now}
+    if markup_pct is not None:
+        set_fields["value.markup_pct"] = markup_pct
+    collection_account = body.get("collection_account")
+    if collection_account is not None:
+        set_fields["value.collection_account"] = str(collection_account).strip()
+
+    await db.settings.update_one(
+        {"key": "vas_config"},
+        {"$set": {"key": "vas_config", **set_fields}},
+        upsert=True,
+    )
+
+    # SH fallback toggle
+    if "sh_fallback_enabled" in body:
+        enabled = bool(body["sh_fallback_enabled"])
+        await db.settings.update_one(
+            {"key": "sh_vas_fallback"},
+            {"$set": {"key": "sh_vas_fallback", "enabled": enabled, "updated_at": now}},
+            upsert=True,
+        )
+
+    # SH VAS category ID overrides
+    if "sh_category_ids" in body:
+        cat_ids = body["sh_category_ids"]
+        if isinstance(cat_ids, dict):
+            await db.settings.update_one(
+                {"key": "sh_vas_cats"},
+                {"$set": {"key": "sh_vas_cats", "value": cat_ids, "updated_at": now}},
+                upsert=True,
+            )
+
+    return {"message": "VAS config updated"}
+
+
+@router.post("/admin/safehaven/vas-categories/refresh")
+async def refresh_sh_vas_categories(request: Request):
+    """Fetch live Safe Haven VAS service categories and cache them for routing."""
+    await get_admin_user(request)
+    from core import call_sh
+    try:
+        services_resp = await call_sh("GET", "/vas/services")
+        services = services_resp.get("data", [])
+        if not isinstance(services, list):
+            services = []
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch SH VAS services: {e}")
+
+    mapping: dict = {}
+    for svc in services:
+        svc_id   = svc.get("_id", "")
+        svc_type = (svc.get("type") or svc.get("name") or "").upper()
+        if not svc_id or not svc_type:
+            continue
+        # Fetch categories for this service
+        try:
+            cats_resp = await call_sh("GET", f"/vas/service/{svc_id}/service-categories")
+            cats = cats_resp.get("data", [])
+        except Exception:
+            cats = []
+        if cats and isinstance(cats, list):
+            # Map each category by service_type_IDENTIFIER
+            for cat in cats:
+                cat_ident = (cat.get("identifier") or cat.get("name") or "").upper()
+                cat_id    = cat.get("_id", "")
+                if cat_id and cat_ident:
+                    mapping[f"{svc_type}_{cat_ident}"] = cat_id
+
+    if not mapping:
+        raise HTTPException(502, "No service categories returned from Safe Haven")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.settings.update_one(
+        {"key": "sh_vas_cats"},
+        {"$set": {"key": "sh_vas_cats", "value": mapping, "updated_at": now}},
+        upsert=True,
+    )
+
+    # Also refresh data+cable product catalogs
+    product_catalog: dict = {}
+    for svc in services:
+        svc_id   = svc.get("_id", "")
+        svc_type = (svc.get("type") or svc.get("name") or "").upper()
+        if not svc_id or svc_type not in ("DATA", "DATA PURCHASE", "CABLE", "CABLE TV"):
+            continue
+        for k, cat_id in mapping.items():
+            if not k.startswith(svc_type.split()[0]):
+                continue
+            try:
+                prods_resp = await call_sh("GET", f"/vas/service-category/{cat_id}/products")
+                prods = prods_resp.get("data", [])
+                if prods:
+                    product_catalog[k] = prods
+            except Exception:
+                pass
+    if product_catalog:
+        await db.settings.update_one(
+            {"key": "sh_vas_products"},
+            {"$set": {"key": "sh_vas_products", "value": product_catalog, "updated_at": now}},
+            upsert=True,
+        )
+
+    return {"message": f"Refreshed {len(mapping)} category mappings and {len(product_catalog)} product catalogs", "categories": mapping}
+
+
+@router.get("/admin/vas-reconciliation")
+async def get_vas_reconciliation(request: Request, limit: int = 50):
+    """
+    List VAS transactions that FAILED and may have a Safe Haven balance discrepancy.
+    These are transactions where vas_debit recorded a PROCESSING state but the VAS
+    purchase failed. The user's Mongo shadow wallet has been restored, but these
+    transactions should be cross-checked against the Safe Haven portal.
+    
+    NOTE: Since the architecture was changed (no pre-sweep), NEW failures will have
+    NO SH discrepancy. Only transactions before the fix may have a real SH balance gap.
+    """
+    await get_admin_user(request)
+    
+    # Transactions that are VAS-type, FAILED, and were created before the architecture fix
+    # (all time) — admin can verify via Safe Haven portal
+    txns = await db.transactions.find({
+        "type": {"$in": ["AIRTIME", "DATA", "CABLE", "ELECTRICITY", "BETTING", "EDUCATION"]},
+        "status": "FAILED",
+        "direction": "DEBIT",
+    }).sort("created_at", -1).limit(limit).to_list(limit)
+    
+    # Specifically flag the known stuck transactions
+    known_stuck = {
+        "TXNC05A183FB57999BC0717F1B1",
+        "TXN7E1D017EA918B85847E648C9",
+        "TXNA9B90999A23F9E5AECCF78A2",
+        "TXN73DC0670679AE3ADCBE6D700",
+    }
+    
+    items = []
+    for txn in txns:
+        txn_id = txn.get("transaction_id", "")
+        user_id = txn.get("user_id", "")
+        amt = txn.get("amount", 0)
+        created = txn.get("created_at", "")
+        
+        # Get user info
+        user_doc = None
+        try:
+            from bson import ObjectId
+            user_doc = await db.users.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            pass
+        
+        items.append({
+            "transaction_id": txn_id,
+            "user_id": user_id,
+            "user_email": (user_doc or {}).get("email", ""),
+            "user_name": f"{(user_doc or {}).get('first_name','')} {(user_doc or {}).get('last_name','')}".strip(),
+            "type": txn.get("type"),
+            "amount_ngn": round(amt / 100, 2),
+            "created_at": created,
+            "metadata": txn.get("metadata", {}),
+            "needs_manual_reconciliation": txn_id in known_stuck,
+            "note": (
+                "CRITICAL: Pre-architecture-fix. Check SH portal — user SH may not have been refunded. "
+                "Use Safe Haven admin portal to transfer from VAS bucket (0118140601) to user's SH account."
+                if txn_id in known_stuck
+                else "Post-fix: User's SH was NOT pre-debited. Shadow wallet restored. No SH action needed."
+            )
+        })
+    
+    return {
+        "total": len(items),
+        "known_stuck_count": sum(1 for i in items if i["needs_manual_reconciliation"]),
+        "manual_action_required": (
+            "Transfer from SH VAS bucket (0118140601) to each affected user's SH account "
+            "via Safe Haven admin portal for transactions marked 'needs_manual_reconciliation'."
+        ),
+        "items": items,
+    }
+
+
+
 async def get_sh_fee_config(request: Request):
     await get_admin_user(request)
     config = await db.sh_fee_config.find_one({"type": "NIP_FEE_TIERS"})
