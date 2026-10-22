@@ -951,7 +951,7 @@ async def get_sh_vas_products(service: str, sub_key: str) -> list:
     return products
 
 async def get_sms_provider() -> str:
-    """Returns active SMS provider: SENDORA (default) or BULKSMSLIVE."""
+    """Returns active SMS provider: SENDORA (default), BULKSMSLIVE, STROWALLET, or TERMII."""
     doc = await db.settings.find_one({"key": "sms_provider"})
     return (doc or {}).get("value", "SENDORA")
 
@@ -1053,6 +1053,65 @@ async def _send_via_strowallet_sms(phone: str, body: str) -> dict:
     return {"ok": ok, "ref": resp.get("message"), "raw": resp}
 
 
+
+
+# ===== TERMII SMS =====
+async def get_termii_config() -> dict:
+    """Returns Termii config from DB settings (api_key, sender_id)."""
+    doc = await db.settings.find_one({"key": "termii_config"})
+    val = (doc or {}).get("value", {})
+    return {
+        "api_key":  val.get("api_key", ""),
+        "sender_id": val.get("sender_id", "Bompay"),
+    }
+
+
+async def _send_via_termii(phone: str, body: str, channel: str = "dnd") -> dict:
+    """Send SMS via Termii. Uses DND channel (transactional) by default.
+    Phone must be in +234 format; the '+' is stripped before sending to Termii."""
+    cfg = await get_termii_config()
+    api_key = cfg.get("api_key", "")
+    if not api_key:
+        return {"ok": False, "error": "Termii API key not configured"}
+    sender_id = cfg.get("sender_id", "Bompay")
+    # Termii expects phone without '+' prefix: '2348012345678'
+    termii_phone = phone.lstrip("+")
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(
+            "https://api.ng.termii.com/api/sms/send",
+            headers={"Content-Type": "application/json"},
+            json={
+                "api_key":  api_key,
+                "to":       termii_phone,
+                "from":     sender_id,
+                "sms":      body,
+                "type":     "plain",
+                "channel":  channel,
+            }
+        )
+    resp = {}
+    try:
+        resp = r.json()
+    except Exception:
+        pass
+    ok = r.status_code < 400 and resp.get("code") in (None, "ok", "1801")
+    return {"ok": ok, "ref": resp.get("message_id"), "raw": resp}
+
+
+async def send_otp_sms(phone: str, body: str) -> dict:
+    """Send an OTP/auth SMS using the currently active SMS provider.
+    Falls back to Termii's DND channel for all providers (OTPs are transactional)."""
+    active = await get_sms_provider()
+    if active == "TERMII":
+        return await _send_via_termii(phone, body, channel="dnd")
+    elif active == "BULKSMSLIVE":
+        return await _send_via_bulksms(phone, body)
+    elif active == "STROWALLET":
+        return await _send_via_strowallet_sms(phone, body)
+    else:
+        return await _send_via_sendora(phone, body)
+
+
 # ===== SERVICE FLAGS =====
 async def get_service_flags() -> dict:
     """Returns dict of service_key -> enabled. Defaults True if not explicitly set."""
@@ -1146,6 +1205,8 @@ async def send_event_sms(user_id: str, event_type: str, metadata: dict):
                 result = await _send_via_bulksms(phone, body)
             elif active_provider == "STROWALLET":
                 result = await _send_via_strowallet_sms(phone, body)
+            elif active_provider == "TERMII":
+                result = await _send_via_termii(phone, body, channel="dnd")
             else:
                 result = await _send_via_sendora(phone, body)
             status = "SENT" if result.get("ok") else "FAILED"

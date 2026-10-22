@@ -31,6 +31,7 @@ from core import (  # noqa: F401,F403,F405
     call_sh, mock_sh, call_cdh, call_pg,
     get_vas_provider, get_service_provider, get_sms_config,
     get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
+    send_otp_sms,
     # private helpers (explicitly imported)
     _cloudinary_upload, _cloudinary_delete, _email_html,
     _send_tier_approval_email, _send_tier_revoke_email,
@@ -372,7 +373,7 @@ async def forgot_pin(request: Request):
         "sent_at": datetime.now(timezone.utc).isoformat()
     })
     sms_body = f"Your BOMPAY PIN reset code is: {otp_code}. Valid for 10 minutes. Do not share this code."
-    result = await _send_via_bulksms(phone, sms_body)
+    result = await send_otp_sms(phone, sms_body)
     if not result.get("ok"):
         logger.warning(f"[FORGOT-PIN] SMS failed for {phone}: {result}")
     masked = "*" * (len(phone) - 4) + phone[-4:]
@@ -455,7 +456,7 @@ async def send_phone_otp(request: Request, req: SendPhoneOtpReq):
         "sent_at": datetime.now(timezone.utc).isoformat()
     })
     sms_body = f"Your BOMPAY verification code is: {otp_code}. Valid for 10 minutes. Do not share this code."
-    result = await _send_via_bulksms(phone, sms_body)
+    result = await send_otp_sms(phone, sms_body)
     if not result.get("ok"):
         logger.warning(f"[OTP] SMS send to {phone} failed: {result}")
     return {"sent": True, "message": "OTP sent to your phone number"}

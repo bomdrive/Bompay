@@ -25,6 +25,7 @@ from core import (  # noqa: F401,F403,F405
     call_sh, mock_sh, call_cdh, call_pg,
     get_vas_provider, get_service_provider, get_sms_config,
     get_sms_provider, get_sendora_api_key, get_sendora_sender_id, get_bulksms_credentials,
+    get_termii_config,
     _cloudinary_upload, _cloudinary_delete, _email_html,
     _send_tier_approval_email, _send_tier_revoke_email,
     _send_via_sendora, _send_via_bulksms,
@@ -2896,6 +2897,9 @@ async def admin_dashboard_full(request: Request):
          "status": "OK" if (os.environ.get("SENDORA_API_KEY") and active_sms == "SENDORA") else (
              "STANDBY" if os.environ.get("SENDORA_API_KEY") else "UNCONFIGURED"),
          "detail": "Active SMS" if active_sms == "SENDORA" else "Standby"},
+        {"id": "TERMII", "name": "Termii", "category": "SMS",
+         "status": "OK" if active_sms == "TERMII" else "STANDBY",
+         "detail": "Active SMS (OTP + Alerts)" if active_sms == "TERMII" else "Standby"},
         {"id": "RESEND", "name": "Resend Email", "category": "Email",
          "status": "OK" if resend_ok else "UNCONFIGURED",
          "detail": "Transactional email"},
@@ -3117,19 +3121,55 @@ async def update_bulksms_config(req: BulkSmsCredentialsReq, request: Request):
 async def get_active_sms_provider(request: Request):
     await get_admin_user(request)
     provider = await get_sms_provider()
-    return {"active_provider": provider, "available": ["SENDORA", "BULKSMSLIVE"]}
+    return {"active_provider": provider, "available": ["SENDORA", "BULKSMSLIVE", "STROWALLET", "TERMII"]}
 
 @router.put("/admin/sms-provider")
 async def set_active_sms_provider(req: SmsProviderReq, request: Request):
     await get_admin_user(request)
-    if req.provider not in ("SENDORA", "BULKSMSLIVE", "STROWALLET"):
-        raise HTTPException(400, "Provider must be SENDORA, BULKSMSLIVE, or STROWALLET")
+    if req.provider not in ("SENDORA", "BULKSMSLIVE", "STROWALLET", "TERMII"):
+        raise HTTPException(400, "Provider must be SENDORA, BULKSMSLIVE, STROWALLET, or TERMII")
     await db.settings.update_one(
         {"key": "sms_provider"},
         {"$set": {"key": "sms_provider", "value": req.provider}},
         upsert=True
     )
     return {"message": f"Active SMS provider set to {req.provider}", "active_provider": req.provider}
+
+
+# ===== TERMII CONFIG =====
+@router.get("/admin/termii-config")
+async def get_termii_config_endpoint(request: Request):
+    await get_admin_user(request)
+    doc = await db.settings.find_one({"key": "termii_config"})
+    val = (doc or {}).get("value", {})
+    api_key = val.get("api_key", "")
+    return {
+        "configured": bool(api_key),
+        "sender_id": val.get("sender_id", "Bompay"),
+        "api_key_hint": f"...{api_key[-8:]}" if len(api_key) > 8 else ("set" if api_key else ""),
+    }
+
+@router.put("/admin/termii-config")
+async def update_termii_config(request: Request):
+    await get_admin_user(request)
+    body = await request.json()
+    api_key   = body.get("api_key", "").strip()
+    sender_id = body.get("sender_id", "Bompay").strip() or "Bompay"
+    if not api_key:
+        raise HTTPException(400, "api_key is required")
+    existing = await db.settings.find_one({"key": "termii_config"})
+    existing_val = (existing or {}).get("value", {})
+    new_val = {**existing_val, "sender_id": sender_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if api_key:
+        new_val["api_key"] = api_key
+    await db.settings.update_one(
+        {"key": "termii_config"},
+        {"$set": {"key": "termii_config", "value": new_val}},
+        upsert=True
+    )
+    return {"message": "Termii config saved", "sender_id": sender_id, "configured": True}
+
+
 
 # ===== ADMIN EMAIL CONFIG =====
 @router.get("/admin/email-config")
