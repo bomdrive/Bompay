@@ -862,7 +862,7 @@ async def business_payroll_reminder(request: Request):
                          f"Payroll due in 2 days. {len(active_staff)} staff. "
                          f"Total: \u20A6{total_kobo/100:,.2f}. Fund your business account.")
 
-        # Record so we don't send again this month
+        # Record so we don't send again this month ok
         await db.business_payroll_reminders.insert_one({
             "business_id": biz_id,
             "month_key":   month_key,
