@@ -4529,3 +4529,269 @@ async def fetch_sh_accounts_for_service(request: Request):
         # Fallback: return existing service accounts so admin can at least see what's configured
         docs = await db.service_bucket_accounts.find({}, {"_id": 0}).to_list(None)
         return {"accounts": [], "source": "fallback", "error": str(e), "existing": docs}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FREE TRANSFER CONFIGURATION & REPORTING
+# ════════════════════════════════════════════════════════════════════════════
+
+def _get_wat_day_start_utc_ft() -> str:
+    """ISO string of WAT (UTC+1) midnight expressed as UTC for the current WAT calendar day."""
+    now_utc = datetime.now(timezone.utc)
+    total_minutes = now_utc.hour * 60 + now_utc.minute + 60
+    if total_minutes >= 1440:
+        wat_date = (now_utc + timedelta(days=1)).date()
+    else:
+        wat_date = now_utc.date()
+    midnight_utc = datetime(wat_date.year, wat_date.month, wat_date.day,
+                            tzinfo=timezone.utc) - timedelta(hours=1)
+    return midnight_utc.isoformat()
+
+
+class FreeTransferConfigReq(BaseModel):
+    enabled: bool = False
+    daily_free_count: int = 0
+    refund_account_number: str = ""
+    refund_account_name: str = ""
+
+
+@router.get("/admin/free-transfers/config")
+async def get_free_transfer_config(request: Request):
+    """Return the current free-transfer configuration."""
+    await get_admin_user(request)
+    cfg = await db.free_transfer_config.find_one({}, {"_id": 0}) or {
+        "enabled": False, "daily_free_count": 0,
+        "refund_account_number": "", "refund_account_name": "", "updated_at": None
+    }
+    return cfg
+
+
+@router.put("/admin/free-transfers/config")
+async def update_free_transfer_config(req: FreeTransferConfigReq, request: Request):
+    """Update the free-transfer configuration."""
+    admin = await get_admin_user(request)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.free_transfer_config.update_one(
+        {},
+        {"$set": {
+            "enabled": req.enabled,
+            "daily_free_count": max(0, req.daily_free_count),
+            "refund_account_number": req.refund_account_number.strip(),
+            "refund_account_name": req.refund_account_name.strip(),
+            "updated_at": now,
+            "updated_by": str(admin.get("email", "admin")),
+        }},
+        upsert=True
+    )
+    return {"message": "Free transfer config updated"}
+
+
+@router.get("/admin/free-transfers/stats")
+async def get_free_transfer_stats(request: Request, date: Optional[str] = None):
+    """Daily summary: free transfers used, NIP fees refunded, pending/failed reimbursements."""
+    await get_admin_user(request)
+    cfg = await db.free_transfer_config.find_one({}, {"_id": 0}) or {}
+
+    if date:
+        try:
+            d = datetime.strptime(date, "%Y-%m-%d")
+            # WAT midnight for that date = d 00:00 WAT = (d 00:00 UTC) − 1 h
+            day_start = (datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                         - timedelta(hours=1)).isoformat()
+            day_end = (datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                       + timedelta(hours=23)).isoformat()
+        except Exception:
+            day_start = _get_wat_day_start_utc_ft()
+            day_end = datetime.now(timezone.utc).isoformat()
+    else:
+        day_start = _get_wat_day_start_utc_ft()
+        day_end = datetime.now(timezone.utc).isoformat()
+
+    free_txns_today = await db.transactions.count_documents({
+        "type": "BANK_TRANSFER", "direction": "DEBIT",
+        "free_transfer_used": True, "status": {"$ne": "FAILED"},
+        "created_at": {"$gte": day_start, "$lte": day_end}
+    })
+
+    reimb_today = await db.free_transfer_reimbursements.aggregate([
+        {"$match": {"created_at": {"$gte": day_start, "$lte": day_end}}},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_kobo": {"$sum": "$nip_fee_kobo"}}}
+    ]).to_list(None)
+    by_status = {r["_id"]: r for r in reimb_today}
+
+    all_time = await db.free_transfer_reimbursements.aggregate([
+        {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_kobo": {"$sum": "$nip_fee_kobo"}}}
+    ]).to_list(None)
+    all_by_status = {r["_id"]: r for r in all_time}
+
+    return {
+        "config": cfg,
+        "today": {
+            "date_label": date or "today",
+            "free_transfers": free_txns_today,
+            "completed_reimbursements": by_status.get("COMPLETED", {}).get("count", 0),
+            "pending_reimbursements": by_status.get("PENDING", {}).get("count", 0),
+            "failed_reimbursements": by_status.get("FAILED", {}).get("count", 0),
+            "total_refunded_kobo": by_status.get("COMPLETED", {}).get("total_kobo", 0),
+            "total_refunded_naira": round(by_status.get("COMPLETED", {}).get("total_kobo", 0) / 100, 2),
+        },
+        "all_time": {
+            "total_free_transfers": sum(v.get("count", 0) for v in all_by_status.values()),
+            "total_completed": all_by_status.get("COMPLETED", {}).get("count", 0),
+            "total_refunded_naira": round(all_by_status.get("COMPLETED", {}).get("total_kobo", 0) / 100, 2),
+            "total_failed": all_by_status.get("FAILED", {}).get("count", 0),
+            "total_pending": all_by_status.get("PENDING", {}).get("count", 0),
+        }
+    }
+
+
+@router.get("/admin/free-transfers/users")
+async def get_free_transfer_users(request: Request, page: int = 1, limit: int = 50,
+                                   date: Optional[str] = None):
+    """Per-user breakdown of free transfers and reimbursements for a given WAT day."""
+    await get_admin_user(request)
+
+    if date:
+        try:
+            d = datetime.strptime(date, "%Y-%m-%d")
+            day_start = (datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                         - timedelta(hours=1)).isoformat()
+            day_end = (datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                       + timedelta(hours=23)).isoformat()
+        except Exception:
+            day_start = _get_wat_day_start_utc_ft()
+            day_end = datetime.now(timezone.utc).isoformat()
+    else:
+        day_start = _get_wat_day_start_utc_ft()
+        day_end = datetime.now(timezone.utc).isoformat()
+
+    pipeline = [
+        {"$match": {
+            "type": "BANK_TRANSFER", "direction": "DEBIT",
+            "free_transfer_used": True, "status": {"$ne": "FAILED"},
+            "created_at": {"$gte": day_start, "$lte": day_end}
+        }},
+        {"$group": {"_id": "$user_id", "count": {"$sum": 1}, "last_at": {"$max": "$created_at"}}},
+        {"$sort": {"count": -1}},
+        {"$skip": (page - 1) * limit},
+        {"$limit": limit}
+    ]
+    user_txns = await db.transactions.aggregate(pipeline).to_list(None)
+
+    results = []
+    for item in user_txns:
+        uid = item["_id"]
+        try:
+            oid = ObjectId(uid) if ObjectId.is_valid(str(uid)) else uid
+            user_doc = await db.users.find_one({"_id": oid},
+                                               {"first_name": 1, "last_name": 1, "email": 1, "phone": 1})
+        except Exception:
+            user_doc = None
+
+        reimb = await db.free_transfer_reimbursements.aggregate([
+            {"$match": {"user_id": uid, "created_at": {"$gte": day_start, "$lte": day_end}}},
+            {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_kobo": {"$sum": "$nip_fee_kobo"}}}
+        ]).to_list(None)
+        rb = {r["_id"]: r for r in reimb}
+
+        results.append({
+            "user_id": str(uid),
+            "user_name": (f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip()
+                          if user_doc else "Unknown"),
+            "email": user_doc.get("email", "") if user_doc else "",
+            "phone": user_doc.get("phone", "") if user_doc else "",
+            "free_transfers_used": item["count"],
+            "last_transfer_at": item["last_at"],
+            "reimbursements_completed": rb.get("COMPLETED", {}).get("count", 0),
+            "reimbursements_pending": rb.get("PENDING", {}).get("count", 0),
+            "reimbursements_failed": rb.get("FAILED", {}).get("count", 0),
+            "total_refunded_naira": round(rb.get("COMPLETED", {}).get("total_kobo", 0) / 100, 2),
+        })
+
+    return {"users": results, "page": page, "limit": limit}
+
+
+@router.get("/admin/free-transfers/reimbursements")
+async def list_reimbursements(request: Request, status: Optional[str] = None,
+                               page: int = 1, limit: int = 50):
+    """List reimbursement records; optionally filter by status (PENDING/COMPLETED/FAILED)."""
+    await get_admin_user(request)
+    query = {}
+    if status:
+        query["status"] = status.upper()
+    total = await db.free_transfer_reimbursements.count_documents(query)
+    docs = await db.free_transfer_reimbursements.find(
+        query, {"_id": 0}
+    ).sort("created_at", -1).skip((page - 1) * limit).limit(limit).to_list(None)
+    return {"reimbursements": docs, "total": total, "page": page, "limit": limit}
+
+
+@router.post("/admin/free-transfers/reimbursements/{rid}/retry")
+async def retry_reimbursement(rid: str, request: Request):
+    """Retry a FAILED or PENDING reimbursement (admin-initiated, synchronous)."""
+    await get_admin_user(request)
+    doc = await db.free_transfer_reimbursements.find_one({"reimbursement_id": rid})
+    if not doc:
+        raise HTTPException(404, "Reimbursement not found")
+    if doc["status"] == "COMPLETED":
+        raise HTTPException(400, "Reimbursement already completed — nothing to retry")
+
+    uid = doc["user_id"]
+    try:
+        oid = ObjectId(uid) if ObjectId.is_valid(str(uid)) else uid
+        w = await db.wallets.find_one({"user_id": oid}) or await db.wallets.find_one({"user_id": uid})
+    except Exception:
+        w = await db.wallets.find_one({"user_id": uid})
+    if not w:
+        raise HTTPException(404, "User wallet not found")
+
+    cfg = await db.free_transfer_config.find_one({}) or {}
+    refund_account = (cfg.get("refund_account_number") or "").strip() or \
+                     (doc.get("refund_account_number") or "").strip()
+    if not refund_account:
+        raise HTTPException(400, "No refund account configured")
+
+    nip_fee_ngn = round(doc["nip_fee_kobo"] / 100, 2)
+    user_account = w.get("account_number", "")
+
+    await db.free_transfer_reimbursements.update_one(
+        {"reimbursement_id": rid},
+        {"$set": {"status": "PENDING", "error": None,
+                  "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    try:
+        ne_resp = await call_sh("POST", "/transfers/name-enquiry", body={
+            "bankCode": SAFEHAVEN_OWN_BANK_CODE, "accountNumber": user_account,
+        })
+        ne_data = ne_resp.get("data", {})
+        ne_ref = ne_data.get("sessionId") or f"NEQ{secrets.token_hex(8).upper()}"
+        r = await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
+            "debitAccountNumber": refund_account,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": user_account,
+            "amount": nip_fee_ngn,
+            "saveBeneficiary": False,
+            "narration": "NIP fee refund (admin retry)",
+            "paymentReference": f"RFND{rid}R",
+        })
+        r_data = r.get("data", {})
+        if str(r_data.get("status") or "").lower() in ("failed", "fail"):
+            raise Exception(f"SH rejected: {r_data}")
+        provider_ref = r_data.get("transactionReference") or r_data.get("reference") or ""
+        await db.free_transfer_reimbursements.update_one(
+            {"reimbursement_id": rid},
+            {"$set": {
+                "status": "COMPLETED", "provider_reference": provider_ref,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }}
+        )
+        return {"message": "Reimbursement completed", "provider_reference": provider_ref}
+    except Exception as exc:
+        await db.free_transfer_reimbursements.update_one(
+            {"reimbursement_id": rid},
+            {"$set": {"status": "FAILED", "error": str(exc)[:500],
+                      "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        raise HTTPException(500, f"Retry failed: {str(exc)[:200]}")

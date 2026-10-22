@@ -72,6 +72,89 @@ from routes.strowallet import strow_name_enquiry, strow_bank_transfer
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+
+# ── WAT timezone + free-transfer helpers ───────────────────────────────────
+
+def _get_wat_day_start_utc() -> str:
+    """ISO string of WAT (UTC+1) midnight expressed as UTC for the current WAT calendar day."""
+    now_utc = datetime.now(timezone.utc)
+    # WAT = UTC+1 (no DST). Find the start of *today* in WAT.
+    total_minutes = now_utc.hour * 60 + now_utc.minute + 60  # +60 for WAT offset
+    if total_minutes >= 1440:  # current UTC time already belongs to the next WAT day
+        wat_date = (now_utc + timedelta(days=1)).date()
+    else:
+        wat_date = now_utc.date()
+    # WAT midnight = today 00:00 WAT = (today 00:00 UTC) − 1 h = yesterday 23:00 UTC
+    midnight_utc = datetime(wat_date.year, wat_date.month, wat_date.day,
+                            tzinfo=timezone.utc) - timedelta(hours=1)
+    return midnight_utc.isoformat()
+
+
+async def _refund_nip_fee_bg(txn_id: str, user_id: str, user_account: str,
+                              nip_fee_ngn: float, refund_account_number: str) -> None:
+    """Background: transfer the NIP fee from admin's dedicated SH account → user's SH sub-account.
+    Creates a reimbursement record; marks COMPLETED on success, FAILED on error.
+    This is NOT exposed as a customer transfer."""
+    reimbursement_id = f"REIMB{secrets.token_hex(8).upper()}"
+    now = datetime.now(timezone.utc).isoformat()
+    await db.free_transfer_reimbursements.insert_one({
+        "reimbursement_id": reimbursement_id,
+        "txn_id": txn_id,
+        "user_id": user_id,
+        "nip_fee_kobo": int(round(nip_fee_ngn * 100)),
+        "refund_account_number": refund_account_number,
+        "status": "PENDING",
+        "created_at": now,
+        "updated_at": now,
+    })
+    try:
+        # Name-enquiry for the user's Safe Haven sub-account (required by SH transfer API)
+        ne_resp = await call_sh("POST", "/transfers/name-enquiry", body={
+            "bankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "accountNumber": user_account,
+        })
+        ne_data = ne_resp.get("data", {})
+        ne_ref = ne_data.get("sessionId") or f"NEQ{secrets.token_hex(8).upper()}"
+        # Transfer NIP fee from refund account → user's account
+        r = await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
+            "debitAccountNumber": refund_account_number,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": user_account,
+            "amount": round(nip_fee_ngn, 2),
+            "saveBeneficiary": False,
+            "narration": "NIP fee refund",
+            "paymentReference": f"RFND{reimbursement_id}",
+        })
+        r_data = r.get("data", {})
+        # SH may return HTTP 201 with embedded failure status — guard against it
+        if str(r_data.get("status") or "").lower() in ("failed", "fail"):
+            raise Exception(f"SH rejected refund: {r_data}")
+        provider_ref = r_data.get("transactionReference") or r_data.get("reference") or ""
+        await db.free_transfer_reimbursements.update_one(
+            {"reimbursement_id": reimbursement_id},
+            {"$set": {
+                "status": "COMPLETED",
+                "provider_reference": provider_ref,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }}
+        )
+        logger.info(f"[FreeTransfer] Reimbursement {reimbursement_id} completed "
+                    f"(txn={txn_id}, ₦{nip_fee_ngn:.2f})")
+    except Exception as exc:
+        logger.error(f"[FreeTransfer] Reimbursement {reimbursement_id} FAILED "
+                     f"(txn={txn_id}): {exc}")
+        await db.free_transfer_reimbursements.update_one(
+            {"reimbursement_id": reimbursement_id},
+            {"$set": {
+                "status": "FAILED",
+                "error": str(exc)[:500],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }}
+        )
+
+
 @router.get("/transfers/banks")
 async def get_banks():
     try:
@@ -213,6 +296,22 @@ async def send_money(request: Request, req: TransferReq):
     )
     try:
         transfer_provider = await get_service_provider("TRANSFER")
+        # ── Free-transfer eligibility (Safe Haven only; refunds NIP fee on success) ──
+        _ft_cfg = await db.free_transfer_config.find_one({}) or {}
+        _is_free = (
+            transfer_provider != "STROWALLET"
+            and bool(_ft_cfg.get("enabled"))
+            and int(_ft_cfg.get("daily_free_count", 0)) > 0
+            and bool(str(_ft_cfg.get("refund_account_number", "")).strip())
+        )
+        if _is_free:
+            _free_used = await db.transactions.count_documents({
+                "user_id": user["_id"], "type": "BANK_TRANSFER", "direction": "DEBIT",
+                "status": {"$nin": ["FAILED", "PROCESSING"]},
+                "free_transfer_used": True,
+                "created_at": {"$gte": _get_wat_day_start_utc()},
+            })
+            _is_free = _free_used < int(_ft_cfg["daily_free_count"])
         if transfer_provider == "STROWALLET":
             # ── Strowallet transfer path ──────────────────────────────────
             result = await strow_bank_transfer(
@@ -266,6 +365,16 @@ async def send_money(request: Request, req: TransferReq):
                 txn_id=txn_id, user_account=w["account_number"],
                 bompay_fee_ngn=fee_ngn, sh_fee_ngn=sh_fee_ngn, category="TRANSFER_FEES"
             ))
+            # ── Free transfer: mark txn + schedule NIP-fee reimbursement ──────
+            if _is_free:
+                await db.transactions.update_one(
+                    {"transaction_id": txn_id}, {"$set": {"free_transfer_used": True}}
+                )
+                asyncio.create_task(_refund_nip_fee_bg(
+                    txn_id=txn_id, user_id=user["_id"], user_account=w["account_number"],
+                    nip_fee_ngn=sh_fee_ngn,
+                    refund_account_number=_ft_cfg["refund_account_number"],
+                ))
         # Mirror to PostgreSQL immutable ledger
         try:
             await pg_ledger.record_transfer_out(
