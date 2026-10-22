@@ -1066,8 +1066,9 @@ async def get_termii_config() -> dict:
     }
 
 
-async def _send_via_termii(phone: str, body: str, channel: str = "dnd") -> dict:
-    """Send SMS via Termii. Uses DND channel (transactional) by default.
+async def _send_via_termii(phone: str, body: str, channel: str = "generic") -> dict:
+    """Send SMS via Termii v4 API.
+    Tries 'generic' channel first; if the account has DND route configured, pass channel='dnd'.
     Phone must be in +234 format; the '+' is stripped before sending to Termii."""
     cfg = await get_termii_config()
     api_key = cfg.get("api_key", "")
@@ -1076,26 +1077,39 @@ async def _send_via_termii(phone: str, body: str, channel: str = "dnd") -> dict:
     sender_id = cfg.get("sender_id", "Bompay")
     # Termii expects phone without '+' prefix: '2348012345678'
     termii_phone = phone.lstrip("+")
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(
-            "https://api.ng.termii.com/api/sms/send",
-            headers={"Content-Type": "application/json"},
-            json={
-                "api_key":  api_key,
-                "to":       termii_phone,
-                "from":     sender_id,
-                "sms":      body,
-                "type":     "plain",
-                "channel":  channel,
-            }
-        )
-    resp = {}
-    try:
-        resp = r.json()
-    except Exception:
-        pass
-    ok = r.status_code < 400 and resp.get("code") in (None, "ok", "1801")
-    return {"ok": ok, "ref": resp.get("message_id"), "raw": resp}
+    channels_to_try = [channel]
+    if channel == "dnd":
+        channels_to_try = ["dnd", "generic"]  # fall back to generic if DND not configured
+    last_resp = {}
+    for ch in channels_to_try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                "https://v4.api.termii.com/api/sms/send",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "api_key":  api_key,
+                    "to":       termii_phone,
+                    "from":     sender_id,
+                    "sms":      body,
+                    "type":     "plain",
+                    "channel":  ch,
+                }
+            )
+        resp = {}
+        try:
+            resp = r.json()
+        except Exception:
+            pass
+        last_resp = resp
+        # 422 "Route not configured" means this channel is not set up — try the next
+        if r.status_code == 422 and "Route not configured" in str(resp.get("message", "")):
+            logger.warning(f"[Termii] channel={ch} not configured, trying next")
+            continue
+        ok = r.status_code < 400 and resp.get("code") not in ("error",)
+        if ok:
+            return {"ok": True, "ref": resp.get("message_id"), "raw": resp, "channel_used": ch}
+        return {"ok": False, "ref": None, "raw": resp, "error": resp.get("message", str(r.status_code))}
+    return {"ok": False, "raw": last_resp, "error": "No configured Termii channel available (DND and generic both failed)"}
 
 
 async def send_otp_sms(phone: str, body: str) -> dict:

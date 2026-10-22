@@ -28,7 +28,8 @@ from core import (  # noqa: F401,F403,F405
     get_termii_config,
     _cloudinary_upload, _cloudinary_delete, _email_html,
     _send_tier_approval_email, _send_tier_revoke_email,
-    _send_via_sendora, _send_via_bulksms,
+    _send_via_sendora, _send_via_bulksms, _send_via_termii,
+    _send_via_strowallet_sms, send_otp_sms,
     _get_client_ip, _parse_ua,
 )
 from core import (  # noqa: F401,F403,F405
@@ -3168,6 +3169,52 @@ async def update_termii_config(request: Request):
         upsert=True
     )
     return {"message": "Termii config saved", "sender_id": sender_id, "configured": True}
+
+
+@router.post("/admin/sms/test")
+async def admin_test_sms(request: Request):
+    """Send a test SMS to a given phone number using the active SMS provider.
+    Body: { "phone": "08034010891", "provider": "TERMII" (optional, defaults to active) }"""
+    await get_admin_user(request)
+    body = await request.json()
+    phone_raw = str(body.get("phone", "")).strip()
+    if not phone_raw:
+        raise HTTPException(400, "phone is required")
+    # Normalise to +234 format
+    if phone_raw.startswith("0"):
+        phone_e164 = "+234" + phone_raw[1:]
+    elif phone_raw.startswith("234"):
+        phone_e164 = "+" + phone_raw
+    elif phone_raw.startswith("+"):
+        phone_e164 = phone_raw
+    else:
+        phone_e164 = "+234" + phone_raw
+
+    override_provider = (body.get("provider") or "").strip().upper()
+    test_msg = f"BOMPAY test SMS – if you receive this, your {override_provider or 'SMS'} provider is working correctly."
+
+    try:
+        if override_provider == "TERMII":
+            result = await _send_via_termii(phone_e164, test_msg, channel="dnd")
+        elif override_provider == "BULKSMSLIVE":
+            result = await _send_via_bulksms(phone_e164, test_msg)
+        elif override_provider == "STROWALLET":
+            result = await _send_via_strowallet_sms(phone_e164, test_msg)
+        elif override_provider == "SENDORA":
+            result = await _send_via_sendora(phone_e164, test_msg)
+        else:
+            result = await send_otp_sms(phone_e164, test_msg)
+    except Exception as exc:
+        return {"ok": False, "phone": phone_e164, "error": str(exc)}
+
+    return {
+        "ok": result.get("ok", False),
+        "phone": phone_e164,
+        "provider_used": override_provider or await get_sms_provider(),
+        "ref": result.get("ref"),
+        "raw": result.get("raw", {}),
+        "error": result.get("error"),
+    }
 
 
 
