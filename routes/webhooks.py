@@ -164,9 +164,17 @@ async def safehaven_webhook(request: Request):
                     debit_name = (data.get("debitAccountName") or data.get("senderName")
                                   or data.get("debitName") or "External Transfer")
                     narration = data.get("narration") or f"Transfer from {debit_name}"
+                    payment_ref = data.get("paymentReference") or data.get("transactionReference") or ""
+
+                    # Detect NIP fee refund (hidden from user — admin-only internal credit)
+                    _is_nip_refund = (
+                        "NIP fee refund" in narration or
+                        str(payment_ref).startswith("RFND")
+                    )
+
                     w_before = await get_wallet(wallet["user_id"])
                     bal_before = w_before["available_balance"]
-                    await db.transactions.insert_one({
+                    txn_doc = {
                         "transaction_id": txn_id, "user_id": wallet["user_id"],
                         "type": "WALLET_FUNDING", "direction": "CREDIT", "amount": amt_kobo,
                         "fee": int(float(data.get("fees", 0) or data.get("fee", 0)) * 100),
@@ -181,18 +189,13 @@ async def safehaven_webhook(request: Request):
                         "balance_after_kobo": bal_before + amt_kobo,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "updated_at": datetime.now(timezone.utc).isoformat()
-                    })
+                    }
+                    if _is_nip_refund:
+                        txn_doc["is_nip_refund"] = True  # hidden from user transaction list
+                    await db.transactions.insert_one(txn_doc)
                     await db.wallets.update_one({"user_id": wallet["user_id"]},
                         {"$inc": {"available_balance": amt_kobo, "ledger_balance": amt_kobo}})
                     w = await get_wallet(wallet["user_id"])
-                    # Use live SH balance in notification (primary account)
-                    sh_id_w = wallet.get("sh_account_id")
-                    notif_balance = w["available_balance"] / 100  # shadow fallback
-                    if sh_id_w:
-                        try:
-                            notif_balance = await get_sh_subaccount_balance(sh_id_w)
-                        except Exception:
-                            pass  # keep shadow fallback
                     await ledger_entry(wallet["user_id"], w["_id"], txn_id, "CREDIT", amt_kobo, narration)
                     try:
                         user_doc = await db.users.find_one({"_id": ObjectId(wallet["user_id"])})
@@ -203,15 +206,28 @@ async def safehaven_webhook(request: Request):
                         )
                     except Exception as le:
                         logger.error(f"[Ledger] webhook credit mirror failed: {le}")
-                    await notify(wallet["user_id"], "Credit Alert",
-                                 f"₦{amount:,.2f} received from {debit_name}. New balance: ₦{notif_balance:,.2f}", "success")
-                    asyncio.create_task(send_event_notification(wallet["user_id"], "TRANSFER_CREDIT", {
-                        "amount": amount, "sender": debit_name, "balance": notif_balance
-                    }))
-                    asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
-                    # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
-                    asyncio.create_task(_track_nip_inward_cost(txn_id, wallet["user_id"], amount))
-                    logger.info(f"[SH-WEBHOOK] ✅ credited ₦{amount} to user {wallet['user_id']} txn={txn_id}")
+
+                    if not _is_nip_refund:
+                        # Use live SH balance in notification (primary account)
+                        sh_id_w = wallet.get("sh_account_id")
+                        notif_balance = w["available_balance"] / 100  # shadow fallback
+                        if sh_id_w:
+                            try:
+                                notif_balance = await get_sh_subaccount_balance(sh_id_w)
+                            except Exception:
+                                pass
+                        await notify(wallet["user_id"], "Credit Alert",
+                                     f"₦{amount:,.2f} received from {debit_name}. New balance: ₦{notif_balance:,.2f}", "success")
+                        asyncio.create_task(send_event_notification(wallet["user_id"], "TRANSFER_CREDIT", {
+                            "amount": amount, "sender": debit_name, "balance": notif_balance
+                        }))
+                        asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
+                        # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
+                        asyncio.create_task(_track_nip_inward_cost(txn_id, wallet["user_id"], amount))
+                    else:
+                        logger.info(f"[SH-WEBHOOK] NIP refund credit silently applied for user {wallet['user_id']} — no alert sent")
+
+                    logger.info(f"[SH-WEBHOOK] ✅ credited ₦{amount} to user {wallet['user_id']} txn={txn_id} nip_refund={_is_nip_refund}")
                 else:
                     logger.info(f"[SH-WEBHOOK] duplicate skipped session_id={session_id}")
             else:

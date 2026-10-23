@@ -832,6 +832,31 @@ async def get_daily_transfer_usage(request: Request):
         "transfers_allowed": single_limit > 0,
     }
 
+@router.get("/transfers/free-transfer-eligible")
+async def get_free_transfer_eligible(request: Request):
+    """Returns whether the current user has a free external transfer available today."""
+    user = await get_current_user(request)
+    ft_cfg = await db.free_transfer_config.find_one({}) or {}
+    transfer_provider = await get_service_provider("TRANSFER")
+    enabled = (
+        transfer_provider != "STROWALLET"
+        and bool(ft_cfg.get("enabled"))
+        and int(ft_cfg.get("daily_free_count", 0)) > 0
+        and bool(str(ft_cfg.get("refund_account_number", "")).strip())
+    )
+    if not enabled:
+        return {"eligible": False, "remaining": 0, "daily_free_count": 0}
+    daily_free_count = int(ft_cfg["daily_free_count"])
+    used = await db.transactions.count_documents({
+        "user_id": user["_id"], "type": "BANK_TRANSFER", "direction": "DEBIT",
+        "status": {"$nin": ["FAILED", "PROCESSING"]},
+        "free_transfer_used": True,
+        "created_at": {"$gte": _get_wat_day_start_utc()},
+    })
+    remaining = max(0, daily_free_count - used)
+    return {"eligible": remaining > 0, "remaining": remaining, "daily_free_count": daily_free_count}
+
+
 @router.get("/transfers/fee-preview")
 async def preview_transfer_fee(amount: float, request: Request):
     """User-facing fee preview for transfer confirmation screen."""

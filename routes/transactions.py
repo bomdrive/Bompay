@@ -69,8 +69,8 @@ logger = logging.getLogger(__name__)
 async def get_transactions(request: Request, page: int = 1, limit: int = 20,
                             txn_type: str = None, txn_status: str = None):
     user = await get_current_user(request)
-    # BALANCE_ADJUSTMENT is an admin-only internal correction — never visible to users
-    query: dict = {"user_id": user["_id"], "type": {"$ne": "BALANCE_ADJUSTMENT"}}
+    # BALANCE_ADJUSTMENT and NIP fee refunds are admin-only — never visible to users
+    query: dict = {"user_id": user["_id"], "type": {"$ne": "BALANCE_ADJUSTMENT"}, "is_nip_refund": {"$ne": True}}
     if txn_type:
         query["type"] = txn_type
     if txn_status:
