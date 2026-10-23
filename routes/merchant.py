@@ -108,17 +108,25 @@ def _fmt_phone(phone: str) -> str:
 async def _initiate_sh_identity_verify(identity_type: str, identity_number: str) -> str:
     """
     Initiate Safe Haven /identity/v2 BVN/NIN verification.
-    Correct payload uses 'type' and 'number' (NOT identityType/identityNumber).
-    Safe Haven sends OTP to the director's BVN/NIN-registered phone.
+    Correct payload uses 'type', 'number', 'debitAccountNumber' (required), and 'async'.
+    Safe Haven debits the debitAccountNumber for the verification fee.
+    Safe Haven then sends OTP to the director's BVN/NIN-registered phone.
     Returns the initiation `_id` to be used in the OTP validation step.
     """
     if not identity_number:
         return ""
+    # Get BOMPAY's Safe Haven operational account number for the verification fee debit
+    settings = await db.provider_settings.find_one({"provider": "safehaven"})
+    debit_acct = (settings or {}).get("account_number", "") or os.environ.get("SAFEHAVEN_DEBIT_ACCOUNT", "")
     try:
-        resp = await call_sh("POST", "/identity/v2", body={
-            "type": identity_type.upper(),    # Correct field name per Safe Haven docs
-            "number": identity_number.strip(), # Correct field name per Safe Haven docs
-        })
+        payload: dict = {
+            "type": identity_type.upper(),     # Required: "BVN" or "NIN"
+            "number": identity_number.strip(), # Required: the BVN/NIN string
+            "async": False,
+        }
+        if debit_acct:
+            payload["debitAccountNumber"] = debit_acct  # Required by Safe Haven for fee debit
+        resp = await call_sh("POST", "/identity/v2", body=payload)
         # Response may be top-level or nested under "data"
         data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
         init_id = (data or {}).get("_id", "") or resp.get("_id", "")
