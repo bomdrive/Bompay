@@ -531,6 +531,9 @@ async def update_provider(req: ProviderSettingsReq, request: Request):
     # Only overwrite account number if a non-blank value was submitted
     if req.safehaven_account_number.strip():
         update_fields["account_number"] = req.safehaven_account_number.strip()
+    # Only overwrite settlement account ID if a non-blank value was submitted
+    if req.safehaven_settlement_account_id.strip():
+        update_fields["settlement_account_id"] = req.safehaven_settlement_account_id.strip()
     await db.provider_settings.update_one({"provider": "safehaven"}, {"$set": update_fields}, upsert=True)
     await audit(admin["_id"], "UPDATE_PROVIDER", "safehaven", {"mode": req.mode})
     return {"message": "Provider settings updated successfully"}

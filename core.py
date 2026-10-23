@@ -1806,6 +1806,7 @@ class ProviderSettingsReq(BaseModel):
     safehaven_issuer: str = ""          # Company URL used as JWT iss claim — blank = keep existing
     safehaven_base_url: str
     safehaven_account_number: str = ""  # Platform's main Safe Haven account (for KYC debit fees)
+    safehaven_settlement_account_id: str = ""  # Safe Haven account _id used as settlement for checkout VAs
     mode: str
 
 class KYCInitiateReq(BaseModel):

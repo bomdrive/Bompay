@@ -247,27 +247,47 @@ async def startup():
         if not await db.fee_configs.find_one({"service": fc["service"]}):
             await db.fee_configs.insert_one(fc)
 
-    # Seed default merchant platform fee rules
+    # Seed default merchant platform fee rules (all services)
     default_merchant_fees = [
         {
             "service": "CHECKOUT",
             "fee_type": "FLAT_PLUS_PCT",
-            "flat_kobo": 10000,   # ₦100 flat
-            "percentage": 1.5,    # 1.5%
-            "min_fee_kobo": 10000,  # ₦100 minimum
+            "flat_kobo": 10000,     # ₦100
+            "percentage": 1.5,
+            "min_fee_kobo": 10000,
             "max_fee_kobo": 500000, # ₦5,000 cap
             "is_active": True,
-            "description": "Fee charged per completed checkout transaction",
+            "description": "Hosted checkout session — bank transfer or Pay with Bompay",
+        },
+        {
+            "service": "PAY_WITH_BOMPAY",
+            "fee_type": "FLAT_PLUS_PCT",
+            "flat_kobo": 0,
+            "percentage": 0.5,
+            "min_fee_kobo": 0,
+            "max_fee_kobo": 200000,  # ₦2,000 cap
+            "is_active": True,
+            "description": "Checkout paid via Bompay wallet OTP debit",
         },
         {
             "service": "MERCHANT_TRANSFER",
             "fee_type": "FLAT",
-            "flat_kobo": 5300,    # ₦53 (standard NIP fee)
+            "flat_kobo": 5300,      # ₦53 NIP fee
             "percentage": 0.0,
             "min_fee_kobo": 5300,
             "max_fee_kobo": 5300,
             "is_active": True,
-            "description": "NIP outward transfer fee",
+            "description": "NIP outward bank transfer",
+        },
+        {
+            "service": "VIRTUAL_ACCOUNT",
+            "fee_type": "FLAT",
+            "flat_kobo": 0,
+            "percentage": 0.0,
+            "min_fee_kobo": 0,
+            "max_fee_kobo": 0,
+            "is_active": False,
+            "description": "Merchant virtual account provisioning (no fee by default)",
         },
         {
             "service": "AIRTIME",
@@ -277,7 +297,57 @@ async def startup():
             "min_fee_kobo": 0,
             "max_fee_kobo": 100000,
             "is_active": False,
-            "description": "Airtime purchase fee (inactive by default)",
+            "description": "Airtime top-up (inactive by default)",
+        },
+        {
+            "service": "DATA",
+            "fee_type": "PERCENTAGE",
+            "flat_kobo": 0,
+            "percentage": 2.0,
+            "min_fee_kobo": 0,
+            "max_fee_kobo": 100000,
+            "is_active": False,
+            "description": "Mobile data bundle purchase (inactive by default)",
+        },
+        {
+            "service": "ELECTRICITY",
+            "fee_type": "FLAT_PLUS_PCT",
+            "flat_kobo": 10000,     # ₦100
+            "percentage": 0.5,
+            "min_fee_kobo": 10000,
+            "max_fee_kobo": 200000,
+            "is_active": False,
+            "description": "Electricity token/bill payment (inactive by default)",
+        },
+        {
+            "service": "CABLE_TV",
+            "fee_type": "FLAT",
+            "flat_kobo": 10000,     # ₦100
+            "percentage": 0.0,
+            "min_fee_kobo": 10000,
+            "max_fee_kobo": 10000,
+            "is_active": False,
+            "description": "Cable TV subscription (DSTV, GOtv, StarTimes — inactive by default)",
+        },
+        {
+            "service": "BANK_VERIFICATION",
+            "fee_type": "FLAT",
+            "flat_kobo": 5000,      # ₦50
+            "percentage": 0.0,
+            "min_fee_kobo": 5000,
+            "max_fee_kobo": 5000,
+            "is_active": False,
+            "description": "BVN/account name enquiry (inactive by default)",
+        },
+        {
+            "service": "MERCHANT_WALLET_FUNDING",
+            "fee_type": "PERCENTAGE",
+            "flat_kobo": 0,
+            "percentage": 0.0,
+            "min_fee_kobo": 0,
+            "max_fee_kobo": 0,
+            "is_active": False,
+            "description": "Inbound credit to merchant virtual account (no fee by default)",
         },
     ]
     for fee in default_merchant_fees:
