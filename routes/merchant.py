@@ -546,10 +546,37 @@ async def merchant_dashboard(request: Request):
 @router.get("/v1/merchant/accounts")
 async def list_merchant_accounts(request: Request):
     m = await get_current_merchant(request)
-    accounts = await db.merchant_accounts.find(
+    raw_accounts = await db.merchant_accounts.find(
         {"merchant_id": m["merchant_id"]}, {"_id": 0}
     ).to_list(20)
-    return {"accounts": accounts}
+
+    # Build response list with live balances included
+    result = []
+    for acct in raw_accounts:
+        bal = 0.0
+        if acct.get("sh_account_number"):
+            try:
+                sh_id = acct.get("sh_account_id", "")
+                if sh_id:
+                    r = await call_sh("GET", f"/accounts/{sh_id}")
+                    data = r.get("data") or r
+                else:
+                    r = await call_sh("GET", "/accounts", params={"accountNumber": acct["sh_account_number"]})
+                    data = r.get("data", [])
+                    if isinstance(data, list) and data:
+                        data = data[0]
+                    elif isinstance(data, list):
+                        data = {}
+                bal = float(
+                    data.get("availableBalance") or
+                    data.get("accountBalance") or
+                    data.get("bookBalance") or 0
+                )
+            except Exception as e:
+                logger.warning(f"[MERCHANT] Balance fetch for {acct.get('account_id')}: {e}")
+        result.append({**acct, "balance_ngn": bal})
+
+    return {"accounts": result}
 
 
 class RetryProvisionRequest(BaseModel):
@@ -879,6 +906,20 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
     except Exception as e:
         raise HTTPException(502, f"Transfer failed: {e}")
 
+    # Derive status from Safe Haven's actual response — SH returns PENDING for NIP transfers
+    # that complete asynchronously; do not hardcode "success"
+    sh_data = sh_resp.get("data") or {}
+    sh_status_raw = (sh_data.get("status") or sh_resp.get("status") or "").upper()
+    sh_session = sh_data.get("sessionId") or sh_data.get("transactionReference") or ""
+    if sh_status_raw in ("COMPLETED", "SUCCESS", "SUCCESSFUL"):
+        txn_status = "success"
+    elif sh_status_raw in ("FAILED", "FAILURE", "REVERSED", "REJECTED"):
+        txn_status = "failed"
+    else:
+        # PENDING, PROCESSING, or unknown — Safe Haven will confirm via webhook
+        txn_status = "pending"
+    logger.info(f"[MERCHANT] Transfer {txn_ref} SH status={sh_status_raw!r} → recorded as {txn_status}")
+
     txn_doc = {
         "transaction_id": txn_ref,
         "merchant_id": m["merchant_id"],
@@ -887,7 +928,8 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
         "direction": "DEBIT",
         "amount": amount_kobo,
         "currency": "NGN",
-        "status": "success",
+        "status": txn_status,
+        "sh_session_id": sh_session,
         "beneficiary_account": req.account_number,
         "beneficiary_name": account_name,
         "beneficiary_bank": req.bank_code,
@@ -898,7 +940,8 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
     }
     await db.merchant_transactions.insert_one(txn_doc)
     txn_doc.pop("_id", None)
-    return {"message": "Transfer initiated", "transaction": txn_doc, "beneficiary_name": account_name}
+    return {"message": "Transfer initiated", "transaction": txn_doc, "beneficiary_name": account_name,
+            "sh_status": sh_status_raw, "sh_session_id": sh_session}
 
 
 # ─── NAME ENQUIRY & BANKS (merchant-auth wrappers) ────────────────────────────
