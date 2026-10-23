@@ -167,8 +167,8 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
 
     cb_url = (
         os.environ.get("MERCHANT_PROVISION_CALLBACK_URL")
-        or FRONTEND_URL.rstrip("/")
         or WEBHOOK_BASE_URL
+        or FRONTEND_URL.rstrip("/")
     ) + "/api/webhooks/safehaven"
 
     # ── Step 2: Corporate v2 with vID ──────────────────────────────────────────
