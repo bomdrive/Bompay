@@ -1455,27 +1455,31 @@ async def _send_kyb_decision_email(email: str, business_name: str, status: str, 
         frontend = FRONTEND_URL.rstrip("/")
         if status == "approved":
             subject = f"[BOMPAY] Your KYB has been Approved — {business_name}"
-            lines = [
-                f"Congratulations! Your KYB verification for <strong>{business_name}</strong> has been <strong style='color:#059669'>approved</strong>.",
-                "Your merchant account is now in <strong>Live mode</strong>. You can begin accepting real payments.",
+            cta_label, cta_url = "Log in to your Dashboard", f"{frontend}/v1/dashboard"
+            rows = [
+                ("Business", business_name),
+                ("KYB Status", "Approved ✓"),
+                ("Mode", "Live"),
             ]
             if account_number:
-                lines.append(f"Your primary virtual account number: <strong style='font-family:monospace;font-size:16px'>{account_number}</strong> (Safe Haven MFB)")
+                rows.append(("Primary Account", account_number))
             if admin_note:
-                lines.append(f"Note from our team: {admin_note}")
-            cta = ("Log in to your Dashboard", f"{frontend}/v1/dashboard")
+                rows.append(("Note", admin_note))
         else:
             subject = f"[BOMPAY] KYB Application Update — {business_name}"
-            lines = [
-                f"Thank you for submitting your KYB verification for <strong>{business_name}</strong>.",
-                "After review, we were unable to approve your application at this time.",
+            cta_label, cta_url = "Update KYB Documents", f"{frontend}/v1/kyb"
+            rows = [
+                ("Business", business_name),
+                ("KYB Status", "Not Approved"),
             ]
             if admin_note:
-                lines.append(f"<strong>Reason:</strong> {admin_note}")
-            lines.append("Please review the information provided and re-submit your KYB documents. If you believe this is an error, please contact our support team.")
-            cta = ("Update KYB Documents", f"{frontend}/v1/kyb")
+                rows.append(("Reason", admin_note))
+            rows.append(("Next Step", "Please review and re-submit your KYB documents"))
 
-        html = _email_html(subject.replace("[BOMPAY] ", ""), lines, f'<a href="{cta[1]}" style="background:#064BCB;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">{cta[0]} →</a>')
+        footer_html = (f'<a href="{cta_url}" style="background:#064BCB;color:#fff;padding:10px 20px;'
+                       f'border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">'
+                       f'{cta_label} →</a>')
+        html = _email_html(subject.replace("[BOMPAY] ", ""), rows, footer_html)
         await send_email(to=email, subject=subject, html=html)
         logger.info(f"[MERCHANT] KYB decision email sent to {email} — {status}")
     except Exception as e:
