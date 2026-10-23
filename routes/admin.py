@@ -1594,8 +1594,12 @@ async def admin_ledger_entry_lines(entry_id: str, request: Request):
 @router.get("/admin/fees")
 async def get_fee_configs(request: Request):
     await get_admin_user(request)
-    configs = await db.fee_configs.find({}, {"_id": 0}).to_list(50)
-    return {"configs": configs}
+    # Sort ascending by updated_at so latest always wins when building deduplication dict
+    all_configs = await db.fee_configs.find({}, {"_id": 0}).sort("updated_at", 1).to_list(100)
+    deduped = {}
+    for c in all_configs:
+        deduped[c["service"]] = c  # newer updated_at overwrites older
+    return {"configs": list(deduped.values())}
 
 @router.put("/admin/fees/{service}")
 async def update_fee_config(service: str, req: FeeConfigReq, request: Request):
@@ -1618,6 +1622,11 @@ async def update_fee_config(service: str, req: FeeConfigReq, request: Request):
         {"$set": update_data},
         upsert=True
     )
+    # Remove any stale duplicate documents for this service (keep only the one just upserted)
+    all_docs = await db.fee_configs.find({"service": service}, {"_id": 1}).sort("updated_at", -1).to_list(20)
+    if len(all_docs) > 1:
+        stale_ids = [d["_id"] for d in all_docs[1:]]
+        await db.fee_configs.delete_many({"_id": {"$in": stale_ids}})
     return {"message": f"Fee config for {service} updated", "config": update_data}
 
 @router.get("/admin/fees/preview")

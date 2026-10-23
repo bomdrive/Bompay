@@ -2105,7 +2105,9 @@ async def _check_high_balance_alert(category: str, charge_doc: Optional[dict]):
 
 async def calculate_fee(service: str, amount_ngn: float) -> float:
     """Return fee in NGN for a given service and amount."""
-    config = await db.fee_configs.find_one({"service": service, "is_active": True})
+    # Always get the latest saved config to avoid stale duplicates
+    docs = await db.fee_configs.find({"service": service, "is_active": True}).sort("updated_at", -1).to_list(1)
+    config = docs[0] if docs else None
     if not config:
         if service == "TRANSFER":
             return min(max(10, amount_ngn * 0.01), 100)
@@ -2123,7 +2125,7 @@ async def calculate_fee(service: str, amount_ngn: float) -> float:
     elif fee_type == "TIERED":
         tiers = sorted(config.get("tiers", []), key=lambda t: t["min"])
         for tier in tiers:
-            if amount_ngn >= tier["min"] and amount_ngn < tier.get("max", float("inf")):
+            if amount_ngn >= tier["min"] and amount_ngn <= tier.get("max", float("inf")):
                 return float(tier["fee"])
         if tiers:
             return float(tiers[-1]["fee"])
@@ -2182,7 +2184,7 @@ async def calculate_nip_inward_commission(amount_ngn: float) -> float:
     elif fee_type == "TIERED":
         tiers = sorted(config.get("tiers", []), key=lambda t: t["min"])
         for tier in tiers:
-            if amount_ngn >= tier["min"] and amount_ngn < tier.get("max", float("inf")):
+            if amount_ngn >= tier["min"] and amount_ngn <= tier.get("max", float("inf")):
                 return float(tier["fee"])
         if tiers:
             return float(tiers[-1]["fee"])
