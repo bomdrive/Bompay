@@ -551,6 +551,36 @@ async def list_merchant_accounts(request: Request):
     return {"accounts": accounts}
 
 
+@router.post("/v1/merchant/accounts/{account_id}/retry")
+async def retry_account_provision(account_id: str, request: Request):
+    """Retry Safe Haven provisioning for an account still stuck in Provisioning state."""
+    m = await get_current_merchant(request)
+    acct = await db.merchant_accounts.find_one({"account_id": account_id, "merchant_id": m["merchant_id"]})
+    if not acct:
+        raise HTTPException(404, "Account not found")
+    if acct.get("sh_account_number"):
+        return {"message": "Account already provisioned", "sh_account_number": acct["sh_account_number"]}
+    # Re-run provisioning with KYB data
+    kyb = await db.merchant_kyb.find_one({"merchant_id": m["merchant_id"]}, {"_id": 0}) or {}
+    label = acct.get("name") or m.get("business_name", "Primary")
+    sh = await _create_sh_corporate_subaccount(m, kyb, label)
+    now = now_utc()
+    await db.merchant_accounts.update_one(
+        {"account_id": account_id},
+        {"$set": {
+            "sh_account_id":     sh["sh_account_id"],
+            "sh_account_number": sh["sh_account_number"],
+            "sh_account_name":   sh["sh_account_name"],
+            "bank_name":         sh["bank_name"],
+            "bank_code":         sh["bank_code"],
+            "external_reference": sh.get("external_reference", ""),
+            "provisioned_at":    now,
+        }}
+    )
+    logger.info(f"[MERCHANT] Account retry provision: {account_id} → acct={sh['sh_account_number'] or 'pending/async'}")
+    return {"message": "Provisioning re-initiated", "sh_account_number": sh.get("sh_account_number", "")}
+
+
 @router.post("/v1/merchant/accounts")
 async def create_merchant_account(req: CreateAccount, request: Request):
     m = await get_current_merchant(request)
