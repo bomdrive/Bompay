@@ -105,62 +105,84 @@ def _fmt_phone(phone: str) -> str:
     return p
 
 
-async def _verify_director_identity(identity_type: str, identity_number: str) -> str:
+async def _initiate_sh_identity_verify(identity_type: str, identity_number: str) -> str:
     """
-    Call Safe Haven /identity/v2 to verify a director's BVN/NIN.
-    Returns the `_id` (vID) on success — used as identityId with identityType='vID'
-    when creating a corporate sub-account.  Returns "" on any failure.
+    Initiate Safe Haven /identity/v2 BVN/NIN verification.
+    Correct payload uses 'type' and 'number' (NOT identityType/identityNumber).
+    Safe Haven sends OTP to the director's BVN/NIN-registered phone.
+    Returns the initiation `_id` to be used in the OTP validation step.
     """
     if not identity_number:
         return ""
     try:
         resp = await call_sh("POST", "/identity/v2", body={
-            "identityType": identity_type.upper(),
-            "identityNumber": identity_number.strip(),
+            "type": identity_type.upper(),    # Correct field name per Safe Haven docs
+            "number": identity_number.strip(), # Correct field name per Safe Haven docs
         })
-        data = resp.get("data", {})
-        vid = data.get("_id", "")
-        status = (data.get("status") or data.get("verificationStatus") or "").upper()
-        # Accept any successful-looking status or blank status (some SH envs omit it)
-        if vid and status not in ("FAILED", "INVALID", "REJECTED"):
-            logger.info(f"[MERCHANT] SH identity verified type={identity_type} vID={vid[:12]}…")
-            return vid
-        logger.warning(f"[MERCHANT] SH identity verify: no vID or bad status={status!r}")
+        # Response may be top-level or nested under "data"
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        init_id = (data or {}).get("_id", "") or resp.get("_id", "")
+        if init_id:
+            logger.info(f"[MERCHANT] SH identity initiation ({identity_type}) → initID starts with {str(init_id)[:12]}…")
+            return init_id
+        logger.warning(f"[MERCHANT] SH identity initiation: no _id in response statusCode={resp.get('statusCode')}")
     except Exception as e:
-        logger.warning(f"[MERCHANT] SH identity verify failed ({identity_type}): {e}")
+        logger.warning(f"[MERCHANT] SH identity initiation failed ({identity_type}): {e}")
+    return ""
+
+
+async def _validate_sh_identity(init_id: str, identity_type: str, otp: str) -> str:
+    """
+    Validate Safe Haven identity OTP at /identity/v2/validate.
+    Returns the validated vID (_id) on success — used as identityId for corporate sub-account.
+    """
+    if not init_id or not otp:
+        return ""
+    try:
+        resp = await call_sh("POST", "/identity/v2/validate", body={
+            "identityId": init_id,
+            "type": identity_type.upper(),
+            "otp": otp,
+        })
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        vid = (data or {}).get("_id", "") or resp.get("_id", "")
+        if vid:
+            logger.info(f"[MERCHANT] SH identity validated → vID starts with {str(vid)[:12]}…")
+            return vid
+        logger.warning(f"[MERCHANT] SH identity validate: no vID in response: statusCode={resp.get('statusCode')}")
+    except Exception as e:
+        logger.warning(f"[MERCHANT] SH identity validate failed: {e}")
     return ""
 
 
 async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str) -> dict:
     """
-    Create a Safe Haven corporate (v2) virtual sub-account with a 3-step flow:
-      1. Verify director identity via /identity/v2 → get vID
-      2. Create corporate sub-account with vID (identityType=vID, preferred)
-      3. Fallback A — corporate v2 with raw BVN (identityType=BVN)
-      4. Fallback B — individual endpoint (/accounts/subaccount)
+    Create a Safe Haven virtual sub-account.
+    Flow:
+      1. If director_vid (pre-validated via OTP flow in KYB) + rc_number → corporate /accounts/v2/subaccount
+      2. Fallback → individual /accounts/subaccount with BVN or NIN directly
+         (individual endpoint accepts identityType=BVN/NIN + identityNumber, no prior OTP needed)
     Returns dict with sh_account_id, sh_account_number, external_reference, etc.
+    NOTE: Corporate endpoint requires a vID from the 2-step initiate→validate OTP flow.
+          For merchants who completed BVN verification in KYB, this is populated as director_vid.
     """
     external_ref = f"bp-m-{merchant['merchant_id']}-{uuid.uuid4().hex[:8]}"
     phone = _fmt_phone(merchant.get("phone", ""))
     bvn = (kyb or {}).get("director_bvn", "")
     nin = (kyb or {}).get("director_nin", "")
     rc_number = (kyb or {}).get("rc_number") or merchant.get("rc_number") or ""
+    # Pre-validated vID stored during KYB BVN verification (initiate→OTP→validate flow)
+    vid = (kyb or {}).get("director_vid", "")
     identity_id = bvn or nin or ""
-
-    # ── Step 1: Identity Verification → get vID ────────────────────────────────
-    vid = ""
-    if bvn:
-        vid = await _verify_director_identity("BVN", bvn)
-    if not vid and nin:
-        vid = await _verify_director_identity("NIN", nin)
+    identity_type = "BVN" if bvn else ("NIN" if nin else "BVN")
 
     async def _parse(sh_resp: dict, fallback_label: str) -> dict:
-        sh_data = sh_resp.get("data", sh_resp)
+        sh_data = sh_resp.get("data") if isinstance(sh_resp.get("data"), dict) else sh_resp
         return {
-            "sh_account_id": (sh_data.get("_id") or sh_data.get("id") or sh_data.get("accountId") or ""),
-            "sh_account_number": (sh_data.get("accountNumber") or sh_data.get("virtualAccountNumber") or ""),
-            "sh_account_name": sh_data.get("accountName") or f"{merchant.get('business_name', '')} — {fallback_label}",
-            "bank_name": sh_data.get("bankName") or "Safe Haven MFB",
+            "sh_account_id": ((sh_data or {}).get("_id") or (sh_data or {}).get("id") or (sh_data or {}).get("accountId") or ""),
+            "sh_account_number": ((sh_data or {}).get("accountNumber") or (sh_data or {}).get("virtualAccountNumber") or ""),
+            "sh_account_name": (sh_data or {}).get("accountName") or f"{merchant.get('business_name', '')} — {fallback_label}",
+            "bank_name": (sh_data or {}).get("bankName") or "Safe Haven MFB",
             "bank_code": "090286",
             "external_reference": external_ref,
         }
@@ -171,66 +193,45 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
         or FRONTEND_URL.rstrip("/")
     ) + "/api/webhooks/safehaven"
 
-    # ── Step 2: Corporate v2 with vID ──────────────────────────────────────────
-    if vid:
+    # ── Step 1: Corporate v2 with pre-validated vID (requires OTP-verified director) ──
+    if vid and rc_number:
         payload: dict = {
             "externalReference": external_ref,
             "phoneNumber": phone,
             "emailAddress": merchant.get("email", ""),
             "identityType": "vID",
             "identityId": vid,
+            "companyRegistrationNumber": rc_number,
             "autoSweep": False,
         }
         if cb_url:
             payload["callbackUrl"] = cb_url
-        if rc_number:
-            payload["companyRegistrationNumber"] = rc_number
         try:
             result = await _parse(await call_sh("POST", "/accounts/v2/subaccount", body=payload), label)
-            logger.info(f"[MERCHANT] Corporate SH v2 (vID) → {merchant['merchant_id']}: {result['sh_account_number']}")
+            logger.info(f"[MERCHANT] Corporate SH v2 (vID) → {merchant['merchant_id']}: acct={result['sh_account_number'] or 'pending/async'}")
             return result
         except Exception as e:
-            logger.warning(f"[MERCHANT] Corporate v2 (vID) failed: {e} — trying BVN fallback")
+            logger.warning(f"[MERCHANT] Corporate v2 (vID) failed: {e} — falling back to individual endpoint")
 
-    # ── Step 3: Corporate v2 with raw BVN ──────────────────────────────────────
-    if identity_id:
-        payload2: dict = {
-            "externalReference": external_ref,
-            "phoneNumber": phone,
-            "emailAddress": merchant.get("email", ""),
-            "identityType": "BVN",
-            "identityId": identity_id,
-            "autoSweep": False,
-        }
-        if cb_url:
-            payload2["callbackUrl"] = cb_url
-        if rc_number:
-            payload2["companyRegistrationNumber"] = rc_number
-        try:
-            result = await _parse(await call_sh("POST", "/accounts/v2/subaccount", body=payload2), label)
-            logger.info(f"[MERCHANT] Corporate SH v2 (BVN) → {merchant['merchant_id']}: {result['sh_account_number']}")
-            return result
-        except Exception as e:
-            logger.warning(f"[MERCHANT] Corporate v2 (BVN) failed: {e} — trying individual fallback")
-
-    # ── Step 4: Individual endpoint fallback ────────────────────────────────────
+    # ── Step 2: Individual endpoint (BVN/NIN direct — no prior OTP required) ─────────
     parts = (merchant.get("owner_name") or merchant.get("business_name") or "Business Owner").split()
-    payload3: dict = {
+    payload2: dict = {
         "externalReference": external_ref,
         "firstName": parts[0],
         "lastName": " ".join(parts[1:]) or "Owner",
         "emailAddress": merchant.get("email", ""),
         "phoneNumber": phone,
-        "identityType": "BVN",
-        "identityNumber": identity_id,
-        "identityId": identity_id,
         "autoSweep": False,
     }
     if cb_url:
-        payload3["callbackUrl"] = cb_url
+        payload2["callbackUrl"] = cb_url
+    if identity_id:
+        payload2["identityType"] = identity_type
+        payload2["identityNumber"] = identity_id
+        # Do NOT add identityId for BVN/NIN type — identityId is only for vID type
     try:
-        result = await _parse(await call_sh("POST", "/accounts/subaccount", body=payload3), label)
-        logger.info(f"[MERCHANT] Individual SH (fallback) → {merchant['merchant_id']}: {result['sh_account_number']}")
+        result = await _parse(await call_sh("POST", "/accounts/subaccount", body=payload2), label)
+        logger.info(f"[MERCHANT] Individual SH → {merchant['merchant_id']}: acct={result['sh_account_number'] or 'pending/async'}")
         return result
     except Exception as e:
         logger.warning(f"[MERCHANT] All SH sub-account attempts failed: {e}")
@@ -274,8 +275,18 @@ class SubmitKYB(BaseModel):
     director_id_number: str
     director_bvn: Optional[str] = ""
     director_nin: Optional[str] = ""
+    director_vid: Optional[str] = ""   # Pre-validated Safe Haven vID from OTP flow
     cac_document_url: Optional[str] = ""
     director_id_url: Optional[str] = ""
+
+class VerifyBVNRequest(BaseModel):
+    identity_type: str  # "BVN" or "NIN"
+    identity_number: str
+
+class ValidateBVNRequest(BaseModel):
+    init_id: str        # _id returned from initiation
+    identity_type: str  # "BVN" or "NIN"
+    otp: str
 
 class WebhookConfig(BaseModel):
     url: str
@@ -1214,6 +1225,50 @@ async def upload_kyb_document(
         logger.error(f"[KYB Upload] {e}")
         raise HTTPException(500, "Document upload failed. Please try again.")
     return {"url": url, "doc_type": doc_type}
+
+
+@router.post("/v1/merchant/kyb/verify-identity")
+async def kyb_verify_identity(req: VerifyBVNRequest, request: Request):
+    """
+    Step 1 of BVN/NIN verification: Initiate Safe Haven identity check.
+    Safe Haven sends an OTP to the director's BVN/NIN-registered phone.
+    Returns initiation _id to be used in the validation step.
+    """
+    m = await get_current_merchant(request)
+    id_type = req.identity_type.upper()
+    if id_type not in ("BVN", "NIN"):
+        raise HTTPException(400, "identity_type must be BVN or NIN")
+    if not req.identity_number or len(req.identity_number.strip()) < 10:
+        raise HTTPException(400, "A valid 11-digit BVN or NIN is required")
+    init_id = await _initiate_sh_identity_verify(id_type, req.identity_number.strip())
+    if not init_id:
+        raise HTTPException(502, "Identity verification initiation failed. Check your BVN/NIN and try again.")
+    logger.info(f"[KYB] Identity verification initiated for merchant {m['merchant_id']} type={id_type}")
+    return {"init_id": init_id, "message": f"OTP sent to your {id_type}-registered phone number"}
+
+
+@router.post("/v1/merchant/kyb/validate-identity")
+async def kyb_validate_identity(req: ValidateBVNRequest, request: Request):
+    """
+    Step 2 of BVN/NIN verification: Validate the OTP received on the director's phone.
+    On success, stores the validated vID in the merchant's KYB record.
+    This vID is used during corporate sub-account creation on KYB approval.
+    """
+    m = await get_current_merchant(request)
+    if not req.init_id or not req.otp:
+        raise HTTPException(400, "init_id and otp are required")
+    vid = await _validate_sh_identity(req.init_id, req.identity_type.upper(), req.otp)
+    if not vid:
+        raise HTTPException(400, "OTP validation failed. Check the code and try again.")
+    # Store vID in KYB record for later use during account provisioning
+    now = now_utc()
+    await db.merchant_kyb.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$set": {"director_vid": vid, "director_vid_type": req.identity_type.upper(), "vid_verified_at": now}},
+        upsert=True
+    )
+    logger.info(f"[KYB] vID stored for merchant {m['merchant_id']}")
+    return {"verified": True, "message": "Identity verified successfully. Your BVN has been validated."}
 
 
 @router.get("/v1/merchant/logs")

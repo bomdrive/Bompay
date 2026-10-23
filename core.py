@@ -631,6 +631,11 @@ async def mock_sh(path: str, body: dict = None) -> dict:
             "status": "SUCCESS",
             "otpId": f"OTPID{secrets.token_hex(12).upper()}"
         }}
+    if path == "/identity/v2/validate":
+        return {"statusCode": 200, "message": "Identity validated successfully", "data": {
+            "_id": f"MOCKVID{secrets.token_hex(12).upper()}",
+            "status": "VERIFIED",
+        }}
     # Sub-account creation — matches both /accounts/subaccount and /accounts/v2/subaccount
     if "/accounts" in path and "subaccount" in path and "subaccounts" not in path:
         phone = (body or {}).get("phoneNumber", "+2340000000000")
