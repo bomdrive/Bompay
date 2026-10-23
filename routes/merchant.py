@@ -165,33 +165,37 @@ async def _validate_sh_identity(init_id: str, identity_type: str, otp: str) -> s
 
 async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str) -> dict:
     """
-    Create a Safe Haven virtual sub-account.
-    Flow:
-      1. If director_vid (pre-validated via OTP flow in KYB) + rc_number → corporate /accounts/v2/subaccount
-      2. Fallback → individual /accounts/subaccount with BVN or NIN directly
-         (individual endpoint accepts identityType=BVN/NIN + identityNumber, no prior OTP needed)
-    Returns dict with sh_account_id, sh_account_number, external_reference, etc.
-    NOTE: Corporate endpoint requires a vID from the 2-step initiate→validate OTP flow.
-          For merchants who completed BVN verification in KYB, this is populated as director_vid.
+    Create a Safe Haven corporate virtual sub-account using the Safe Haven team's 2-step flow:
+
+    Step 1 — Individual sub-account with booleanMatch=true:
+        POST /accounts/subaccount  { identityType, identityNumber, dateOfBirth, booleanMatch: true }
+        → response._id  (this becomes the identityId / vID for Step 2)
+
+    Step 2 — Corporate sub-account using Step 1 _id as vID:
+        POST /accounts/v2/subaccount  { identityType: "vID", identityId: <step1._id>,
+                                        companyRegistrationNumber, ... }
+        → corporate virtual account (the merchant's primary account)
+
+    Falls back to keeping the individual account from Step 1 if Step 2 fails.
     """
     external_ref = f"bp-m-{merchant['merchant_id']}-{uuid.uuid4().hex[:8]}"
     phone = _fmt_phone(merchant.get("phone", ""))
-    bvn = (kyb or {}).get("director_bvn", "")
-    nin = (kyb or {}).get("director_nin", "")
+    email = merchant.get("email", "")
+    bvn  = (kyb or {}).get("director_bvn", "")
+    nin  = (kyb or {}).get("director_nin", "")
+    dob  = (kyb or {}).get("director_dob", "")
     rc_number = (kyb or {}).get("rc_number") or merchant.get("rc_number") or ""
-    # Pre-validated vID stored during KYB BVN verification (initiate→OTP→validate flow)
-    vid = (kyb or {}).get("director_vid", "")
-    identity_id = bvn or nin or ""
+    identity_id   = bvn or nin or ""
     identity_type = "BVN" if bvn else ("NIN" if nin else "BVN")
 
     async def _parse(sh_resp: dict, fallback_label: str) -> dict:
         sh_data = sh_resp.get("data") if isinstance(sh_resp.get("data"), dict) else sh_resp
         return {
-            "sh_account_id": ((sh_data or {}).get("_id") or (sh_data or {}).get("id") or (sh_data or {}).get("accountId") or ""),
+            "sh_account_id":     ((sh_data or {}).get("_id") or (sh_data or {}).get("id") or ""),
             "sh_account_number": ((sh_data or {}).get("accountNumber") or (sh_data or {}).get("virtualAccountNumber") or ""),
-            "sh_account_name": (sh_data or {}).get("accountName") or f"{merchant.get('business_name', '')} — {fallback_label}",
-            "bank_name": (sh_data or {}).get("bankName") or "Safe Haven MFB",
-            "bank_code": "090286",
+            "sh_account_name":   (sh_data or {}).get("accountName") or f"{merchant.get('business_name', '')} — {fallback_label}",
+            "bank_name":  (sh_data or {}).get("bankName") or "Safe Haven MFB",
+            "bank_code":  "090286",
             "external_reference": external_ref,
         }
 
@@ -201,58 +205,72 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
         or FRONTEND_URL.rstrip("/")
     ) + "/api/webhooks/safehaven"
 
-    # ── Step 1: Corporate v2 with pre-validated vID (requires OTP-verified director) ──
-    if vid and rc_number:
-        payload: dict = {
+    # ── Step 1: Individual sub-account with BVN/NIN + booleanMatch ───────────────────
+    step1_vid = ""
+    step1_result = None
+    if identity_id:
+        payload1: dict = {
+            "phoneNumber":       phone,
+            "emailAddress":      email,
             "externalReference": external_ref,
-            "phoneNumber": phone,
-            "emailAddress": merchant.get("email", ""),
-            "identityType": "vID",
-            "identityId": vid,
+            "identityType":      identity_type,   # "BVN" or "NIN"
+            "identityNumber":    identity_id,
+            "autoSweep":         False,
+        }
+        if dob:
+            payload1["dateOfBirth"] = dob
+            payload1["booleanMatch"] = True
+        if cb_url:
+            payload1["callbackUrl"] = cb_url
+        try:
+            resp1 = await call_sh("POST", "/accounts/subaccount", body=payload1)
+            step1_result = await _parse(resp1, label)
+            # Extract _id from the raw response — this is the vID for Step 2
+            raw_data = resp1.get("data") if isinstance(resp1.get("data"), dict) else resp1
+            step1_vid = (raw_data or {}).get("_id", "")
+            logger.info(f"[MERCHANT] SH Step1 individual (booleanMatch={bool(dob)}) → {merchant['merchant_id']}: acct={step1_result['sh_account_number'] or 'pending/async'} vid={step1_vid[:12] if step1_vid else 'none'}…")
+        except Exception as e:
+            logger.warning(f"[MERCHANT] SH Step1 individual failed: {e}")
+
+    # ── Step 2: Corporate sub-account using Step 1 _id as identityId (vID) ──────────
+    if step1_vid and rc_number:
+        corp_ref = f"{external_ref}-corp"
+        payload2: dict = {
+            "phoneNumber":              phone,
+            "emailAddress":             email,
+            "externalReference":        corp_ref,
+            "identityType":             "vID",
+            "identityId":               step1_vid,
             "companyRegistrationNumber": rc_number,
-            "autoSweep": False,
+            "autoSweep":                False,
         }
         if cb_url:
-            payload["callbackUrl"] = cb_url
+            payload2["callbackUrl"] = cb_url
         try:
-            result = await _parse(await call_sh("POST", "/accounts/v2/subaccount", body=payload), label)
-            logger.info(f"[MERCHANT] Corporate SH v2 (vID) → {merchant['merchant_id']}: acct={result['sh_account_number'] or 'pending/async'}")
-            return result
+            resp2 = await call_sh("POST", "/accounts/v2/subaccount", body=payload2)
+            corp_result = await _parse(resp2, label)
+            corp_result["external_reference"] = corp_ref
+            logger.info(f"[MERCHANT] SH Step2 corporate → {merchant['merchant_id']}: acct={corp_result['sh_account_number'] or 'pending/async'}")
+            return corp_result
         except Exception as e:
-            logger.warning(f"[MERCHANT] Corporate v2 (vID) failed: {e} — falling back to individual endpoint")
+            logger.warning(f"[MERCHANT] SH Step2 corporate failed: {e} — using Step1 individual account")
 
-    # ── Step 2: Individual endpoint (BVN/NIN direct — no prior OTP required) ─────────
-    parts = (merchant.get("owner_name") or merchant.get("business_name") or "Business Owner").split()
-    payload2: dict = {
-        "externalReference": external_ref,
-        "firstName": parts[0],
-        "lastName": " ".join(parts[1:]) or "Owner",
-        "emailAddress": merchant.get("email", ""),
-        "phoneNumber": phone,
-        "autoSweep": False,
+    # ── Fallback: return Step 1 individual account if corporate step failed/skipped ──
+    if step1_result:
+        return step1_result
+
+    logger.warning(f"[MERCHANT] All SH sub-account attempts failed for {merchant['merchant_id']}")
+    return {
+        "sh_account_id": "", "sh_account_number": "",
+        "sh_account_name": label, "bank_name": "Safe Haven MFB",
+        "bank_code": "090286", "external_reference": external_ref,
     }
-    if cb_url:
-        payload2["callbackUrl"] = cb_url
-    if identity_id:
-        payload2["identityType"] = identity_type
-        payload2["identityNumber"] = identity_id
-        # Do NOT add identityId for BVN/NIN type — identityId is only for vID type
-    try:
-        result = await _parse(await call_sh("POST", "/accounts/subaccount", body=payload2), label)
-        logger.info(f"[MERCHANT] Individual SH → {merchant['merchant_id']}: acct={result['sh_account_number'] or 'pending/async'}")
-        return result
-    except Exception as e:
-        logger.warning(f"[MERCHANT] All SH sub-account attempts failed: {e}")
-        return {
-            "sh_account_id": "", "sh_account_number": "",
-            "sh_account_name": label, "bank_name": "Safe Haven MFB",
-            "bank_code": "090286", "external_reference": external_ref,
-        }
 
 
 async def _create_sh_subaccount(merchant: dict, label: str) -> dict:
-    """Backward-compatible wrapper — no KYB data available (registration time)."""
-    return await _create_sh_corporate_subaccount(merchant, {}, label)
+    """Create a new sub-account. Loads stored KYB data so BVN/NIN/DOB are available."""
+    kyb = await db.merchant_kyb.find_one({"merchant_id": merchant["merchant_id"]}, {"_id": 0}) or {}
+    return await _create_sh_corporate_subaccount(merchant, kyb, label)
 
 
 # ─── MODELS ──────────────────────────────────────────────────────────────────
@@ -283,6 +301,7 @@ class SubmitKYB(BaseModel):
     director_id_number: str
     director_bvn: Optional[str] = ""
     director_nin: Optional[str] = ""
+    director_dob: Optional[str] = ""   # Date of birth YYYY-MM-DD for BVN boolean match
     director_vid: Optional[str] = ""   # Pre-validated Safe Haven vID from OTP flow
     cac_document_url: Optional[str] = ""
     director_id_url: Optional[str] = ""
@@ -1448,38 +1467,56 @@ async def admin_get_merchant(merchant_id: str, request: Request):
 
 
 async def _send_kyb_decision_email(email: str, business_name: str, status: str, admin_note: str, account_number: str):
-    """Send KYB approval/rejection email to merchant."""
+    """Send KYB approval/rejection email to merchant with a working CTA button."""
     if not email:
         return
     try:
         frontend = FRONTEND_URL.rstrip("/")
         if status == "approved":
             subject = f"[BOMPAY] Your KYB has been Approved — {business_name}"
-            cta_label, cta_url = "Log in to your Dashboard", f"{frontend}/v1/dashboard"
-            rows = [
-                ("Business", business_name),
-                ("KYB Status", "Approved ✓"),
-                ("Mode", "Live"),
-            ]
+            cta_label = "Log in to your Dashboard"
+            cta_url   = f"{frontend}/v1/dashboard"
+            status_color = "#059669"
+            status_text  = "Approved ✓"
+            extra_rows = ""
             if account_number:
-                rows.append(("Primary Account", account_number))
+                extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Primary Account</td>'
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:700;text-align:right;font-family:monospace">{account_number}</td></tr>')
             if admin_note:
-                rows.append(("Note", admin_note))
+                extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Note</td>'
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{admin_note}</td></tr>')
         else:
             subject = f"[BOMPAY] KYB Application Update — {business_name}"
-            cta_label, cta_url = "Update KYB Documents", f"{frontend}/v1/kyb"
-            rows = [
-                ("Business", business_name),
-                ("KYB Status", "Not Approved"),
-            ]
+            cta_label = "Update KYB Documents"
+            cta_url   = f"{frontend}/v1/kyb"
+            status_color = "#dc2626"
+            status_text  = "Not Approved"
+            extra_rows = ""
             if admin_note:
-                rows.append(("Reason", admin_note))
-            rows.append(("Next Step", "Please review and re-submit your KYB documents"))
+                extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Reason</td>'
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{admin_note}</td></tr>')
 
-        footer_html = (f'<a href="{cta_url}" style="background:#064BCB;color:#fff;padding:10px 20px;'
-                       f'border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">'
-                       f'{cta_label} →</a>')
-        html = _email_html(subject.replace("[BOMPAY] ", ""), rows, footer_html)
+        html = (
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            f'<tr><td style="background:#064BCB;padding:24px 24px 16px;border-radius:12px 12px 0 0">'
+            f'<span style="color:#fff;font-size:18px;font-weight:800;letter-spacing:-0.5px">BOMPAY</span></td></tr>'
+            f'<tr><td style="background:#fff;padding:20px 24px;border-radius:0 0 12px 12px;font-family:Arial,sans-serif">'
+            f'<p style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:16px">KYB Verification Update</p>'
+            f'<table width="100%" cellpadding="0" cellspacing="0">'
+            f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Business</td>'
+            f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{business_name}</td></tr>'
+            f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">KYB Status</td>'
+            f'<td style="padding:4px 0;font-size:13px;font-weight:700;text-align:right;color:{status_color}">{status_text}</td></tr>'
+            f'{extra_rows}'
+            f'</table>'
+            f'<p style="margin-top:20px">'
+            f'<a href="{cta_url}" style="background:#064BCB;color:#fff;padding:10px 20px;'
+            f'border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">'
+            f'{cta_label} &rarr;</a></p>'
+            f'<p style="font-size:11px;color:#94a3b8;margin-top:16px">BOMPAY — Your trusted Nigerian fintech. '
+            f'We never ask for your PIN or password by email.</p>'
+            f'</td></tr></table>'
+        )
         await send_email(to=email, subject=subject, html=html)
         logger.info(f"[MERCHANT] KYB decision email sent to {email} — {status}")
     except Exception as e:
