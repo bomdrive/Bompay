@@ -394,9 +394,56 @@ async def safehaven_webhook(request: Request):
                                 logger.info(f"[SH-WEBHOOK] merchant credit duplicate skipped session_id={session_id}")
                         else:
                             logger.warning(f"[SH-WEBHOOK] ⚠️ no merchant found for account={credit_acct_num!r} — credit unmatched")
-        else:
-            logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
-                        f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
+
+    # ── Checkout session payment confirmation ─────────────────────────
+    # Handle virtualAccount.transfer to a checkout session's temp VA
+    if event_type.lower() in {e.lower() for e in credit_events}:
+        ext_ref = data.get("externalReference") or data.get("external_reference") or ""
+        va_id   = data.get("virtualAccountId") or data.get("virtualAccount") or data.get("accountId") or ""
+        session = await db.checkout_sessions.find_one({
+            "$or": [
+                {"external_reference": ext_ref} if ext_ref else {"_id": None},
+                {"sh_virtual_account_id": va_id} if va_id else {"_id": None},
+                {"sh_account_number": credit_acct_num} if credit_acct_num else {"_id": None},
+            ]
+        }) if (ext_ref or va_id or credit_acct_num) else None
+
+        if session and session.get("status") == "pending":
+            try:
+                amt_kobo_paid = int(amount * 100)
+                expected_kobo = session.get("amount_kobo", 0)
+                now_ts = datetime.now(timezone.utc).isoformat()
+                # Exact match
+                if is_success and not data.get("isReversed") and amt_kobo_paid == expected_kobo:
+                    await db.checkout_sessions.update_one(
+                        {"session_id": session["session_id"]},
+                        {"$set": {
+                            "status": "paid",
+                            "paid_at": now_ts,
+                            "updated_at": now_ts,
+                            "webhook_payload": data,
+                        }}
+                    )
+                    logger.info(f"[CHECKOUT] ✅ Session {session['session_id']} marked PAID ₦{amount}")
+                elif is_success and not data.get("isReversed") and amt_kobo_paid != expected_kobo:
+                    # Under/over payment — flag for manual review
+                    await db.checkout_sessions.update_one(
+                        {"session_id": session["session_id"]},
+                        {"$set": {
+                            "status": "review",
+                            "updated_at": now_ts,
+                            "webhook_payload": data,
+                            "review_reason": f"amount_mismatch: paid={amt_kobo_paid} expected={expected_kobo}",
+                        }}
+                    )
+                    logger.warning(f"[CHECKOUT] Amount mismatch for session {session['session_id']}: "
+                                   f"paid={amt_kobo_paid} expected={expected_kobo}")
+            except Exception as ce:
+                logger.error(f"[CHECKOUT] Session update failed for ext_ref={ext_ref}: {ce}")
+
+    if not is_success:
+        logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
+                    f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
 
     # ── Transfer reversal ─────────────────────────────────────────────
     elif event_type.lower() in ("transfer.reversal", "transfer.reversed", "debit.reversal",

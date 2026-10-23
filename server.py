@@ -123,14 +123,14 @@ from routes import (
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business, cards, merchant,
+    push, epos, promotions, family, business, cards, merchant, checkout,
 )
 
 for mod in [
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business, cards, merchant,
+    push, epos, promotions, family, business, cards, merchant, checkout,
 ]:
     app.include_router(mod.router, prefix="/api")
 
@@ -154,6 +154,13 @@ async def startup():
     await db.name_enquiries.create_index("session_id", unique=True, sparse=True)
     await db.wallets.create_index("sh_account_number", sparse=True)
     await db.support_tickets.create_index([("user_id", 1), ("status", 1)])
+    # Checkout sessions
+    await db.checkout_sessions.create_index("session_id", unique=True)
+    await db.checkout_sessions.create_index("external_reference", unique=True, sparse=True)
+    await db.checkout_sessions.create_index([("merchant_id", 1), ("created_at", -1)])
+    await db.checkout_sessions.create_index("sh_virtual_account_id", sparse=True)
+    # Merchant fee rules
+    await db.merchant_fee_rules.create_index("service", unique=True)
     await db.support_messages.create_index([("ticket_id", 1), ("created_at", 1)])
     await db.ajo_groups.create_index("invite_code", unique=True, sparse=True)
     await db.ajo_groups.create_index([("creator_id", 1), ("status", 1)])
@@ -240,7 +247,46 @@ async def startup():
         if not await db.fee_configs.find_one({"service": fc["service"]}):
             await db.fee_configs.insert_one(fc)
 
-    # Init Cloudinary
+    # Seed default merchant platform fee rules
+    default_merchant_fees = [
+        {
+            "service": "CHECKOUT",
+            "fee_type": "FLAT_PLUS_PCT",
+            "flat_kobo": 10000,   # ₦100 flat
+            "percentage": 1.5,    # 1.5%
+            "min_fee_kobo": 10000,  # ₦100 minimum
+            "max_fee_kobo": 500000, # ₦5,000 cap
+            "is_active": True,
+            "description": "Fee charged per completed checkout transaction",
+        },
+        {
+            "service": "MERCHANT_TRANSFER",
+            "fee_type": "FLAT",
+            "flat_kobo": 5300,    # ₦53 (standard NIP fee)
+            "percentage": 0.0,
+            "min_fee_kobo": 5300,
+            "max_fee_kobo": 5300,
+            "is_active": True,
+            "description": "NIP outward transfer fee",
+        },
+        {
+            "service": "AIRTIME",
+            "fee_type": "PERCENTAGE",
+            "flat_kobo": 0,
+            "percentage": 2.0,
+            "min_fee_kobo": 0,
+            "max_fee_kobo": 100000,
+            "is_active": False,
+            "description": "Airtime purchase fee (inactive by default)",
+        },
+    ]
+    for fee in default_merchant_fees:
+        if not await db.merchant_fee_rules.find_one({"service": fee["service"]}):
+            await db.merchant_fee_rules.insert_one({
+                **fee,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_by": "system",
+            })
     try:
         cld_doc = await db.admin_settings.find_one({"key": "cloudinary"})
         if cld_doc and cld_doc.get("cloud_name"):

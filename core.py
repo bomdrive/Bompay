@@ -656,6 +656,29 @@ async def mock_sh(path: str, body: dict = None) -> dict:
             "availableBalance": 0, "accountBalance": 0, "bookBalance": 0,
             "accountNumber": "0000000000", "status": "Active", "canDebit": True, "canCredit": True
         }}
+    # Temporary virtual account for checkout (POST /virtual-accounts)
+    if path == "/virtual-accounts":
+        ext_ref = (body or {}).get("externalReference", "")
+        fake_acct = "90" + "".join([str(random.randint(0, 9)) for _ in range(8)])
+        mock_id = f"MOCKVA{secrets.token_hex(12).upper()}"
+        return {"statusCode": 200, "message": "Virtual Account Created.", "data": {
+            "_id": mock_id,
+            "accountNumber": fake_acct,
+            "accountName": "BOMPAY CHECKOUT",
+            "bankName": "Safe Haven MFB",
+            "currencyCode": "NGN",
+            "externalReference": ext_ref,
+            "amountControl": (body or {}).get("amountControl", "Fixed"),
+            "status": "Active",
+        }}
+    # Get virtual account by ID
+    if path.startswith("/virtual-accounts/") and len(path.split("/")) == 3:
+        va_id = path.split("/")[-1]
+        return {"statusCode": 200, "data": {
+            "_id": va_id, "accountNumber": "9000000000",
+            "bankName": "Safe Haven MFB", "status": "Active",
+            "availableBalance": 0,
+        }}
     return {"statusCode": 200, "data": {}}
 
 async def call_sh(method: str, path: str, body: dict = None, params: dict = None) -> dict:
