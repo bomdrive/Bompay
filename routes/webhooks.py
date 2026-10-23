@@ -354,6 +354,41 @@ async def safehaven_webhook(request: Request):
         else:
             logger.warning(f"[SH-WEBHOOK] unhandled eventType={event_type!r} — full event: {json.dumps(event)[:500]}")
 
+    # ── Merchant account provisioning callback ─────────────────────────────────
+    # Safe Haven fires these when a sub-account is ready: subaccount.created,
+    # account.created, virtualAccount.created (casing varies by SH env)
+    provision_events = {
+        "subaccount.created", "account.created", "virtualaccount.created",
+        "subAccount.created", "virtualAccount.created",
+    }
+    if event_type in provision_events or event_type.lower() in {e.lower() for e in provision_events}:
+        data = event.get("data", event)
+        ext_ref = (
+            data.get("externalReference") or data.get("external_reference") or
+            event.get("externalReference") or event.get("external_reference") or ""
+        )
+        acct_number = data.get("accountNumber") or data.get("virtualAccountNumber") or ""
+        acct_name = data.get("accountName") or ""
+        sh_acct_id = data.get("_id") or data.get("id") or data.get("accountId") or ""
+
+        if ext_ref and ext_ref.startswith("bp-m-"):
+            acct_doc = await db.merchant_accounts.find_one({"external_reference": ext_ref})
+            if acct_doc and acct_number:
+                await db.merchant_accounts.update_one(
+                    {"external_reference": ext_ref},
+                    {"$set": {
+                        "sh_account_number": acct_number,
+                        "sh_account_name": acct_name or acct_doc.get("sh_account_name", ""),
+                        "sh_account_id": sh_acct_id or acct_doc.get("sh_account_id", ""),
+                        "provisioned_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "active",
+                    }}
+                )
+                logger.info(f"[SH-WEBHOOK] Merchant account provisioned via webhook: "
+                            f"ext_ref={ext_ref} acct={acct_number}")
+            else:
+                logger.warning(f"[SH-WEBHOOK] Provision webhook: no matching merchant account for ext_ref={ext_ref!r}")
+
     return {"received": True}
 
 # ===== PAIRGATE WEBHOOK =====

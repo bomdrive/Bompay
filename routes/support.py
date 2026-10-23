@@ -230,6 +230,18 @@ async def list_user_tickets(request: Request, ticket_type: str = ""):
     tickets = await db.support_tickets.find(q, {"_id": 0}).sort("created_at", -1).to_list(50)
     return {"tickets": tickets}
 
+
+@router.get("/support/unread")
+async def get_support_unread(request: Request):
+    """Return count of unread admin messages across all open support tickets."""
+    user = await get_current_user(request)
+    result = await db.support_tickets.aggregate([
+        {"$match": {"user_id": user["_id"], "unread_user": {"$gt": 0}}},
+        {"$group": {"_id": None, "total": {"$sum": "$unread_user"}}},
+    ]).to_list(1)
+    unread = result[0]["total"] if result else 0
+    return {"unread": unread}
+
 @router.get("/support/messages")
 async def get_support_messages(request: Request):
     user = await get_current_user(request)
@@ -261,15 +273,6 @@ async def get_support_ticket_messages(ticket_id: str, request: Request):
         "ticket_type": ticket.get("ticket_type", "general"),
         "created_at": ticket.get("created_at"),
     }
-
-
-async def get_support_unread(request: Request):
-    user = await get_current_user(request)
-    ticket = await db.support_tickets.find_one({"user_id": user["_id"], "status": "OPEN"})
-    if not ticket:
-        return {"unread": 0}
-    count = await db.support_messages.count_documents({"ticket_id": ticket["ticket_id"], "sender": "admin", "read": False})
-    return {"unread": count}
 
 @router.get("/admin/support")
 async def admin_get_tickets(request: Request, page: int = 1, limit: int = 20, status_filter: str = None):
