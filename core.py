@@ -1344,7 +1344,7 @@ async def send_email(*, to: str, subject: str, html: str) -> None:
             if r.status_code >= 400:
                 logger.warning(f"[Email] send failed {r.status_code}: {r.text[:200]}")
         else:
-            logger.debug(f"[Email] No email provider configured — dropping email to {to}")
+            logger.warning(f"[Email] No email provider configured (set EMERGENT_EMAIL_KEY or configure Resend in admin) — dropping email to {to} subject={subject[:60]!r}")
     except Exception as e:
         logger.error(f"[Email] error: {e}")
 

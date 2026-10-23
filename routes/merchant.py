@@ -5,6 +5,7 @@ Prefix: /api/admin/merchants (admin-facing)
 """
 import os, secrets, uuid, asyncio
 from datetime import datetime, timezone, timedelta
+from html import escape as _escape
 from typing import Optional
 import jwt as pyjwt  # noqa: F401 — used via 'pyjwt' alias below
 from fastapi import APIRouter, Request, HTTPException, Response, UploadFile, File
@@ -632,18 +633,31 @@ async def get_merchant_account(account_id: str, request: Request):
     )
     if not acct:
         raise HTTPException(404, "Account not found")
-    # Fetch live balance if SH account exists
+    # Fetch live balance from Safe Haven
     balance = 0.0
     if acct.get("sh_account_number"):
         try:
-            r = await call_sh("GET", "/accounts", params={"accountNumber": acct["sh_account_number"]})
-            data = r.get("data", [])
-            if isinstance(data, list) and data:
-                balance = float(data[0].get("balance", 0))
-            elif isinstance(data, dict):
-                balance = float(data.get("balance", 0))
-        except Exception:
-            pass
+            sh_id = acct.get("sh_account_id", "")
+            if sh_id:
+                # Preferred: direct single-account endpoint by Safe Haven internal ID
+                r = await call_sh("GET", f"/accounts/{sh_id}")
+                data = r.get("data") or r
+            else:
+                # Fallback: list query by account number, then take first result
+                r = await call_sh("GET", "/accounts", params={"accountNumber": acct["sh_account_number"]})
+                data = r.get("data", [])
+                if isinstance(data, list) and data:
+                    data = data[0]
+                elif isinstance(data, list):
+                    data = {}
+            # Safe Haven returns availableBalance / accountBalance / bookBalance (not "balance")
+            balance = float(
+                data.get("availableBalance") or
+                data.get("accountBalance") or
+                data.get("bookBalance") or 0
+            )
+        except Exception as e:
+            logger.warning(f"[MERCHANT] Balance fetch failed for account {account_id}: {e}")
     txns = await db.merchant_transactions.find(
         {"merchant_id": m["merchant_id"], "account_id": account_id},
         {"_id": 0}
@@ -1522,20 +1536,30 @@ async def _send_kyb_decision_email(email: str, business_name: str, status: str, 
     if not email:
         return
     try:
-        frontend = FRONTEND_URL.rstrip("/")
+        # HTML-escape all user-controlled inputs to prevent rendering issues
+        safe_biz = _escape(business_name or "")
+        safe_note = _escape(admin_note or "")
+        safe_acct = _escape(account_number or "")
+
+        # Ensure the frontend URL is always HTTPS — fall back to bompay.app if not
+        raw_frontend = (FRONTEND_URL or "").rstrip("/")
+        if not raw_frontend.startswith("https://"):
+            raw_frontend = "https://bompay.app"
+        frontend = raw_frontend
+
         if status == "approved":
             subject = f"[BOMPAY] Your KYB has been Approved — {business_name}"
             cta_label = "Log in to your Dashboard"
             cta_url   = f"{frontend}/v1/dashboard"
             status_color = "#059669"
-            status_text  = "Approved ✓"
+            status_text  = "Approved"
             extra_rows = ""
-            if account_number:
+            if safe_acct:
                 extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Primary Account</td>'
-                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:700;text-align:right;font-family:monospace">{account_number}</td></tr>')
-            if admin_note:
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:700;text-align:right;font-family:monospace">{safe_acct}</td></tr>')
+            if safe_note:
                 extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Note</td>'
-                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{admin_note}</td></tr>')
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{safe_note}</td></tr>')
         else:
             subject = f"[BOMPAY] KYB Application Update — {business_name}"
             cta_label = "Update KYB Documents"
@@ -1543,9 +1567,9 @@ async def _send_kyb_decision_email(email: str, business_name: str, status: str, 
             status_color = "#dc2626"
             status_text  = "Not Approved"
             extra_rows = ""
-            if admin_note:
+            if safe_note:
                 extra_rows += (f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Reason</td>'
-                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{admin_note}</td></tr>')
+                               f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{safe_note}</td></tr>')
 
         html = (
             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
@@ -1555,7 +1579,7 @@ async def _send_kyb_decision_email(email: str, business_name: str, status: str, 
             f'<p style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:16px">KYB Verification Update</p>'
             f'<table width="100%" cellpadding="0" cellspacing="0">'
             f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Business</td>'
-            f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{business_name}</td></tr>'
+            f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{safe_biz}</td></tr>'
             f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">KYB Status</td>'
             f'<td style="padding:4px 0;font-size:13px;font-weight:700;text-align:right;color:{status_color}">{status_text}</td></tr>'
             f'{extra_rows}'
@@ -1563,8 +1587,8 @@ async def _send_kyb_decision_email(email: str, business_name: str, status: str, 
             f'<p style="margin-top:20px">'
             f'<a href="{cta_url}" style="background:#064BCB;color:#fff;padding:10px 20px;'
             f'border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">'
-            f'{cta_label} &rarr;</a></p>'
-            f'<p style="font-size:11px;color:#94a3b8;margin-top:16px">BOMPAY — Your trusted Nigerian fintech. '
+            f'{cta_label}</a></p>'
+            f'<p style="font-size:11px;color:#94a3b8;margin-top:16px">BOMPAY &mdash; Your trusted Nigerian fintech. '
             f'We never ask for your PIN or password by email.</p>'
             f'</td></tr></table>'
         )
