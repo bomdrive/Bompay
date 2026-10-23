@@ -551,8 +551,12 @@ async def list_merchant_accounts(request: Request):
     return {"accounts": accounts}
 
 
+class RetryProvisionRequest(BaseModel):
+    director_dob: Optional[str] = ""   # Provide if not already in KYB record
+
+
 @router.post("/v1/merchant/accounts/{account_id}/retry")
-async def retry_account_provision(account_id: str, request: Request):
+async def retry_account_provision(account_id: str, req: RetryProvisionRequest, request: Request):
     """Retry Safe Haven provisioning for an account still stuck in Provisioning state."""
     m = await get_current_merchant(request)
     acct = await db.merchant_accounts.find_one({"account_id": account_id, "merchant_id": m["merchant_id"]})
@@ -560,25 +564,39 @@ async def retry_account_provision(account_id: str, request: Request):
         raise HTTPException(404, "Account not found")
     if acct.get("sh_account_number"):
         return {"message": "Account already provisioned", "sh_account_number": acct["sh_account_number"]}
-    # Re-run provisioning with KYB data
+
+    # Load KYB, optionally patch in a newly-provided DOB
     kyb = await db.merchant_kyb.find_one({"merchant_id": m["merchant_id"]}, {"_id": 0}) or {}
+    if req.director_dob and not kyb.get("director_dob"):
+        kyb["director_dob"] = req.director_dob
+        await db.merchant_kyb.update_one(
+            {"merchant_id": m["merchant_id"]},
+            {"$set": {"director_dob": req.director_dob}},
+            upsert=True,
+        )
+        logger.info(f"[MERCHANT] Stored director_dob from retry for {m['merchant_id']}")
+
     label = acct.get("name") or m.get("business_name", "Primary")
     sh = await _create_sh_corporate_subaccount(m, kyb, label)
     now = now_utc()
     await db.merchant_accounts.update_one(
         {"account_id": account_id},
         {"$set": {
-            "sh_account_id":     sh["sh_account_id"],
-            "sh_account_number": sh["sh_account_number"],
-            "sh_account_name":   sh["sh_account_name"],
-            "bank_name":         sh["bank_name"],
-            "bank_code":         sh["bank_code"],
+            "sh_account_id":      sh["sh_account_id"],
+            "sh_account_number":  sh["sh_account_number"],
+            "sh_account_name":    sh["sh_account_name"],
+            "bank_name":          sh["bank_name"],
+            "bank_code":          sh["bank_code"],
             "external_reference": sh.get("external_reference", ""),
-            "provisioned_at":    now,
+            "provisioned_at":     now,
         }}
     )
     logger.info(f"[MERCHANT] Account retry provision: {account_id} → acct={sh['sh_account_number'] or 'pending/async'}")
-    return {"message": "Provisioning re-initiated", "sh_account_number": sh.get("sh_account_number", "")}
+    return {
+        "message": "Provisioning re-initiated",
+        "sh_account_number": sh.get("sh_account_number", ""),
+        "needs_dob": not kyb.get("director_dob"),
+    }
 
 
 @router.post("/v1/merchant/accounts")
