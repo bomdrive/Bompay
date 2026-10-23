@@ -324,6 +324,76 @@ async def safehaven_webhook(request: Request):
                             logger.info(f"[SH-WEBHOOK] business duplicate skipped session_id={session_id}")
                     else:
                         logger.warning(f"[SH-WEBHOOK] ⚠️ no business found for account={credit_acct_num!r}")
+                        # ── Check if this is a merchant virtual account credit ─────
+                        merch_acct = await db.merchant_accounts.find_one(
+                            {"sh_account_number": credit_acct_num}
+                        )
+                        if merch_acct:
+                            merchant_id = merch_acct.get("merchant_id", "")
+                            dup = await db.merchant_transactions.find_one(
+                                {"provider_reference": session_id, "merchant_id": merchant_id}
+                            )
+                            if not dup:
+                                amt_kobo = int(amount * 100)
+                                txn_id = f"MTXN{secrets.token_hex(12).upper()}"
+                                debit_name = (data.get("debitAccountName") or data.get("senderName")
+                                              or data.get("debitName") or "External Transfer")
+                                narration = data.get("narration") or f"Transfer from {debit_name}"
+                                await db.merchant_transactions.insert_one({
+                                    "transaction_id": txn_id,
+                                    "merchant_id": merchant_id,
+                                    "account_id": merch_acct.get("account_id", ""),
+                                    "type": "INFLOW", "direction": "CREDIT",
+                                    "amount": amt_kobo, "currency": "NGN",
+                                    "status": "COMPLETED", "provider": "SAFEHAVEN",
+                                    "description": narration,
+                                    "provider_reference": session_id,
+                                    "metadata": {
+                                        "event_type": event_type,
+                                        "debit_account": data.get("debitAccountNumber"),
+                                        "debit_name": debit_name,
+                                        "credit_account": credit_acct_num,
+                                    },
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                # Push notification to merchant
+                                merchant = await db.merchants.find_one({"merchant_id": merchant_id})
+                                if merchant:
+                                    memail = merchant.get("email", "")
+                                    bname  = merchant.get("business_name", "Your Business")
+                                    logger.info(f"[SH-WEBHOOK] ✅ merchant credit ₦{amount} → {merchant_id} txn={txn_id}")
+                                    # Email notification
+                                    async def _merch_credit_email(em=memail, bn=bname, amt=amount, dn=debit_name, sid=session_id):
+                                        try:
+                                            if not em:
+                                                return
+                                            html = (
+                                                f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                                                f'<tr><td style="background:#064BCB;padding:20px 24px;border-radius:12px 12px 0 0">'
+                                                f'<span style="color:#fff;font-size:18px;font-weight:800">BOMPAY</span></td></tr>'
+                                                f'<tr><td style="background:#fff;padding:20px 24px;border-radius:0 0 12px 12px;font-family:Arial,sans-serif">'
+                                                f'<p style="font-size:15px;font-weight:700;color:#0f172a">Account Credit Alert</p>'
+                                                f'<table width="100%" cellpadding="0" cellspacing="0">'
+                                                f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Amount</td>'
+                                                f'<td style="padding:4px 0;color:#059669;font-size:15px;font-weight:800;text-align:right">+₦{amt:,.2f}</td></tr>'
+                                                f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">From</td>'
+                                                f'<td style="padding:4px 0;color:#0f172a;font-size:13px;font-weight:600;text-align:right">{dn}</td></tr>'
+                                                f'<tr><td style="padding:4px 0;color:#64748b;font-size:13px">Reference</td>'
+                                                f'<td style="padding:4px 0;color:#0f172a;font-size:12px;text-align:right;font-family:monospace">{sid}</td></tr>'
+                                                f'</table>'
+                                                f'<p style="margin-top:16px"><a href="{FRONTEND_URL.rstrip("/")}/v1/accounts" '
+                                                f'style="background:#064BCB;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700">View Account &rarr;</a></p>'
+                                                f'<p style="font-size:11px;color:#94a3b8;margin-top:16px">BOMPAY — Never share your PIN or password.</p>'
+                                                f'</td></tr></table>'
+                                            )
+                                            await send_email(to=em, subject=f"[BOMPAY] ₦{amt:,.2f} credited to {bn}", html=html)
+                                        except Exception as ex:
+                                            logger.warning(f"[SH-WEBHOOK] merchant credit email failed: {ex}")
+                                    asyncio.create_task(_merch_credit_email())
+                            else:
+                                logger.info(f"[SH-WEBHOOK] merchant credit duplicate skipped session_id={session_id}")
+                        else:
+                            logger.warning(f"[SH-WEBHOOK] ⚠️ no merchant found for account={credit_acct_num!r} — credit unmatched")
         else:
             logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
                         f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
@@ -351,6 +421,13 @@ async def safehaven_webhook(request: Request):
             logger.info(f"[SH-WEBHOOK] debit on internal account "
                         f"'{internal_debit.get('category') or internal_debit.get('service','?')}' "
                         f"({debit_acct_num}) — no action needed")
+        elif event_type == "identityCreditCheck":
+            # Safe Haven fires this when a BVN/NIN boolean match is attempted.
+            # status=FAILED means the credit check did not pass (DOB mismatch or rate limit).
+            # status=SUCCESS means identity validated — the sub-account will proceed.
+            status = data.get("status", "")
+            id_type = data.get("type", "")
+            logger.info(f"[SH-WEBHOOK] identityCreditCheck type={id_type} status={status} — no action needed")
         else:
             logger.warning(f"[SH-WEBHOOK] unhandled eventType={event_type!r} — full event: {json.dumps(event)[:500]}")
 
