@@ -564,6 +564,9 @@ async def retry_account_provision(account_id: str, req: RetryProvisionRequest, r
         raise HTTPException(404, "Account not found")
     if acct.get("sh_account_number"):
         return {"message": "Account already provisioned", "sh_account_number": acct["sh_account_number"]}
+    # Only allow one attempt — if already submitted to Safe Haven, block further retries
+    if acct.get("external_reference"):
+        raise HTTPException(400, "Provisioning already submitted to Safe Haven. Your account number will arrive shortly via webhook. Please wait.")
 
     # Load KYB, optionally patch in a newly-provided DOB
     kyb = await db.merchant_kyb.find_one({"merchant_id": m["merchant_id"]}, {"_id": 0}) or {}
