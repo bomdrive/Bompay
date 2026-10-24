@@ -770,15 +770,20 @@ async def call_sh(method: str, path: str, body: dict = None, params: dict = None
 
         resp = r.json()
 
-        # Safe Haven VAS returns HTTP 201 even when the purchase fails — the real outcome
-        # is in the body: statusCode 4xx and data.status = "failed".  Detect and raise here
-        # so the calling VAS route can refund the user and not mark the txn as COMPLETED.
+        # Safe Haven sometimes returns HTTP 2xx with a statusCode 4xx/5xx in the body.
+        # Detect this for ALL endpoints so configuration/provider errors surface correctly.
+        body_status_code = resp.get("statusCode")
+        if body_status_code and str(body_status_code) not in ("200", "201"):
+            err_msg = resp.get("message") or f"Safe Haven error (statusCode: {body_status_code})"
+            logger.error(f"[SafeHaven] Body-level error on {path}: statusCode={body_status_code} msg={err_msg}")
+            raise HTTPException(400, err_msg)
+
+        # VAS: additionally fail if data.status is 'failed' even when statusCode looks OK
         if "/vas/pay/" in path:
-            body_code = resp.get("statusCode", 200)
             vas_status = (resp.get("data") or {}).get("status", "")
-            if str(body_code) not in ("200", "201") or vas_status == "failed":
+            if vas_status == "failed":
                 err_msg = resp.get("message") or f"VAS purchase failed (status: {vas_status})"
-                logger.error(f"[SafeHaven] VAS body failure {path}: code={body_code} status={vas_status} msg={err_msg}")
+                logger.error(f"[SafeHaven] VAS body failure {path}: status={vas_status} msg={err_msg}")
                 raise HTTPException(400, err_msg)
 
         return resp

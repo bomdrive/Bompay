@@ -62,9 +62,9 @@ def _now() -> str:
 
 
 async def _get_settlement_account_id() -> str:
+    """Get the Safe Haven settlement account ID (primary Corporate account _id) from provider settings."""
     settings = await db.provider_settings.find_one({"provider": "safehaven"})
-    return (settings or {}).get("settlement_account_id", "") or \
-           os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
+    return (settings or {}).get("settlement_account_id", "") or os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
 
 
 def _validate_amount(amount_naira: float) -> int:
@@ -83,13 +83,6 @@ def _validate_amount(amount_naira: float) -> int:
     if kobo < 100:
         raise HTTPException(400, "Minimum checkout amount is ₦1.00")
     return kobo
-
-
-async def _get_settlement_account_id() -> str:
-    """Get the Safe Haven settlement account ID from provider settings."""
-    settings = await db.provider_settings.find_one({"provider": "safehaven"})
-    sid = (settings or {}).get("settlement_account_id", "") or os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
-    return sid
 
 
 async def _create_sh_virtual_account(

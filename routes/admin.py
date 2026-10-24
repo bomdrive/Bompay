@@ -4590,6 +4590,35 @@ async def fetch_sh_accounts_for_service(request: Request):
         return {"accounts": [], "source": "fallback", "error": str(e), "existing": docs}
 
 
+@router.get("/admin/safehaven/accounts")
+async def admin_sh_accounts_list(request: Request):
+    """
+    List Safe Haven accounts for provider configuration.
+    Used by admin to look up account_number (for debit) and account_id (_id for settlement).
+    The 'settlement' account is the merchant's primary Corporate account with Safe Haven.
+    """
+    await get_admin_user(request)
+    try:
+        result = await call_sh("GET", "/accounts?page=1&limit=100")
+        accounts_raw = result.get("data", [])
+        if not isinstance(accounts_raw, list):
+            accounts_raw = result.get("data", {}).get("data", []) if isinstance(result.get("data"), dict) else []
+        accounts = [
+            {
+                "account_number": a.get("accountNumber") or a.get("account_number", ""),
+                "account_name": a.get("accountName") or a.get("account_name", ""),
+                "account_id": a.get("_id") or a.get("id", ""),
+                "available_balance": a.get("availableBalance", 0),
+                "type": a.get("type") or a.get("accountType", ""),
+            }
+            for a in accounts_raw if a.get("accountNumber") or a.get("account_number")
+        ]
+        return {"accounts": accounts}
+    except Exception as e:
+        logger.warning(f"[Admin] SH accounts fetch failed: {e}")
+        return {"accounts": [], "error": str(e)}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # FREE TRANSFER CONFIGURATION & REPORTING
 # ════════════════════════════════════════════════════════════════════════════
