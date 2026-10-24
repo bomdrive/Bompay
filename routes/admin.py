@@ -4854,3 +4854,133 @@ async def retry_reimbursement(rid: str, request: Request):
                       "updated_at": datetime.now(timezone.utc).isoformat()}}
         )
         raise HTTPException(500, f"Retry failed: {str(exc)[:200]}")
+
+
+# ─── ADMIN: STOREFRONT CONTROLS ───────────────────────────────────────────────
+
+@router.get("/admin/storefronts")
+async def admin_list_storefronts(
+    request: Request,
+    page: int = 1,
+    status: str = "",
+    search: str = "",
+    flagged: bool = False,
+):
+    """List all merchant storefronts with admin metrics."""
+    await get_admin_user(request)
+
+    limit = 20
+    skip = (page - 1) * limit
+    filt: dict = {"is_deleted": {"$ne": True}}
+    if status:
+        filt["status"] = status
+    if flagged:
+        filt["admin_flag"] = {"$exists": True, "$ne": None}
+    if search:
+        filt["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"slug": {"$regex": search, "$options": "i"}},
+        ]
+
+    total = await db.stores.count_documents(filt)
+    stores = await db.stores.find(filt, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    # Enrich with merchant info and basic metrics
+    for s in stores:
+        m = await db.merchants.find_one({"merchant_id": s["merchant_id"]}, {"email": 1, "business_name": 1, "full_name": 1})
+        s["merchant_email"] = (m or {}).get("email", "—")
+        s["merchant_name"] = (m or {}).get("business_name") or (m or {}).get("full_name", "—")
+        s["product_count"] = await db.products.count_documents({"store_id": s["store_id"]})
+        s["order_count"] = await db.store_orders.count_documents({"store_id": s["store_id"]})
+        agg = await db.store_orders.aggregate([
+            {"$match": {"store_id": s["store_id"], "payment_status": "paid"}},
+            {"$group": {"_id": None, "total": {"$sum": "$total_kobo"}}}
+        ]).to_list(1)
+        s["revenue_kobo"] = agg[0]["total"] if agg else 0
+
+    # Summary stats
+    stats = {
+        "total": await db.stores.count_documents({"is_deleted": {"$ne": True}}),
+        "published": await db.stores.count_documents({"status": "published", "is_deleted": {"$ne": True}}),
+        "suspended": await db.stores.count_documents({"status": "suspended", "is_deleted": {"$ne": True}}),
+        "flagged": await db.stores.count_documents({"admin_flag": {"$exists": True, "$ne": None}, "is_deleted": {"$ne": True}}),
+        "draft": await db.stores.count_documents({"status": "draft", "is_deleted": {"$ne": True}}),
+    }
+
+    return {"stores": stores, "total": total, "page": page, "stats": stats}
+
+
+@router.get("/admin/storefronts/{store_id}")
+async def admin_get_storefront(store_id: str, request: Request):
+    """Get full details of a storefront for admin review."""
+    await get_admin_user(request)
+
+    s = await db.stores.find_one({"store_id": store_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(404, "Store not found")
+
+    m = await db.merchants.find_one({"merchant_id": s["merchant_id"]}, {"email": 1, "business_name": 1, "full_name": 1, "kyb_status": 1})
+    s["merchant_email"] = (m or {}).get("email", "—")
+    s["merchant_name"] = (m or {}).get("business_name") or (m or {}).get("full_name", "—")
+    s["merchant_kyb"] = (m or {}).get("kyb_status", "—")
+    s["product_count"] = await db.products.count_documents({"store_id": store_id})
+    s["order_count"] = await db.store_orders.count_documents({"store_id": store_id})
+    s["pending_orders"] = await db.store_orders.count_documents({"store_id": store_id, "order_status": "pending"})
+    agg = await db.store_orders.aggregate([
+        {"$match": {"store_id": store_id, "payment_status": "paid"}},
+        {"$group": {"_id": None, "total": {"$sum": "$total_kobo"}}}
+    ]).to_list(1)
+    s["revenue_kobo"] = agg[0]["total"] if agg else 0
+    return s
+
+
+@router.post("/admin/storefronts/{store_id}/action")
+async def admin_storefront_action(store_id: str, request: Request):
+    """
+    Admin actions: suspend | unsuspend | flag | review | clear_flag
+    Body: {action, reason}
+    """
+    admin = await get_admin_user(request)
+    admin_email = admin.get("email", "admin")
+
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    reason = (body.get("reason") or "").strip()
+
+    VALID_ACTIONS = {"suspend", "unsuspend", "flag", "review", "clear_flag"}
+    if action not in VALID_ACTIONS:
+        raise HTTPException(400, f"action must be one of: {', '.join(VALID_ACTIONS)}")
+
+    s = await db.stores.find_one({"store_id": store_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(404, "Store not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    update: dict = {"updated_at": now}
+
+    if action == "suspend":
+        update["status"] = "suspended"
+        update["admin_suspension_reason"] = reason
+        update["admin_suspended_at"] = now
+        update["admin_suspended_by"] = admin_email
+    elif action == "unsuspend":
+        update["status"] = "published"
+        update["admin_suspension_reason"] = None
+        update["admin_suspended_at"] = None
+    elif action == "flag":
+        update["admin_flag"] = reason or "Flagged for review"
+        update["admin_flagged_at"] = now
+        update["admin_flagged_by"] = admin_email
+    elif action == "review":
+        update["admin_review_status"] = "under_review"
+        update["admin_review_note"] = reason
+        update["admin_review_at"] = now
+        update["admin_review_by"] = admin_email
+    elif action == "clear_flag":
+        update["admin_flag"] = None
+        update["admin_review_status"] = "cleared"
+
+    await db.stores.update_one({"store_id": store_id}, {"$set": update})
+    logger.info(f"[ADMIN] Storefront {store_id} action={action} by {admin_email}")
+    return {"ok": True, "action": action, "store_id": store_id}
+

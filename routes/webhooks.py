@@ -74,6 +74,76 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+async def _confirm_storefront_order(order_id: str, session_id: str):
+    """Update storefront order to paid and atomically commit inventory."""
+    try:
+        order = await db.store_orders.find_one({"order_id": order_id})
+        if not order:
+            logger.warning(f"[STOREFRONT] Order not found for confirmation: {order_id}")
+            return
+        if order.get("payment_status") == "paid":
+            logger.info(f"[STOREFRONT] Order already paid (idempotent): {order_id}")
+            return
+        now_ts = datetime.now(timezone.utc).isoformat()
+        await db.store_orders.update_one(
+            {"order_id": order_id, "payment_status": {"$ne": "paid"}},  # idempotent
+            {"$set": {"payment_status": "paid", "order_status": "processing",
+                      "checkout_session_id": session_id, "paid_at": now_ts, "updated_at": now_ts}}
+        )
+        # Commit reserved inventory (deduct reserved AND actual quantity)
+        for item in order.get("items", []):
+            pid = item.get("product_id")
+            qty = item.get("quantity", 1)
+            vid = item.get("variant_id")
+            if vid:
+                await db.products.update_one(
+                    {"product_id": pid, "variants.variant_id": vid},
+                    {"$inc": {"variants.$.inventory_quantity": -qty,
+                              "variants.$.reserved_quantity": -qty}}
+                )
+            else:
+                await db.products.update_one(
+                    {"product_id": pid},
+                    {"$inc": {"inventory_quantity": -qty, "reserved_quantity": -qty}}
+                )
+        # Update customer total_spent
+        customer_email = (order.get("customer") or {}).get("email", "")
+        if customer_email:
+            await db.storefront_customers.update_one(
+                {"merchant_id": order["merchant_id"], "email": customer_email},
+                {"$inc": {"total_spent_kobo": order.get("total_kobo", 0)},
+                 "$set": {"last_order_at": now_ts}}
+            )
+        logger.info(f"[STOREFRONT] ✅ Order {order_id} confirmed paid, inventory committed")
+    except Exception as e:
+        logger.error(f"[STOREFRONT] confirm_order failed for {order_id}: {e}")
+
+
+async def _confirm_payment_link_attempt(attempt_id: str, session_id: str):
+    """Update payment link attempt to paid."""
+    try:
+        attempt = await db.payment_link_attempts.find_one({"attempt_id": attempt_id})
+        if not attempt:
+            logger.warning(f"[PAYLINK] Attempt not found: {attempt_id}")
+            return
+        if attempt.get("status") == "paid":
+            logger.info(f"[PAYLINK] Attempt already paid (idempotent): {attempt_id}")
+            return
+        now_ts = datetime.now(timezone.utc).isoformat()
+        await db.payment_link_attempts.update_one(
+            {"attempt_id": attempt_id, "status": {"$ne": "paid"}},  # idempotent
+            {"$set": {"status": "paid", "checkout_session_id": session_id,
+                      "paid_at": now_ts, "updated_at": now_ts}}
+        )
+        link_id = attempt.get("link_id")
+        if link_id:
+            await db.payment_links.update_one({"link_id": link_id},
+                                               {"$inc": {"usage_count": 1}})
+        logger.info(f"[PAYLINK] ✅ Attempt {attempt_id} confirmed paid")
+    except Exception as e:
+        logger.error(f"[PAYLINK] confirm_attempt failed for {attempt_id}: {e}")
+
+
 async def _track_nip_inward_cost(txn_id: str, user_id: str, amount_ngn: float):
     """Track NIP Inward Commission cost absorbed by Bompay for nightly auto-balance."""
     try:
@@ -425,6 +495,14 @@ async def safehaven_webhook(request: Request):
                         }}
                     )
                     logger.info(f"[CHECKOUT] ✅ Session {session['session_id']} marked PAID ₦{amount}")
+                    # ── Trigger source record update ──────────────────────
+                    _meta = (session.get("metadata") or {})
+                    _src_type = _meta.get("source_type")
+                    _src_id = _meta.get("source_id")
+                    if _src_type == "storefront" and _src_id:
+                        asyncio.create_task(_confirm_storefront_order(_src_id, session["session_id"]))
+                    elif _src_type == "payment_link" and _src_id:
+                        asyncio.create_task(_confirm_payment_link_attempt(_src_id, session["session_id"]))
                 elif is_success and not data.get("isReversed") and amt_kobo_paid != expected_kobo:
                     # Under/over payment — flag for manual review
                     await db.checkout_sessions.update_one(

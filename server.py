@@ -123,14 +123,14 @@ from routes import (
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business, cards, merchant, checkout,
+    push, epos, promotions, family, business, cards, merchant, checkout, chat,
 )
 
 for mod in [
     auth, wallet, transfers, transactions, vas,
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business, cards, merchant, checkout,
+    push, epos, promotions, family, business, cards, merchant, checkout, chat,
 ]:
     app.include_router(mod.router, prefix="/api")
 
@@ -161,7 +161,34 @@ async def startup():
     await db.checkout_sessions.create_index("sh_virtual_account_id", sparse=True)
     # Merchant fee rules
     await db.merchant_fee_rules.create_index("service", unique=True)
+    # Chat sessions
+    await db.chat_sessions.create_index("session_id", unique=True)
+    await db.chat_sessions.create_index([("status", 1), ("last_message_at", -1)])
+    await db.chat_messages.create_index([("session_id", 1), ("created_at", 1)])
     await db.support_messages.create_index([("ticket_id", 1), ("created_at", 1)])
+    # Storefront
+    await db.stores.create_index("store_id", unique=True)
+    await db.stores.create_index([("merchant_id", 1), ("is_deleted", 1)])
+    await db.stores.create_index("slug", unique=True, sparse=True)
+    await db.products.create_index("product_id", unique=True)
+    await db.products.create_index([("store_id", 1), ("status", 1)])
+    await db.products.create_index([("store_id", 1), ("slug", 1)], unique=True, sparse=True)
+    await db.store_orders.create_index("order_id", unique=True)
+    await db.store_orders.create_index([("merchant_id", 1), ("created_at", -1)])
+    await db.store_orders.create_index([("store_id", 1), ("payment_status", 1)])
+    await db.store_orders.create_index("checkout_session_id", sparse=True)
+    # Payment Links
+    await db.payment_links.create_index("link_id", unique=True)
+    await db.payment_links.create_index("code", unique=True)
+    await db.payment_links.create_index([("merchant_id", 1), ("status", 1)])
+    await db.payment_link_attempts.create_index("attempt_id", unique=True)
+    await db.payment_link_attempts.create_index([("link_id", 1), ("status", 1)])
+    await db.payment_link_attempts.create_index("checkout_session_id", sparse=True)
+    # Storefront customers
+    await db.storefront_customers.create_index([("merchant_id", 1), ("email", 1)], unique=True, sparse=True)
+    # Discount codes
+    await db.discount_codes.create_index([("store_id", 1), ("code", 1)], unique=True)
+    await db.discount_codes.create_index([("store_id", 1), ("is_active", 1)])
     await db.ajo_groups.create_index("invite_code", unique=True, sparse=True)
     await db.ajo_groups.create_index([("creator_id", 1), ("status", 1)])
     await db.ajo_members.create_index([("group_id", 1), ("user_id", 1)], unique=True)
@@ -348,6 +375,26 @@ async def startup():
             "max_fee_kobo": 0,
             "is_active": False,
             "description": "Inbound credit to merchant virtual account (no fee by default)",
+        },
+        {
+            "service": "STOREFRONT",
+            "fee_type": "FLAT_PLUS_PCT",
+            "flat_kobo": 5000,       # ₦50 flat
+            "percentage": 1.0,
+            "min_fee_kobo": 5000,
+            "max_fee_kobo": 300000,  # ₦3,000 cap
+            "is_active": True,
+            "description": "BOMPAY Storefront — per order checkout fee",
+        },
+        {
+            "service": "PAYMENT_LINK",
+            "fee_type": "FLAT_PLUS_PCT",
+            "flat_kobo": 0,
+            "percentage": 1.5,
+            "min_fee_kobo": 10000,   # ₦100 min
+            "max_fee_kobo": 500000,  # ₦5,000 cap
+            "is_active": True,
+            "description": "BOMPAY Payment Links — per transaction fee",
         },
     ]
     for fee in default_merchant_fees:

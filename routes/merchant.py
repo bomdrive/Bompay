@@ -1484,6 +1484,31 @@ async def admin_list_merchants(request: Request, page: int = 1, status: str = ""
     return {"merchants": merchants, "total": total, "page": page, "pages": -(-total // 20)}
 
 
+@router.get("/admin/merchants/daily-volume")
+async def admin_merchant_daily_volume(request: Request, days: int = 14):
+    """Daily transaction volume across the merchant platform for the chart."""
+    await _get_admin(request)
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone.utc)
+    results = []
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        date_prefix = d.strftime("%Y-%m-%d")
+        agg = await db.merchant_transactions.aggregate([
+            {"$match": {
+                "created_at": {"$gte": f"{date_prefix}T00:00:00", "$lt": f"{date_prefix}T23:59:59.999"},
+            }},
+            {"$group": {"_id": None, "volume": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+        ]).to_list(1)
+        v = agg[0] if agg else {"volume": 0, "count": 0}
+        results.append({
+            "date": d.strftime("%b %d"),
+            "volume_ngn": round(v["volume"] / 100, 2),
+            "count": v["count"],
+        })
+    return {"data": results, "days": days}
+
+
 @router.get("/admin/merchants/stats")
 async def admin_merchant_stats(request: Request):
     await _get_admin(request)
