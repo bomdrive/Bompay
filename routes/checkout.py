@@ -3,7 +3,7 @@ Bompay Checkout — Hosted Payment Sessions
 Prefix: /api/v1/checkout  (merchant API key auth — public read)
 Prefix: /api/admin/checkout  (admin-only)
 """
-import os, secrets, uuid, hashlib
+import os, secrets, uuid, hashlib, asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Optional
@@ -59,6 +59,12 @@ async def _get_merchant_by_api_key(request: Request) -> dict:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _get_settlement_account_id() -> str:
+    settings = await db.provider_settings.find_one({"provider": "safehaven"})
+    return (settings or {}).get("settlement_account_id", "") or \
+           os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
 
 
 def _validate_amount(amount_naira: float) -> int:
@@ -142,6 +148,110 @@ def _session_public(s: dict) -> dict:
     return {k: v for k, v in s.items() if k not in ("_id", "merchant_id", "webhook_payload")}
 
 
+# ─── SHARED POST-PAYMENT HELPERS ─────────────────────────────────────────────
+
+async def _inline_confirm_payment_link_attempt(attempt_id: str, session_id: str):
+    """Mark a payment link attempt as paid. Idempotent."""
+    try:
+        attempt = await db.payment_link_attempts.find_one({"attempt_id": attempt_id})
+        if not attempt or attempt.get("status") == "paid":
+            return
+        now_ts = _now()
+        await db.payment_link_attempts.update_one(
+            {"attempt_id": attempt_id, "status": {"$ne": "paid"}},
+            {"$set": {"status": "paid", "checkout_session_id": session_id,
+                      "paid_at": now_ts, "updated_at": now_ts}}
+        )
+        link_id = attempt.get("link_id")
+        if link_id:
+            await db.payment_links.update_one({"link_id": link_id}, {"$inc": {"usage_count": 1}})
+        logger.info(f"[CHECKOUT] PayLink attempt {attempt_id} confirmed paid via session={session_id}")
+    except Exception as e:
+        logger.error(f"[CHECKOUT] confirm payment link attempt failed: {e}")
+
+
+async def _inline_confirm_storefront_order(order_id: str, session_id: str):
+    """Mark a storefront order as paid. Idempotent."""
+    try:
+        order = await db.store_orders.find_one({"order_id": order_id})
+        if not order or order.get("payment_status") == "paid":
+            return
+        now_ts = _now()
+        await db.store_orders.update_one(
+            {"order_id": order_id},
+            {"$set": {
+                "payment_status": "paid",
+                "order_status": "processing",
+                "paid_at": now_ts,
+                "updated_at": now_ts,
+            }}
+        )
+        logger.info(f"[CHECKOUT] Storefront order {order_id} confirmed paid via session={session_id}")
+    except Exception as e:
+        logger.error(f"[CHECKOUT] confirm storefront order failed: {e}")
+
+
+async def _record_merchant_credit(session: dict, payment_method: str):
+    """
+    Record a CREDIT transaction entry for the merchant when payment is confirmed.
+    Used for Pay-with-Bompay and any other non-Safe-Haven payment path.
+    Idempotent via idempotency_key.
+    """
+    try:
+        session_id = session["session_id"]
+        merchant_id = session.get("merchant_id", "")
+        amount_kobo = session.get("amount_kobo", 0)
+        if not merchant_id or not amount_kobo:
+            return
+        idem_key = f"MERCHANT_CREDIT_{session_id}"
+        if await db.transactions.find_one({"idempotency_key": idem_key}):
+            logger.info(f"[CHECKOUT] Merchant credit already recorded for session={session_id}")
+            return
+        now_ts = _now()
+        _meta = session.get("metadata") or {}
+        await db.transactions.insert_one({
+            "transaction_id": f"TXN{secrets.token_hex(12).upper()}",
+            "idempotency_key": idem_key,
+            "merchant_id": merchant_id,
+            "type": "CHECKOUT_PAYMENT_RECEIPT",
+            "direction": "CREDIT",
+            "amount": amount_kobo,
+            "fee": 0,
+            "currency": "NGN",
+            "status": "COMPLETED",
+            "provider": payment_method,
+            "description": f"Payment received — {session.get('reference', session_id)}",
+            "metadata": {
+                "session_id": session_id,
+                "source_type": _meta.get("source_type", ""),
+                "source_id": _meta.get("source_id", ""),
+                "payment_method": payment_method,
+            },
+            "created_at": now_ts,
+            "updated_at": now_ts,
+        })
+        logger.info(f"[CHECKOUT] Merchant credit ₦{amount_kobo/100:.2f} recorded merchant={merchant_id} session={session_id}")
+    except Exception as e:
+        logger.error(f"[CHECKOUT] record_merchant_credit failed: {e}")
+
+
+async def _post_payment_tasks(session: dict, payment_method: str = "bompay_wallet"):
+    """
+    Fire-and-forget tasks after any payment confirmation.
+    1. Confirm storefront order or payment link attempt.
+    2. Record merchant credit transaction.
+    """
+    _meta = (session.get("metadata") or {})
+    src_type = _meta.get("source_type", "")
+    src_id = _meta.get("source_id", "")
+    session_id = session["session_id"]
+    if src_type == "storefront" and src_id:
+        await _inline_confirm_storefront_order(src_id, session_id)
+    elif src_type == "payment_link" and src_id:
+        await _inline_confirm_payment_link_attempt(src_id, session_id)
+    await _record_merchant_credit(session, payment_method)
+
+
 # ─── CHECKOUT SESSION ROUTES ──────────────────────────────────────────────────
 
 @router.post("/v1/checkout/sessions")
@@ -213,6 +323,62 @@ async def create_checkout_session(req: CreateSessionReq, request: Request):
         "reference": doc["reference"],
         "status": "pending",
     }
+
+
+@router.post("/v1/checkout/sessions/{session_id}/reprovision")
+async def reprovision_bank_transfer(session_id: str):
+    """
+    Retry Safe Haven virtual account creation for a pending session whose
+    bank_transfer account number is empty. Safe to call multiple times — idempotent.
+    """
+    s = await db.checkout_sessions.find_one({"session_id": session_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(404, "Checkout session not found")
+    if s.get("status") != "pending":
+        return {"account_number": s.get("sh_account_number", ""), "already_active": True}
+    if s.get("sh_account_number"):
+        return {"account_number": s["sh_account_number"], "bank_name": s.get("sh_bank_name"), "account_name": s.get("sh_account_name")}
+
+    # Retry VA creation
+    amount_naira = s.get("amount_naira", s.get("amount_kobo", 0) / 100.0)
+    external_ref = s.get("external_reference") or f"cs-{session_id}"
+    expires_in = 3600
+    settlement_id = await _get_settlement_account_id()
+    cb_url = (WEBHOOK_BASE_URL or "").rstrip("/") + "/api/webhooks/safehaven"
+    payload = {
+        "validFor": expires_in,
+        "amount": amount_naira,
+        "amountControl": "Fixed",
+        "externalReference": external_ref,
+    }
+    if cb_url and cb_url != "/api/webhooks/safehaven":
+        payload["callbackUrl"] = cb_url
+    if settlement_id:
+        payload["settlementAccount"] = {"_id": settlement_id}
+    try:
+        resp = await call_sh("POST", "/virtual-accounts", body=payload)
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        if data and data.get("accountNumber"):
+            update = {
+                "sh_virtual_account_id": data.get("_id", ""),
+                "sh_account_number": data.get("accountNumber", ""),
+                "sh_bank_name": data.get("bankName", "Safe Haven MFB"),
+                "sh_account_name": data.get("accountName", "Bompay Checkout"),
+                "external_reference": external_ref,
+                "updated_at": _now(),
+            }
+            await db.checkout_sessions.update_one({"session_id": session_id}, {"$set": update})
+            logger.info(f"[CHECKOUT] Reprovision success session={session_id} acct={update['sh_account_number']}")
+            return {"account_number": update["sh_account_number"], "bank_name": update["sh_bank_name"],
+                    "account_name": update["sh_account_name"]}
+        else:
+            logger.warning(f"[CHECKOUT] Reprovision: SH returned no accountNumber data={data}")
+            raise HTTPException(503, "Bank transfer is currently unavailable. Please use Pay with Bompay.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CHECKOUT] Reprovision exception: {e}")
+        raise HTTPException(503, "Bank transfer provisioning failed. Please use Pay with Bompay.")
 
 
 @router.get("/v1/checkout/sessions/{session_id}")
@@ -519,6 +685,7 @@ async def bompay_confirm(session_id: str, req: BompayConfirmReq):
             {"$set": {"status": "paid", "paid_at": now_ts, "updated_at": now_ts,
                       "payment_method": "bompay_wallet", "payer_user_id": user_id}}
         )
+        asyncio.create_task(_post_payment_tasks(session, "bompay_wallet"))
         return {"paid": True, "message": "Payment confirmed", "redirect_url": session.get("success_url", "")}
 
     # Debit wallet
@@ -572,6 +739,9 @@ async def bompay_confirm(session_id: str, req: BompayConfirmReq):
     await db.otp_sessions.delete_many({"type": "CHECKOUT_PAY", "scope": session_id})
 
     logger.info(f"[CHECKOUT PAY-BOMPAY] ✅ Paid session={session_id} ₦{amount_kobo/100:.2f} by user={user_id} txn={txn_id}")
+
+    # ── Post-payment tasks (confirm source record + merchant credit) ──────
+    asyncio.create_task(_post_payment_tasks(session, "bompay_wallet"))
 
     redirect_url = session.get("success_url", "")
     if redirect_url:

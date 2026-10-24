@@ -4984,3 +4984,103 @@ async def admin_storefront_action(store_id: str, request: Request):
     logger.info(f"[ADMIN] Storefront {store_id} action={action} by {admin_email}")
     return {"ok": True, "action": action, "store_id": store_id}
 
+
+
+
+# ─── ADMIN: PAYMENT LINKS CONTROLS ───────────────────────────────────────────
+
+@router.get("/admin/payment-links")
+async def admin_list_payment_links(
+    request: Request,
+    page: int = 1,
+    status: str = "",
+    link_type: str = "",
+    search: str = "",
+):
+    admin = await get_admin_user(request)
+
+    limit = 20
+    skip = (page - 1) * limit
+    filt: dict = {}
+    if status:
+        filt["status"] = status  # "active" or "inactive"
+    if link_type:
+        filt["link_type"] = link_type
+    if search:
+        filt["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"code": {"$regex": search, "$options": "i"}},
+        ]
+
+    total = await db.payment_links.count_documents(filt)
+    links = await db.payment_links.find(filt, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    for lnk in links:
+        m = await db.merchants.find_one({"merchant_id": lnk["merchant_id"]}, {"email": 1, "business_name": 1, "full_name": 1})
+        lnk["merchant_email"] = (m or {}).get("email", "—")
+        lnk["merchant_name"] = (m or {}).get("business_name") or (m or {}).get("full_name", "—")
+        lnk["attempt_count"] = await db.payment_link_attempts.count_documents({"link_id": lnk["link_id"]})
+        paid_agg = await db.payment_link_attempts.aggregate([
+            {"$match": {"link_id": lnk["link_id"], "status": "paid"}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}}}
+        ]).to_list(1)
+        lnk["paid_revenue_kobo"] = paid_agg[0]["total"] if paid_agg else 0
+        lnk["paid_count"] = await db.payment_link_attempts.count_documents({"link_id": lnk["link_id"], "status": "paid"})
+
+    stats = {
+        "total": await db.payment_links.count_documents({}),
+        "active": await db.payment_links.count_documents({"status": "active"}),
+        "inactive": await db.payment_links.count_documents({"status": "inactive"}),
+        "flagged": await db.payment_links.count_documents({"admin_flag": {"$exists": True, "$ne": None}}),
+    }
+    return {"links": links, "total": total, "page": page, "stats": stats}
+
+
+@router.post("/admin/payment-links/{link_id}/action")
+async def admin_payment_link_action(link_id: str, request: Request):
+    """
+    Admin actions: deactivate | activate | flag | clear_flag | review
+    """
+    admin = await get_admin_user(request)
+    admin_email = admin.get("email", "admin")
+
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    reason = (body.get("reason") or "").strip()
+
+    VALID_ACTIONS = {"deactivate", "activate", "flag", "clear_flag", "review"}
+    if action not in VALID_ACTIONS:
+        raise HTTPException(400, f"action must be one of: {', '.join(VALID_ACTIONS)}")
+
+    lnk = await db.payment_links.find_one({"link_id": link_id})
+    if not lnk:
+        raise HTTPException(404, "Payment link not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    update: dict = {"updated_at": now}
+
+    if action == "deactivate":
+        update["status"] = "inactive"
+        update["admin_deactivation_reason"] = reason
+        update["admin_deactivated_at"] = now
+        update["admin_deactivated_by"] = admin_email
+    elif action == "activate":
+        update["status"] = "active"
+        update["admin_deactivation_reason"] = None
+        update["admin_deactivated_at"] = None
+    elif action == "flag":
+        update["admin_flag"] = reason or "Flagged for review"
+        update["admin_flagged_at"] = now
+        update["admin_flagged_by"] = admin_email
+    elif action == "clear_flag":
+        update["admin_flag"] = None
+        update["admin_review_status"] = "cleared"
+    elif action == "review":
+        update["admin_review_status"] = "under_review"
+        update["admin_review_note"] = reason
+        update["admin_review_at"] = now
+        update["admin_review_by"] = admin_email
+
+    await db.payment_links.update_one({"link_id": link_id}, {"$set": update})
+    logger.info(f"[ADMIN] PayLink {link_id} action={action} by {admin_email}")
+    return {"ok": True, "action": action, "link_id": link_id}
