@@ -67,6 +67,52 @@ async def _get_settlement_account_id() -> str:
     return (settings or {}).get("settlement_account_id", "") or os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
 
 
+async def _resolve_settlement_account(raw_value: str) -> dict:
+    """
+    Convert the stored settlement value to the correct Safe Haven API field.
+    - If raw_value is a 10-digit Nigerian account number → resolve to _id via SH API and cache
+    - If raw_value is already a 24-char hex ObjectId → use as {"_id": raw_value}
+    - Returns a dict ready for settlementAccount payload, or {} if unresolvable.
+    """
+    if not raw_value:
+        return {}
+
+    # 24-char hex string = MongoDB ObjectId — use directly
+    if len(raw_value) == 24 and all(c in "0123456789abcdefABCDEF" for c in raw_value):
+        return {"_id": raw_value}
+
+    # 10-digit account number — look up the _id from Safe Haven
+    if raw_value.isdigit() and len(raw_value) == 10:
+        try:
+            r = await call_sh("GET", "/accounts", params={"accountNumber": raw_value})
+            data = r.get("data", [])
+            if isinstance(data, list) and data:
+                acct = data[0]
+            elif isinstance(data, dict):
+                acct = data
+            else:
+                acct = {}
+            resolved_id = acct.get("_id") or acct.get("id", "")
+            if resolved_id:
+                logger.info(f"[CHECKOUT] Resolved settlement account {raw_value} → _id={resolved_id[:12]}...")
+                # Cache the resolved _id so future calls skip this lookup
+                await db.provider_settings.update_one(
+                    {"provider": "safehaven"},
+                    {"$set": {"settlement_account_id": resolved_id}},
+                    upsert=True
+                )
+                return {"_id": resolved_id}
+            else:
+                logger.warning(f"[CHECKOUT] SH /accounts?accountNumber={raw_value} returned no _id — data={acct}")
+        except Exception as e:
+            logger.warning(f"[CHECKOUT] Settlement account lookup failed for {raw_value}: {e}")
+        # Fallback: try passing as accountNumber directly (some SH API versions accept this)
+        return {"accountNumber": raw_value}
+
+    # Unknown format — pass as-is and let Safe Haven reject with a clear error
+    return {"_id": raw_value}
+
+
 def _validate_amount(amount_naira: float) -> int:
     """Convert Naira float to integer kobo, rejecting invalid values."""
     try:
@@ -110,7 +156,9 @@ async def _create_sh_virtual_account(
 
     settlement_id = await _get_settlement_account_id()
     if settlement_id:
-        payload["settlementAccount"] = {"_id": settlement_id}
+        sa = await _resolve_settlement_account(settlement_id)
+        if sa:
+            payload["settlementAccount"] = sa
 
     try:
         resp = await call_sh("POST", "/virtual-accounts", body=payload)
@@ -347,7 +395,9 @@ async def reprovision_bank_transfer(session_id: str):
     if cb_url and cb_url != "/api/webhooks/safehaven":
         payload["callbackUrl"] = cb_url
     if settlement_id:
-        payload["settlementAccount"] = {"_id": settlement_id}
+        sa = await _resolve_settlement_account(settlement_id)
+        if sa:
+            payload["settlementAccount"] = sa
     try:
         resp = await call_sh("POST", "/virtual-accounts", body=payload)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
