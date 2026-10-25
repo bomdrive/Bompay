@@ -212,12 +212,25 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str,
         step1_vid = force_identity_id.strip()
         logger.info(f"[MERCHANT] Using admin-supplied identity ID for {merchant_id}")
 
-    # 2. Stored in KYB from a prior successful validation
+    # 2. Stored in KYB as sh_identity_id (from prior provisioning or from KYB OTP validation)
     if not step1_vid:
         stored = (kyb or {}).get("sh_identity_id", "").strip()
         if stored:
             step1_vid = stored
             logger.info(f"[MERCHANT] Reusing stored KYB sh_identity_id for {merchant_id}: {step1_vid[:16]}…")
+
+    # 2b. director_vid — stored by kyb_validate_identity OTP flow (same Safe Haven vID type)
+    if not step1_vid:
+        dvid = (kyb or {}).get("director_vid", "").strip()
+        if dvid:
+            step1_vid = dvid
+            # Persist to sh_identity_id so future lookups are consistent
+            await db.merchant_kyb.update_one(
+                {"merchant_id": merchant_id},
+                {"$set": {"sh_identity_id": dvid}},
+                upsert=True
+            )
+            logger.info(f"[MERCHANT] Reusing director_vid as identityId for {merchant_id}: {step1_vid[:16]}… (saved to sh_identity_id)")
 
     # 3. Existing merchant account _id
     if not step1_vid:
@@ -1433,14 +1446,21 @@ async def kyb_validate_identity(req: ValidateBVNRequest, request: Request):
     vid = await _validate_sh_identity(req.init_id, req.identity_type.upper(), req.otp)
     if not vid:
         raise HTTPException(400, "OTP validation failed. Check the code and try again.")
-    # Store vID in KYB record for later use during account provisioning
+    # Store vID in KYB record for later use during account provisioning.
+    # Saved as both director_vid (legacy field) AND sh_identity_id so provisioning
+    # can reuse it without re-validating BVN.
     now = now_utc()
     await db.merchant_kyb.update_one(
         {"merchant_id": m["merchant_id"]},
-        {"$set": {"director_vid": vid, "director_vid_type": req.identity_type.upper(), "vid_verified_at": now}},
+        {"$set": {
+            "director_vid": vid,
+            "director_vid_type": req.identity_type.upper(),
+            "vid_verified_at": now,
+            "sh_identity_id": vid,  # canonical field used by account provisioning
+        }},
         upsert=True
     )
-    logger.info(f"[KYB] vID stored for merchant {m['merchant_id']}")
+    logger.info(f"[KYB] vID stored (sh_identity_id + director_vid) for merchant {m['merchant_id']}")
     return {"verified": True, "message": "Identity verified successfully. Your BVN has been validated."}
 
 
@@ -1858,13 +1878,21 @@ async def admin_get_merchant_identity_info(merchant_id: str, request: Request):
     Used by admin panel to auto-fill the provision modal and avoid re-entering it.
     """
     await _get_admin(request)
-    kyb = await db.merchant_kyb.find_one({"merchant_id": merchant_id}, {"_id": 0, "sh_identity_id": 1, "rc_number": 1})
+    kyb = await db.merchant_kyb.find_one(
+        {"merchant_id": merchant_id},
+        {"_id": 0, "sh_identity_id": 1, "director_vid": 1, "rc_number": 1}
+    )
     acct = await db.merchant_accounts.find_one(
         {"merchant_id": merchant_id, "type": "primary", "sh_account_id": {"$nin": ["", None]}},
         {"_id": 0, "sh_account_id": 1}
     )
+    # Return sh_identity_id (canonical) falling back to director_vid (from KYB OTP flow)
+    identity_id = (
+        (kyb or {}).get("sh_identity_id", "").strip()
+        or (kyb or {}).get("director_vid", "").strip()
+    )
     return {
-        "sh_identity_id":   (kyb or {}).get("sh_identity_id", ""),
+        "sh_identity_id":   identity_id,
         "rc_number":        (kyb or {}).get("rc_number", ""),
         "existing_acct_id": (acct or {}).get("sh_account_id", ""),
     }
