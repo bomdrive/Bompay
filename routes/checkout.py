@@ -80,16 +80,22 @@ async def _build_settlement_account(merchant_id: str = "") -> dict:
     """
     # 1. Look up the merchant's own Safe Haven account number from their wallet
     if merchant_id:
-        wallet = await db.wallets.find_one(
-            {"user_id": merchant_id, "account_type": {"$in": ["corporate", "individual", "primary", None]}},
-            sort=[("created_at", 1)]
+        # Check merchant_accounts collection first (primary account with account number)
+        primary_acct = await db.merchant_accounts.find_one(
+            {"merchant_id": merchant_id, "type": "primary", "sh_account_number": {"$nin": ["", None]}}
         )
-        if not wallet:
-            # Try without account_type filter
-            wallet = await db.wallets.find_one({"user_id": merchant_id})
-
-        merchant_sh_acct = (wallet or {}).get("sh_account_number", "").strip()
-        merchant_bank_code = (wallet or {}).get("sh_bank_code", SAFEHAVEN_BANK_CODE).strip() or SAFEHAVEN_BANK_CODE
+        if primary_acct:
+            merchant_sh_acct   = primary_acct.get("sh_account_number", "").strip()
+            merchant_bank_code = primary_acct.get("bank_code", SAFEHAVEN_BANK_CODE).strip() or SAFEHAVEN_BANK_CODE
+        else:
+            wallet = await db.wallets.find_one(
+                {"user_id": merchant_id, "account_type": {"$in": ["corporate", "individual", "primary", None]}},
+                sort=[("created_at", 1)]
+            )
+            if not wallet:
+                wallet = await db.wallets.find_one({"user_id": merchant_id})
+            merchant_sh_acct   = (wallet or {}).get("sh_account_number", "").strip()
+            merchant_bank_code = (wallet or {}).get("sh_bank_code", SAFEHAVEN_BANK_CODE).strip() or SAFEHAVEN_BANK_CODE
 
         if merchant_sh_acct:
             logger.info(f"[CHECKOUT] Settlement → merchant account {merchant_sh_acct} (user={merchant_id[:8]}...)")
@@ -320,11 +326,19 @@ async def _create_settlement_record(session: dict, payment_method: str):
             fee_kobo = min(int(rule["max_fee_kobo"]), fee_kobo)
         net_kobo = max(0, amount_kobo - fee_kobo)
 
-        # Merchant bank account
-        wallet = await db.wallets.find_one({"user_id": merchant_id}) or {}
-        merchant_account = wallet.get("sh_account_number", "")
-        merchant_bank_code = wallet.get("sh_bank_code", os.environ.get("SAFEHAVEN_BANK_CODE", "090286"))
-        merchant_account_name = wallet.get("sh_account_name", "")
+        # Merchant bank account — check merchant_accounts first, fall back to wallets
+        primary_acct = await db.merchant_accounts.find_one(
+            {"merchant_id": merchant_id, "type": "primary", "sh_account_number": {"$nin": ["", None]}}
+        )
+        if primary_acct:
+            merchant_account      = primary_acct.get("sh_account_number", "")
+            merchant_bank_code    = primary_acct.get("bank_code", os.environ.get("SAFEHAVEN_BANK_CODE", "090286"))
+            merchant_account_name = primary_acct.get("sh_account_name", "")
+        else:
+            wallet = await db.wallets.find_one({"user_id": merchant_id}) or {}
+            merchant_account      = wallet.get("sh_account_number", "")
+            merchant_bank_code    = wallet.get("sh_bank_code", os.environ.get("SAFEHAVEN_BANK_CODE", "090286"))
+            merchant_account_name = wallet.get("sh_account_name", "")
 
         now_ts = _now()
         settlement_id = f"SL{secrets.token_hex(10).upper()}"
