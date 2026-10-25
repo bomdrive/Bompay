@@ -307,8 +307,27 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str,
         resp2       = await call_sh("POST", "/accounts/v2/subaccount", body=payload2)
         corp_result = await _parse(resp2)
         corp_result["external_reference"] = corp_ref
-        logger.info(f"[MERCHANT] Step2 corporate ✅ → {merchant_id}: acct={corp_result['sh_account_number'] or 'pending (async)'}")
+
+        # Detect silent failure: Safe Haven returned statusCode 200 but no account data
+        # e.g. {"statusCode": 200, "message": "No director match provided details"}
+        if not corp_result.get("sh_account_number") and not corp_result.get("sh_account_id"):
+            sh_msg = resp2.get("message") or ""
+            resp_data = resp2.get("data")
+            # If there is no data at all, this is a rejection, not async processing
+            if not resp_data:
+                logger.error(f"[MERCHANT] Step2 corporate REJECTED for {merchant_id}: {sh_msg} | full: {resp2}")
+                raise HTTPException(400,
+                    f"Safe Haven rejected corporate account creation: {sh_msg or 'No account data returned'}. "
+                    "This usually means the BVN does not match any director listed for this RC number. "
+                    "Please verify the RC number and director BVN with the merchant."
+                )
+            # Data present but no account number yet → genuine async
+            logger.info(f"[MERCHANT] Step2 async response for {merchant_id} — full body: {resp2}")
+
+        logger.info(f"[MERCHANT] Step2 corporate ✅ → {merchant_id}: acct={corp_result['sh_account_number'] or 'pending (async)'}, id={corp_result.get('sh_account_id') or 'none'}")
         return corp_result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[MERCHANT] Step2 corporate FAILED for {merchant_id} rc={rc_number}: {e}")
         raise HTTPException(400, f"Corporate account creation failed: {e}")
@@ -329,6 +348,7 @@ class MerchantRegister(BaseModel):
     business_name: str
     owner_name: str
     phone: str
+    rc_number: Optional[str] = ""
 
 class MerchantLogin(BaseModel):
     email: str
@@ -456,6 +476,7 @@ async def merchant_register(req: MerchantRegister, response: Response):
         "business_name": req.business_name,
         "owner_name": req.owner_name,
         "phone": req.phone,
+        "rc_number": (req.rc_number or "").strip(),
         "mode": "sandbox",
         "status": "active",
         "kyb_status": "pending",
@@ -473,6 +494,14 @@ async def merchant_register(req: MerchantRegister, response: Response):
         "updated_at": now,
     }
     await db.merchants.insert_one(merchant_doc)
+
+    # Persist RC number to merchant_kyb immediately so it's available during provisioning
+    if (req.rc_number or "").strip():
+        await db.merchant_kyb.update_one(
+            {"merchant_id": merchant_id},
+            {"$set": {"merchant_id": merchant_id, "rc_number": req.rc_number.strip()}},
+            upsert=True
+        )
 
     # Create primary Safe Haven virtual account
     sh = await _create_sh_subaccount(merchant_doc, req.business_name)
@@ -1888,6 +1917,128 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
         "pending": False,
     }
 
+
+
+@router.post("/admin/merchants/{merchant_id}/sync-account")
+async def admin_sync_merchant_account(merchant_id: str, request: Request):
+    """
+    Sync a pending merchant account from Safe Haven.
+    1. Calls Safe Haven account list to find any account matching this merchant.
+    2. If found, updates the pending record in DB.
+    Also accepts body { account_number, account_id } for manual admin override.
+    """
+    await _get_admin(request)
+    m = await db.merchants.find_one({"merchant_id": merchant_id})
+    if not m:
+        raise HTTPException(404, "Merchant not found")
+
+    # Accept optional manual override from admin
+    body_data: dict = {}
+    try:
+        body_data = await request.json()
+    except Exception:
+        pass
+    manual_acct_number = (body_data.get("account_number") or "").strip()
+    manual_acct_id     = (body_data.get("account_id") or "").strip()
+
+    # Find the pending merchant account record
+    pending = await db.merchant_accounts.find_one({"merchant_id": merchant_id, "type": "primary"})
+    if not pending:
+        raise HTTPException(404, "No primary account record found. Provision first.")
+    if pending.get("sh_account_number"):
+        return {
+            "message": "Account already has a number",
+            "account_number": pending["sh_account_number"],
+            "synced": False,
+        }
+
+    now = now_utc()
+
+    # ── Manual override: admin pasted the account number/ID directly ────────────
+    if manual_acct_number:
+        await db.merchant_accounts.update_one(
+            {"merchant_id": merchant_id, "type": "primary"},
+            {"$set": {
+                "sh_account_number": manual_acct_number,
+                "sh_account_id":     manual_acct_id or pending.get("sh_account_id", ""),
+                "provisioned_at":    now,
+            }}
+        )
+        logger.info(f"[ADMIN] Manual account number set for {merchant_id}: {manual_acct_number}")
+        return {
+            "message": f"Account number set manually: {manual_acct_number}",
+            "account_number": manual_acct_number,
+            "synced": True,
+            "source": "manual",
+        }
+
+    # ── Auto-sync: poll Safe Haven account list ──────────────────────────────────
+    ext_ref = pending.get("external_reference", "")
+    business_name = (m.get("business_name") or "").lower().strip()
+
+    try:
+        result = await call_sh("GET", "/accounts?page=1&limit=100")
+        accounts_raw = result.get("data", [])
+        if not isinstance(accounts_raw, list):
+            accounts_raw = (result.get("data") or {}).get("data", []) if isinstance(result.get("data"), dict) else []
+
+        # Build search keywords: email prefix, business name words
+        email = (m.get("email") or "").lower()
+        email_prefix = email.split("@")[0] if "@" in email else email  # e.g. "brivo360"
+        biz_words = [w.lower() for w in business_name.split() if len(w) > 3]  # e.g. ["elcalssico"]
+
+        found = None
+        for a in accounts_raw:
+            sh_ext = (a.get("externalReference") or a.get("external_reference") or "").strip()
+            sh_name = (a.get("accountName") or a.get("account_name") or "").lower()
+            acct_no = a.get("accountNumber") or a.get("virtualAccountNumber") or ""
+            if not acct_no:
+                continue
+            # Priority 1: external reference (most reliable)
+            if ext_ref and sh_ext and (sh_ext == ext_ref or ext_ref in sh_ext or sh_ext in ext_ref):
+                found = a
+                logger.info(f"[ADMIN] SH sync: matched by ext_ref for {merchant_id}: {acct_no}")
+                break
+            # Priority 2: email prefix in account name (e.g. "brivo360" in "BRIVO360")
+            if email_prefix and len(email_prefix) >= 4 and email_prefix in sh_name:
+                found = a
+                logger.info(f"[ADMIN] SH sync: matched by email prefix '{email_prefix}' for {merchant_id}: {acct_no}")
+            # Priority 3: business name words
+            elif biz_words and any(w in sh_name for w in biz_words):
+                if not found:
+                    found = a
+                    logger.info(f"[ADMIN] SH sync: matched by biz name for {merchant_id}: {acct_no}")
+
+        if found:
+            acct_no  = found.get("accountNumber") or found.get("virtualAccountNumber") or ""
+            acct_id  = found.get("_id") or found.get("id") or pending.get("sh_account_id", "")
+            acct_nm  = found.get("accountName") or pending.get("sh_account_name", "")
+            await db.merchant_accounts.update_one(
+                {"merchant_id": merchant_id, "type": "primary"},
+                {"$set": {
+                    "sh_account_number": acct_no,
+                    "sh_account_id":     acct_id,
+                    "sh_account_name":   acct_nm,
+                    "provisioned_at":    now,
+                }}
+            )
+            logger.info(f"[ADMIN] SH sync successful for {merchant_id}: {acct_no}")
+            return {
+                "message": f"Account synced from Safe Haven: {acct_no}",
+                "account_number": acct_no,
+                "synced": True,
+                "source": "safehaven_api",
+            }
+
+        return {
+            "message": "Account not found in Safe Haven yet. Safe Haven may still be processing. Try again in a minute or enter the account number manually.",
+            "account_number": "",
+            "synced": False,
+            "source": "safehaven_api",
+        }
+    except Exception as e:
+        logger.error(f"[ADMIN] SH sync error for {merchant_id}: {e}")
+        raise HTTPException(502, f"Safe Haven sync failed: {e}")
 
 
 @router.get("/admin/merchants/{merchant_id}/identity-info")
