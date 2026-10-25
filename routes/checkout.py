@@ -67,25 +67,57 @@ async def _get_settlement_account_id() -> str:
     return (settings or {}).get("settlement_account_id", "") or os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "")
 
 
-async def _build_settlement_account() -> dict:
+async def _build_settlement_account(merchant_id: str = "") -> dict:
     """
-    Build the settlementAccount object Safe Haven expects for virtual account creation.
-    Safe Haven format: {"bankCode": "090286", "accountNumber": "0113360778"}
-    
-    - accountNumber comes from settlement_account_id setting (falls back to main account_number)
-    - bankCode defaults to Safe Haven MFB (090286) for internal accounts; override via settlement_bank_code
-    """
-    settings = await db.provider_settings.find_one({"provider": "safehaven"}) or {}
+    Build the settlementAccount for a checkout virtual account.
 
-    account_number = (settings.get("settlement_account_id") or "").strip() or \
-                     (settings.get("account_number") or "").strip() or \
-                     os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "").strip()
+    Settlement goes to the MERCHANT's own Safe Haven primary account so the customer's
+    payment lands directly in the merchant's wallet. BOMPAY's fee is collected separately
+    via the fee engine.
+
+    Falls back to the platform's configured settlement account only when the merchant
+    has no Safe Haven account yet (e.g. pending KYB).
+    """
+    # 1. Look up the merchant's own Safe Haven account number from their wallet
+    if merchant_id:
+        wallet = await db.wallets.find_one(
+            {"user_id": merchant_id, "account_type": {"$in": ["corporate", "individual", "primary", None]}},
+            sort=[("created_at", 1)]
+        )
+        if not wallet:
+            # Try without account_type filter
+            wallet = await db.wallets.find_one({"user_id": merchant_id})
+
+        merchant_sh_acct = (wallet or {}).get("sh_account_number", "").strip()
+        merchant_bank_code = (wallet or {}).get("sh_bank_code", SAFEHAVEN_BANK_CODE).strip() or SAFEHAVEN_BANK_CODE
+
+        if merchant_sh_acct:
+            logger.info(f"[CHECKOUT] Settlement → merchant account {merchant_sh_acct} (user={merchant_id[:8]}...)")
+            return {"bankCode": merchant_bank_code, "accountNumber": merchant_sh_acct}
+
+        logger.warning(f"[CHECKOUT] Merchant {merchant_id[:8]} has no Safe Haven account — falling back to platform settlement")
+
+    # 2. Fallback: platform-level settlement account from provider_settings
+    settings = await db.provider_settings.find_one({"provider": "safehaven"}) or {}
+    raw_settlement = (settings.get("settlement_account_id") or "").strip()
+    main_acct = (settings.get("account_number") or "").strip() or \
+                os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "").strip()
+
+    # Accept only 10-digit account numbers; discard ObjectId-style cached values
+    if raw_settlement.isdigit() and 7 <= len(raw_settlement) <= 12:
+        account_number = raw_settlement
+    else:
+        if raw_settlement:
+            await db.provider_settings.update_one(
+                {"provider": "safehaven"}, {"$unset": {"settlement_account_id": ""}}
+            )
+        account_number = main_acct
 
     if not account_number:
         return {}
 
     bank_code = (settings.get("settlement_bank_code") or "").strip() or \
-                os.environ.get("SAFEHAVEN_BANK_CODE", "090286")
+                os.environ.get("SAFEHAVEN_BANK_CODE", SAFEHAVEN_BANK_CODE)
 
     return {"bankCode": bank_code, "accountNumber": account_number}
 
@@ -136,7 +168,7 @@ async def _create_sh_virtual_account(
     if cb_url and cb_url != "/api/webhooks/safehaven":
         payload["callbackUrl"] = cb_url
 
-    sa = await _build_settlement_account()
+    sa = await _build_settlement_account(merchant_id)
     if sa:
         payload["settlementAccount"] = sa
         logger.info(f"[CHECKOUT] Using settlementAccount bankCode={sa.get('bankCode')} acct={sa.get('accountNumber')}")
@@ -374,7 +406,7 @@ async def reprovision_bank_transfer(session_id: str):
     }
     if cb_url and cb_url != "/api/webhooks/safehaven":
         payload["callbackUrl"] = cb_url
-    sa = await _build_settlement_account()
+    sa = await _build_settlement_account(s.get("merchant_id", ""))
     if sa:
         payload["settlementAccount"] = sa
         logger.info(f"[CHECKOUT] Reprovision settlementAccount bankCode={sa.get('bankCode')} acct={sa.get('accountNumber')}")
