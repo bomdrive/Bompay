@@ -276,7 +276,7 @@ async def payment_link_analytics(link_id: str, request: Request, days: int = 30)
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     attempts = await db.payment_link_attempts.find(
         {"link_id": link_id, "created_at": {"$gte": since}}, {"_id": 0}
-    ).to_list(1000)
+    ).sort("updated_at", -1).to_list(1000)
 
     paid = [a for a in attempts if a.get("status") == "paid"]
     total_revenue = sum(a.get("amount_kobo", 0) for a in paid)
@@ -286,6 +286,7 @@ async def payment_link_analytics(link_id: str, request: Request, days: int = 30)
         st = a.get("status", "pending")
         statuses[st] = statuses.get(st, 0) + 1
 
+    # Return most recent 20 — paid first (sorted by updated_at DESC so just-paid appear at top)
     return {
         "link_id": link_id,
         "days": days,
@@ -295,7 +296,7 @@ async def payment_link_analytics(link_id: str, request: Request, days: int = 30)
         "total_revenue_kobo": total_revenue,
         "avg_amount_kobo": total_revenue // len(paid) if paid else 0,
         "status_breakdown": statuses,
-        "recent_attempts": attempts[-20:],
+        "recent_attempts": attempts[:20],
     }
 
 

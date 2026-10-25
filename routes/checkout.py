@@ -258,21 +258,21 @@ async def _record_merchant_credit(session: dict, payment_method: str):
         if not merchant_id or not amount_kobo:
             return
         idem_key = f"MERCHANT_CREDIT_{session_id}"
-        if await db.transactions.find_one({"idempotency_key": idem_key}):
+        if await db.merchant_transactions.find_one({"idempotency_key": idem_key}):
             logger.info(f"[CHECKOUT] Merchant credit already recorded for session={session_id}")
             return
         now_ts = _now()
         _meta = session.get("metadata") or {}
-        await db.transactions.insert_one({
+        await db.merchant_transactions.insert_one({
             "transaction_id": f"TXN{secrets.token_hex(12).upper()}",
             "idempotency_key": idem_key,
             "merchant_id": merchant_id,
-            "type": "CHECKOUT_PAYMENT_RECEIPT",
+            "type": "CHECKOUT_PAYMENT",
             "direction": "CREDIT",
             "amount": amount_kobo,
             "fee": 0,
             "currency": "NGN",
-            "status": "COMPLETED",
+            "status": "success",
             "provider": payment_method,
             "description": f"Payment received — {session.get('reference', session_id)}",
             "metadata": {
@@ -280,6 +280,7 @@ async def _record_merchant_credit(session: dict, payment_method: str):
                 "source_type": _meta.get("source_type", ""),
                 "source_id": _meta.get("source_id", ""),
                 "payment_method": payment_method,
+                "customer": session.get("customer_info", {}),
             },
             "created_at": now_ts,
             "updated_at": now_ts,
