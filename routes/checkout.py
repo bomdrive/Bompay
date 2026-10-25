@@ -270,6 +270,7 @@ async def _record_merchant_credit(session: dict, payment_method: str):
         now_ts = _now()
         _meta = session.get("metadata") or {}
         source_type = _meta.get("source_type", "checkout")
+        session_mode = session.get("mode", "sandbox")
         await db.merchant_transactions.insert_one({
             "transaction_id": f"TXN{secrets.token_hex(12).upper()}",
             "idempotency_key": idem_key,
@@ -280,6 +281,7 @@ async def _record_merchant_credit(session: dict, payment_method: str):
             "fee": 0,
             "currency": "NGN",
             "status": "pending_settlement",
+            "mode": session_mode,
             "provider": payment_method,
             "description": f"Payment received — awaiting settlement",
             "metadata": {
