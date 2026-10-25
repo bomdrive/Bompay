@@ -695,13 +695,18 @@ async def get_merchant_account(account_id: str, request: Request):
 # ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
 
 @router.get("/v1/merchant/transactions")
-async def merchant_transactions(request: Request, page: int = 1, limit: int = 20):
+async def merchant_transactions(request: Request, page: int = 1, limit: int = 20, status: str = "", direction: str = ""):
     m = await get_current_merchant(request)
     skip = (page - 1) * limit
+    filt: dict = {"merchant_id": m["merchant_id"]}
+    if status:
+        filt["status"] = status
+    if direction:
+        filt["direction"] = direction
     txns = await db.merchant_transactions.find(
-        {"merchant_id": m["merchant_id"]}, {"_id": 0}
+        filt, {"_id": 0}
     ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-    total = await db.merchant_transactions.count_documents({"merchant_id": m["merchant_id"]})
+    total = await db.merchant_transactions.count_documents(filt)
     return {"transactions": txns, "total": total, "page": page, "pages": -(-total // limit)}
 
 
