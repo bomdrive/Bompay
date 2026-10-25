@@ -171,23 +171,31 @@ async def _track_nip_inward_cost(txn_id: str, user_id: str, amount_ngn: float):
 
 @router.post("/webhooks/safehaven")
 async def safehaven_webhook(request: Request):
-    event = await request.json()
+    try:
+        event = await request.json()
+    except Exception as je:
+        logger.warning(f"[SH-WEBHOOK] Malformed JSON body: {je}")
+        return {"received": True}
+
     event_type = event.get("eventType") or event.get("type", "")
-    data = event.get("data", {})
+    data = event.get("data", {}) or {}
     eid = data.get("_id") or str(uuid.uuid4())
 
     # ── Full payload log ──────────────────────────────────────────────
-    debit_acct  = data.get("debitAccountNumber") or data.get("debitAccount", "")
-    credit_acct = data.get("creditAccountNumber") or data.get("creditAccount", "")
-    pay_ref     = data.get("paymentReference", "")
-    logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} "
-                f"acct={credit_acct or debit_acct} amt={data.get('amount')} "
-                f"status={data.get('status')!r} sessionId={data.get('sessionId')}")
+    try:
+        debit_acct  = data.get("debitAccountNumber") or data.get("debitAccount", "")
+        credit_acct = data.get("creditAccountNumber") or data.get("creditAccount", "")
+        pay_ref     = data.get("paymentReference", "")
+        logger.info(f"[SH-WEBHOOK] eventType={event_type!r} eid={eid} "
+                    f"acct={credit_acct or debit_acct} amt={data.get('amount')} "
+                    f"status={data.get('status')!r} sessionId={data.get('sessionId')}")
 
-    # ── Idempotent store ──────────────────────────────────────────────
-    await db.webhooks.update_one({"event_id": eid},
-        {"$setOnInsert": {"event_id": eid, "event": event, "event_type": event_type,
-                          "received_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+        # ── Idempotent store ──────────────────────────────────────────────
+        await db.webhooks.update_one({"event_id": eid},
+            {"$setOnInsert": {"event_id": eid, "event": event, "event_type": event_type,
+                              "received_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+    except Exception as log_err:
+        logger.error(f"[SH-WEBHOOK] Error in initial processing for {event_type!r}: {log_err}")
 
     # ── Forward to production server (Safe Haven callbackUrl still points here) ──
     prod_url = os.environ.get("WEBHOOK_FORWARD_URL", "")
@@ -206,6 +214,7 @@ async def safehaven_webhook(request: Request):
     # Safe Haven sends eventType="account.credit" OR type="virtualAccount.transfer"
     credit_events = {"account.credit", "virtualaccount.transfer", "virtualAccount.transfer",
                      "account_credit", "credit", "wallet.credit"}
+    is_success = False  # default; set inside credit-events block
     if event_type.lower() in {e.lower() for e in credit_events}:
         credit_acct_num = data.get("creditAccountNumber")
         amount_raw = data.get("amount", 0)
@@ -524,20 +533,20 @@ async def safehaven_webhook(request: Request):
             except Exception as ce:
                 logger.error(f"[CHECKOUT] Session update failed for ext_ref={ext_ref}: {ce}")
 
-    if not is_success:
-        logger.info(f"[SH-WEBHOOK] credit conditions not met: is_success={is_success} "
-                    f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
+        if not is_success:
+            logger.info(f"[SH-WEBHOOK] credit event but conditions not met: is_success={is_success} "
+                        f"isReversed={data.get('isReversed')} amount={amount} acct={credit_acct_num}")
 
     # ── Transfer reversal ─────────────────────────────────────────────
-    elif event_type.lower() in ("transfer.reversal", "transfer.reversed", "debit.reversal",
-                                "account.debit.reversal"):
+    if event_type.lower() in ("transfer.reversal", "transfer.reversed", "debit.reversal",
+                              "account.debit.reversal"):
         await _handle_sh_transfer_reversal(data, eid)
 
     # ── Transfer failed ───────────────────────────────────────────────
     elif event_type.lower() in ("transfer.failed", "transfer.declined"):
         await _handle_sh_transfer_failure(data, eid)
 
-    else:
+    elif event_type.lower() not in {e.lower() for e in credit_events}:
         # Suppress noisy "unhandled" for known internal service account debit events
         # (VAS bucket, cashback, referral, fees) — these are expected and don't need wallet action
         debit_acct_num = data.get("debitAccountNumber", "")

@@ -276,12 +276,8 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str,
         logger.warning(f"[MERCHANT] No RC number — returning individual account for {merchant['merchant_id']}")
         return step1_result
 
-    logger.warning(f"[MERCHANT] All SH sub-account attempts failed for {merchant['merchant_id']}")
-    return {
-        "sh_account_id": "", "sh_account_number": "",
-        "sh_account_name": label, "bank_name": "Safe Haven MFB",
-        "bank_code": "090286", "external_reference": external_ref,
-    }
+    logger.error(f"[MERCHANT] All SH sub-account attempts failed for {merchant['merchant_id']} — no step1_vid, no rc_number match")
+    raise HTTPException(400, "Could not create a corporate account. If BVN rate limit was hit (429), please wait 24 hours and retry. You can also enter the Safe Haven identity ID manually in the provision modal.")
 
 
 async def _create_sh_subaccount(merchant: dict, label: str) -> dict:
@@ -1785,6 +1781,10 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
 
     sh = await _create_sh_corporate_subaccount(m, kyb, m.get("business_name", "Primary"), force_identity_id=identity_id_override)
     now = now_utc()
+
+    # Safety check — never save an empty account number
+    if not sh.get("sh_account_number") and not sh.get("sh_account_id"):
+        raise HTTPException(400, "Provisioning returned no account details. Safe Haven may need more time — retry in a few seconds, or wait 24 hours if the BVN rate limit was hit.")
     acct_update = {
         "sh_account_id": sh["sh_account_id"],
         "sh_account_number": sh["sh_account_number"],
