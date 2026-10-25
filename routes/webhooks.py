@@ -67,6 +67,7 @@ from core import (  # noqa: F401,F403,F405
     _handle_sh_transfer_reversal,
     _handle_sh_transfer_failure,
 )
+from routes.checkout import _record_merchant_credit
 
 import ledger as pg_ledger
 
@@ -503,6 +504,10 @@ async def safehaven_webhook(request: Request):
                         asyncio.create_task(_confirm_storefront_order(_src_id, session["session_id"]))
                     elif _src_type == "payment_link" and _src_id:
                         asyncio.create_task(_confirm_payment_link_attempt(_src_id, session["session_id"]))
+                    # ── Record merchant credit + create settlement record ──
+                    paid_session = dict(session)
+                    paid_session["status"] = "paid"
+                    asyncio.create_task(_record_merchant_credit(paid_session, "bank_transfer"))
                 elif is_success and not data.get("isReversed") and amt_kobo_paid != expected_kobo:
                     # Under/over payment — flag for manual review
                     await db.checkout_sessions.update_one(
