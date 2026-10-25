@@ -248,7 +248,7 @@ async def _inline_confirm_storefront_order(order_id: str, session_id: str):
 async def _record_merchant_credit(session: dict, payment_method: str):
     """
     Record a CREDIT transaction entry for the merchant when payment is confirmed.
-    Used for Pay-with-Bompay and any other non-Safe-Haven payment path.
+    Status starts as 'pending_settlement' — updated to 'settled' when admin settles.
     Idempotent via idempotency_key.
     """
     try:
@@ -263,6 +263,7 @@ async def _record_merchant_credit(session: dict, payment_method: str):
             return
         now_ts = _now()
         _meta = session.get("metadata") or {}
+        source_type = _meta.get("source_type", "checkout")
         await db.merchant_transactions.insert_one({
             "transaction_id": f"TXN{secrets.token_hex(12).upper()}",
             "idempotency_key": idem_key,
@@ -272,12 +273,12 @@ async def _record_merchant_credit(session: dict, payment_method: str):
             "amount": amount_kobo,
             "fee": 0,
             "currency": "NGN",
-            "status": "success",
+            "status": "pending_settlement",
             "provider": payment_method,
-            "description": f"Payment received — {session.get('reference', session_id)}",
+            "description": f"Payment received — awaiting settlement",
             "metadata": {
                 "session_id": session_id,
-                "source_type": _meta.get("source_type", ""),
+                "source_type": source_type,
                 "source_id": _meta.get("source_id", ""),
                 "payment_method": payment_method,
                 "customer": session.get("customer_info", {}),
@@ -286,8 +287,73 @@ async def _record_merchant_credit(session: dict, payment_method: str):
             "updated_at": now_ts,
         })
         logger.info(f"[CHECKOUT] Merchant credit ₦{amount_kobo/100:.2f} recorded merchant={merchant_id} session={session_id}")
+        # Create settlement record for admin to authorise
+        await _create_settlement_record(session, payment_method)
     except Exception as e:
         logger.error(f"[CHECKOUT] record_merchant_credit failed: {e}")
+
+
+async def _create_settlement_record(session: dict, payment_method: str):
+    """
+    Create a merchant_settlements record that the admin must authorise before
+    funds are transferred from BOMDRIVE LIMITED to the merchant's primary account.
+    """
+    try:
+        session_id = session["session_id"]
+        merchant_id = session.get("merchant_id", "")
+        amount_kobo = session.get("amount_kobo", 0)
+        idem_key = f"SETTLEMENT_{session_id}"
+        if await db.merchant_settlements.find_one({"idempotency_key": idem_key}):
+            return
+
+        # Get fee rule — try source_type match then fallback to CHECKOUT
+        _meta = session.get("metadata") or {}
+        source_type = (_meta.get("source_type") or "checkout").upper()
+        rule = await db.merchant_fee_rules.find_one({"service": source_type, "is_active": True}) or \
+               await db.merchant_fee_rules.find_one({"service": "CHECKOUT", "is_active": True}) or {}
+
+        pct = Decimal(str(rule.get("percent", 0)))
+        flat = int(rule.get("flat_kobo", 0))
+        fee_kobo = int((Decimal(str(amount_kobo)) * pct / 100).to_integral_value(ROUND_HALF_UP)) + flat
+        fee_kobo = max(int(rule.get("min_fee_kobo", 0)), fee_kobo)
+        if rule.get("max_fee_kobo"):
+            fee_kobo = min(int(rule["max_fee_kobo"]), fee_kobo)
+        net_kobo = max(0, amount_kobo - fee_kobo)
+
+        # Merchant bank account
+        wallet = await db.wallets.find_one({"user_id": merchant_id}) or {}
+        merchant_account = wallet.get("sh_account_number", "")
+        merchant_bank_code = wallet.get("sh_bank_code", os.environ.get("SAFEHAVEN_BANK_CODE", "090286"))
+        merchant_account_name = wallet.get("sh_account_name", "")
+
+        now_ts = _now()
+        settlement_id = f"SL{secrets.token_hex(10).upper()}"
+        await db.merchant_settlements.insert_one({
+            "settlement_id": settlement_id,
+            "idempotency_key": idem_key,
+            "merchant_id": merchant_id,
+            "business_name": session.get("business_name", ""),
+            "checkout_session_id": session_id,
+            "payment_method": payment_method,
+            "customer_name": session.get("customer_name", ""),
+            "gross_amount_kobo": amount_kobo,
+            "fee_kobo": fee_kobo,
+            "net_amount_kobo": net_kobo,
+            "merchant_account_number": merchant_account,
+            "merchant_bank_code": merchant_bank_code,
+            "merchant_account_name": merchant_account_name,
+            "status": "pending_settlement",
+            "transfer_reference": "",
+            "settled_at": None,
+            "settled_by": "",
+            "failure_reason": "",
+            "metadata": _meta,
+            "created_at": now_ts,
+            "updated_at": now_ts,
+        })
+        logger.info(f"[SETTLEMENT] Created {settlement_id} gross=₦{amount_kobo/100:.2f} fee=₦{fee_kobo/100:.2f} net=₦{net_kobo/100:.2f}")
+    except Exception as e:
+        logger.error(f"[CHECKOUT] create_settlement_record failed: {e}")
 
 
 async def _post_payment_tasks(session: dict, payment_method: str = "bompay_wallet"):

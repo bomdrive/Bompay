@@ -5113,3 +5113,207 @@ async def admin_payment_link_action(link_id: str, request: Request):
     await db.payment_links.update_one({"link_id": link_id}, {"$set": update})
     logger.info(f"[ADMIN] PayLink {link_id} action={action} by {admin_email}")
     return {"ok": True, "action": action, "link_id": link_id}
+
+
+
+# ─── MERCHANT SETTLEMENTS ──────────────────────────────────────────────────────
+
+@router.get("/admin/settlements")
+async def admin_list_settlements(
+    request: Request,
+    status: str = "",
+    merchant_id: str = "",
+    page: int = 1,
+    limit: int = 20,
+):
+    """List all merchant settlements with optional filters."""
+    await get_admin_user(request)
+
+    skip = (page - 1) * limit
+    filt: dict = {}
+    if status:
+        filt["status"] = status
+    if merchant_id:
+        filt["merchant_id"] = merchant_id
+
+    total = await db.merchant_settlements.count_documents(filt)
+    docs = await db.merchant_settlements.find(filt, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    # Stats
+    pending_count = await db.merchant_settlements.count_documents({"status": "pending_settlement"})
+    processing_count = await db.merchant_settlements.count_documents({"status": "processing"})
+    settled_count = await db.merchant_settlements.count_documents({"status": "settled"})
+    failed_count = await db.merchant_settlements.count_documents({"status": "failed"})
+
+    # Sum of pending net amounts
+    agg_pending = await db.merchant_settlements.aggregate([
+        {"$match": {"status": "pending_settlement"}},
+        {"$group": {"_id": None, "total": {"$sum": "$net_amount_kobo"}}}
+    ]).to_list(1)
+    pending_value_kobo = agg_pending[0]["total"] if agg_pending else 0
+
+    agg_settled_today = await db.merchant_settlements.aggregate([
+        {"$match": {"status": "settled", "settled_at": {"$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()}}},
+        {"$group": {"_id": None, "total": {"$sum": "$net_amount_kobo"}}}
+    ]).to_list(1)
+    settled_today_kobo = agg_settled_today[0]["total"] if agg_settled_today else 0
+
+    stats = {
+        "pending_count": pending_count,
+        "processing_count": processing_count,
+        "settled_count": settled_count,
+        "failed_count": failed_count,
+        "pending_value_kobo": pending_value_kobo,
+        "settled_today_kobo": settled_today_kobo,
+    }
+
+    return {"settlements": docs, "total": total, "page": page, "pages": max(1, (total + limit - 1) // limit), "stats": stats}
+
+
+@router.get("/admin/settlements/{settlement_id}")
+async def admin_get_settlement(settlement_id: str, request: Request):
+    """Get full details of a single settlement record."""
+    await get_admin_user(request)
+    doc = await db.merchant_settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Settlement not found")
+    # Enrich with merchant info
+    m = await db.merchants.find_one({"merchant_id": doc["merchant_id"]}, {"email": 1, "business_name": 1, "full_name": 1})
+    doc["merchant_email"] = (m or {}).get("email", "—")
+    doc["merchant_display_name"] = (m or {}).get("business_name") or (m or {}).get("full_name", "—")
+    return doc
+
+
+@router.post("/admin/settlements/{settlement_id}/settle")
+async def admin_settle(settlement_id: str, request: Request):
+    """
+    Initiate Safe Haven transfer from BOMDRIVE/platform account to the merchant's
+    primary account for the net settlement amount.
+    Only processes settlements in 'pending_settlement' status.
+    """
+    admin = await get_admin_user(request)
+    admin_email = admin.get("email", "admin")
+
+    doc = await db.merchant_settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Settlement not found")
+    if doc["status"] not in ("pending_settlement", "failed"):
+        raise HTTPException(400, f"Cannot settle — current status is '{doc['status']}'")
+
+    net_kobo = int(doc.get("net_amount_kobo", 0))
+    if net_kobo <= 0:
+        raise HTTPException(400, "Net amount is zero — nothing to transfer")
+
+    merchant_account = doc.get("merchant_account_number", "").strip()
+    merchant_bank_code = doc.get("merchant_bank_code", "090286").strip() or "090286"
+
+    if not merchant_account:
+        raise HTTPException(400, "Merchant account number not set on this settlement record")
+
+    # Get the platform debit (BOMDRIVE) account number from provider_settings
+    settings = await db.provider_settings.find_one({"provider": "safehaven"}) or {}
+    platform_acct = (settings.get("account_number") or "").strip()
+    if not platform_acct:
+        # Try settlement_account_id if it looks like a plain account number
+        raw = (settings.get("settlement_account_id") or "").strip()
+        if raw.isdigit() and 7 <= len(raw) <= 12:
+            platform_acct = raw
+    if not platform_acct:
+        platform_acct = os.environ.get("SAFEHAVEN_SETTLEMENT_ACCOUNT_ID", "").strip()
+    if not platform_acct:
+        raise HTTPException(400, "Platform source account (BOMDRIVE) not configured in Providers settings")
+
+    amount_ngn = net_kobo / 100.0
+    txn_ref = f"SLT{settlement_id[2:]}"  # e.g. SLT<hex> derived from settlement_id
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    # Mark as processing first (prevents double-settle)
+    await db.merchant_settlements.update_one(
+        {"settlement_id": settlement_id},
+        {"$set": {"status": "processing", "updated_at": now_ts, "settled_by": admin_email, "transfer_reference": txn_ref}}
+    )
+
+    try:
+        # Step 1: Name enquiry (required for Safe Haven transfers)
+        ne = await call_sh("POST", "/transfers/name-enquiry", body={
+            "bankCode": merchant_bank_code,
+            "accountNumber": merchant_account,
+        })
+        ne_ref = (ne.get("data") or {}).get("sessionId") or txn_ref
+
+        # Step 2: Initiate transfer
+        await call_sh("POST", "/transfers", body={
+            "nameEnquiryReference": ne_ref,
+            "debitAccountNumber": platform_acct,
+            "beneficiaryBankCode": merchant_bank_code,
+            "beneficiaryAccountNumber": merchant_account,
+            "amount": amount_ngn,
+            "saveBeneficiary": False,
+            "narration": f"BOMPAY settlement {settlement_id[-8:]}",
+            "paymentReference": txn_ref,
+        })
+
+        settled_ts = datetime.now(timezone.utc).isoformat()
+        # Update settlement to settled
+        await db.merchant_settlements.update_one(
+            {"settlement_id": settlement_id},
+            {"$set": {
+                "status": "settled",
+                "settled_at": settled_ts,
+                "updated_at": settled_ts,
+                "transfer_reference": txn_ref,
+            }}
+        )
+        # Update all merchant_transactions linked to this checkout session
+        session_id = doc.get("checkout_session_id", "")
+        if session_id:
+            await db.merchant_transactions.update_many(
+                {"metadata.session_id": session_id},
+                {"$set": {"status": "settled", "updated_at": settled_ts}}
+            )
+
+        logger.info(f"[SETTLEMENT] {settlement_id} settled ₦{amount_ngn:.2f} → {merchant_account} ref={txn_ref} by {admin_email}")
+        return {"ok": True, "status": "settled", "settlement_id": settlement_id, "transfer_reference": txn_ref}
+
+    except Exception as e:
+        err = str(e)
+        fail_ts = datetime.now(timezone.utc).isoformat()
+        await db.merchant_settlements.update_one(
+            {"settlement_id": settlement_id},
+            {"$set": {"status": "failed", "failure_reason": err, "updated_at": fail_ts}}
+        )
+        if doc.get("checkout_session_id"):
+            await db.merchant_transactions.update_many(
+                {"metadata.session_id": doc["checkout_session_id"]},
+                {"$set": {"status": "settlement_failed", "updated_at": fail_ts}}
+            )
+        logger.error(f"[SETTLEMENT] {settlement_id} FAILED: {err}")
+        raise HTTPException(500, f"Settlement transfer failed: {err}")
+
+
+@router.post("/admin/settlements/{settlement_id}/mark-failed")
+async def admin_mark_settlement_failed(settlement_id: str, request: Request):
+    """Manually mark a settlement as failed (e.g. after provider investigation)."""
+    admin = await get_admin_user(request)
+    admin_email = admin.get("email", "admin")
+    body = await request.json()
+    reason = (body.get("reason") or "Manually marked failed by admin").strip()
+
+    doc = await db.merchant_settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Settlement not found")
+    if doc["status"] == "settled":
+        raise HTTPException(400, "Cannot mark a settled record as failed")
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+    await db.merchant_settlements.update_one(
+        {"settlement_id": settlement_id},
+        {"$set": {"status": "failed", "failure_reason": reason, "updated_at": now_ts, "settled_by": admin_email}}
+    )
+    if doc.get("checkout_session_id"):
+        await db.merchant_transactions.update_many(
+            {"metadata.session_id": doc["checkout_session_id"]},
+            {"$set": {"status": "settlement_failed", "updated_at": now_ts}}
+        )
+    return {"ok": True, "status": "failed", "settlement_id": settlement_id}
