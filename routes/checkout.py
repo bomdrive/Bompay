@@ -333,7 +333,12 @@ async def create_checkout_session(req: CreateSessionReq, request: Request):
     doc = {
         "session_id": session_id,
         "merchant_id": merchant["merchant_id"],
-        "business_name": merchant.get("business_name", ""),
+        "business_name": (
+            merchant.get("business_name") or
+            merchant.get("company_name") or
+            merchant.get("full_name") or
+            merchant.get("email") or "Merchant"
+        ).strip(),
         "mode": merchant["_resolved_mode"],
         "amount_kobo": amount_kobo,
         "amount_naira": req.amount,
