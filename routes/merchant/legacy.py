@@ -164,20 +164,19 @@ async def _validate_sh_identity(init_id: str, identity_type: str, otp: str) -> s
     return ""
 
 
-async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str) -> dict:
+async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str, force_identity_id: str = "") -> dict:
     """
-    Create a Safe Haven corporate virtual sub-account using the Safe Haven team's 2-step flow:
+    Create a Safe Haven corporate virtual sub-account using the 2-step flow:
 
-    Step 1 — Individual sub-account with booleanMatch=true:
+    Step 1 — Individual sub-account with booleanMatch=true (ONLY if no existing individual account):
         POST /accounts/subaccount  { identityType, identityNumber, dateOfBirth, booleanMatch: true }
         → response._id  (this becomes the identityId / vID for Step 2)
+        SKIPPED if merchant already has an individual account on record (reuses existing _id).
 
-    Step 2 — Corporate sub-account using Step 1 _id as vID:
-        POST /accounts/v2/subaccount  { identityType: "vID", identityId: <step1._id>,
+    Step 2 — Corporate sub-account using the vID from Step 1 (or existing account):
+        POST /accounts/v2/subaccount  { identityType: "vID", identityId: <_id>,
                                         companyRegistrationNumber, ... }
         → corporate virtual account (the merchant's primary account)
-
-    Falls back to keeping the individual account from Step 1 if Step 2 fails.
     """
     external_ref = f"bp-m-{merchant['merchant_id']}-{uuid.uuid4().hex[:8]}"
     phone = _fmt_phone(merchant.get("phone", ""))
@@ -206,15 +205,26 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
         or FRONTEND_URL.rstrip("/")
     ) + "/api/webhooks/safehaven"
 
-    # ── Step 1: Individual sub-account with BVN/NIN + booleanMatch ───────────────────
-    step1_vid = ""
+    # ── Step 1: Individual sub-account (SKIP if existing identity already known) ─────
+    step1_vid = force_identity_id  # Admin can supply an existing vID directly
     step1_result = None
-    if identity_id:
+
+    if not step1_vid:
+        # Check if merchant already has an individual account — reuse its _id as vID
+        existing_acct = await db.merchant_accounts.find_one(
+            {"merchant_id": merchant["merchant_id"]},
+            {"sh_account_id": 1}
+        )
+        if existing_acct and existing_acct.get("sh_account_id"):
+            step1_vid = existing_acct["sh_account_id"]
+            logger.info(f"[MERCHANT] Reusing existing individual account _id as vID: {step1_vid[:16]}… for {merchant['merchant_id']}")
+
+    if not step1_vid and identity_id:
         payload1: dict = {
             "phoneNumber":       phone,
             "emailAddress":      email,
             "externalReference": external_ref,
-            "identityType":      identity_type,   # "BVN" or "NIN"
+            "identityType":      identity_type,
             "identityNumber":    identity_id,
             "autoSweep":         False,
         }
@@ -226,24 +236,23 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
         try:
             resp1 = await call_sh("POST", "/accounts/subaccount", body=payload1)
             step1_result = await _parse(resp1, label)
-            # Extract _id from the raw response — this is the vID for Step 2
             raw_data = resp1.get("data") if isinstance(resp1.get("data"), dict) else resp1
             step1_vid = (raw_data or {}).get("_id", "")
-            logger.info(f"[MERCHANT] SH Step1 individual (booleanMatch={bool(dob)}) → {merchant['merchant_id']}: acct={step1_result['sh_account_number'] or 'pending/async'} vid={step1_vid[:12] if step1_vid else 'none'}…")
+            logger.info(f"[MERCHANT] SH Step1 individual → {merchant['merchant_id']}: acct={step1_result['sh_account_number'] or 'pending'} vid={step1_vid[:12] if step1_vid else 'none'}…")
         except Exception as e:
             logger.warning(f"[MERCHANT] SH Step1 individual failed: {e}")
 
-    # ── Step 2: Corporate sub-account using Step 1 _id as identityId (vID) ──────────
+    # ── Step 2: Corporate sub-account using vID from Step 1 ───────────────────────────
     if step1_vid and rc_number:
         corp_ref = f"{external_ref}-corp"
         payload2: dict = {
-            "phoneNumber":              phone,
-            "emailAddress":             email,
-            "externalReference":        corp_ref,
-            "identityType":             "vID",
-            "identityId":               step1_vid,
+            "phoneNumber":               phone,
+            "emailAddress":              email,
+            "externalReference":         corp_ref,
+            "identityType":              "vID",
+            "identityId":                step1_vid,
             "companyRegistrationNumber": rc_number,
-            "autoSweep":                False,
+            "autoSweep":                 False,
         }
         if cb_url:
             payload2["callbackUrl"] = cb_url
@@ -251,13 +260,20 @@ async def _create_sh_corporate_subaccount(merchant: dict, kyb: dict, label: str)
             resp2 = await call_sh("POST", "/accounts/v2/subaccount", body=payload2)
             corp_result = await _parse(resp2, label)
             corp_result["external_reference"] = corp_ref
-            logger.info(f"[MERCHANT] SH Step2 corporate → {merchant['merchant_id']}: acct={corp_result['sh_account_number'] or 'pending/async'}")
+            logger.info(f"[MERCHANT] SH Step2 corporate ✅ → {merchant['merchant_id']}: acct={corp_result['sh_account_number'] or 'pending'}")
             return corp_result
         except Exception as e:
-            logger.warning(f"[MERCHANT] SH Step2 corporate failed: {e} — using Step1 individual account")
+            logger.error(f"[MERCHANT] SH Step2 corporate FAILED for {merchant['merchant_id']} rc={rc_number}: {e}")
+            # Re-raise so caller knows exactly what failed — do NOT silently return individual
+            raise HTTPException(400, f"Corporate account creation failed: {e}. Use 'Provision Corporate Account' in admin panel to retry with a valid RC number.")
 
-    # ── Fallback: return Step 1 individual account if corporate step failed/skipped ──
+    if not rc_number:
+        logger.warning(f"[MERCHANT] No RC number for {merchant['merchant_id']} — cannot create corporate account")
+        raise HTTPException(400, "RC number is required to create a corporate Safe Haven account. Please update the merchant's KYB and retry.")
+
+    # If we have step1_result (individual) but no rc_number, return individual
     if step1_result:
+        logger.warning(f"[MERCHANT] No RC number — returning individual account for {merchant['merchant_id']}")
         return step1_result
 
     logger.warning(f"[MERCHANT] All SH sub-account attempts failed for {merchant['merchant_id']}")
@@ -1738,8 +1754,8 @@ async def admin_review_kyb(merchant_id: str, req: KYBAdminAction, request: Reque
 @router.post("/admin/merchants/{merchant_id}/provision-account")
 async def admin_provision_merchant_account(merchant_id: str, request: Request):
     """
-    Admin: (Re-)provision the primary Safe Haven corporate virtual account.
-    Works for already-approved merchants so admin can regenerate if provisioning failed.
+    Admin: (Re-)provision the primary Safe Haven CORPORATE virtual account.
+    Accepts optional body: { rc_number, identity_id } to override stored values.
     """
     await _get_admin(request)
     m = await db.merchants.find_one({"merchant_id": merchant_id})
@@ -1747,8 +1763,27 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
         raise HTTPException(404, "Merchant not found")
     if m.get("kyb_status") != "approved":
         raise HTTPException(400, "Merchant KYB must be approved before provisioning a live account")
-    kyb = await db.merchant_kyb.find_one({"merchant_id": merchant_id}, {"_id": 0})
-    sh = await _create_sh_corporate_subaccount(m, kyb or {}, m.get("business_name", "Primary"))
+
+    # Accept optional overrides from admin
+    body_data: dict = {}
+    try:
+        body_data = await request.json()
+    except Exception:
+        pass
+    rc_override = (body_data.get("rc_number") or "").strip()
+    identity_id_override = (body_data.get("identity_id") or "").strip()
+
+    kyb = await db.merchant_kyb.find_one({"merchant_id": merchant_id}, {"_id": 0}) or {}
+
+    # Apply RC number override if admin provided one
+    if rc_override:
+        kyb["rc_number"] = rc_override
+        # Also persist it to the merchant record
+        await db.merchants.update_one({"merchant_id": merchant_id}, {"$set": {"rc_number": rc_override}})
+        await db.merchant_kyb.update_one({"merchant_id": merchant_id}, {"$set": {"rc_number": rc_override}})
+        logger.info(f"[ADMIN] RC number override for {merchant_id}: {rc_override}")
+
+    sh = await _create_sh_corporate_subaccount(m, kyb, m.get("business_name", "Primary"), force_identity_id=identity_id_override)
     now = now_utc()
     acct_update = {
         "sh_account_id": sh["sh_account_id"],
@@ -1777,7 +1812,7 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
             "created_at": now,
         })
     return {
-        "message": "Primary account provisioned",
+        "message": "Corporate account provisioned",
         "account_number": sh["sh_account_number"],
         "account_name": sh["sh_account_name"],
         "bank": sh["bank_name"],
