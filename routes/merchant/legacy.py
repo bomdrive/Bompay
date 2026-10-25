@@ -1832,18 +1832,27 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
     sh = await _create_sh_corporate_subaccount(m, kyb, m.get("business_name", "Primary"), force_identity_id=identity_id_override)
     now = now_utc()
 
-    # Safety check — never save an empty account number
-    if not sh.get("sh_account_number") and not sh.get("sh_account_id"):
-        raise HTTPException(400, "Provisioning returned no account details. Safe Haven may need more time — retry in a few seconds, or wait 24 hours if the BVN rate limit was hit.")
+    # If call_sh raised, the exception already propagated above.
+    # Here we only reject a completely empty response with no external_reference
+    # (means Safe Haven never acknowledged the request at all).
+    ext_ref = sh.get("external_reference", "")
+    if not sh.get("sh_account_number") and not sh.get("sh_account_id") and not ext_ref:
+        raise HTTPException(400, "Provisioning failed — Safe Haven returned no acknowledgment. Check RC number and retry.")
+
+    # Safe Haven may process corporate accounts asynchronously (acct number arrives via webhook).
+    # Save the record NOW so the webhook can match by external_reference and fill in the account number.
+    is_async = not sh.get("sh_account_number") and not sh.get("sh_account_id")
+    if is_async:
+        logger.info(f"[ADMIN] Corporate account accepted by Safe Haven (async). Saving pending record ext_ref={ext_ref}")
 
     acct_update = {
-        "sh_account_id":     sh["sh_account_id"],
-        "sh_account_number": sh["sh_account_number"],
-        "sh_account_name":   sh["sh_account_name"],
-        "bank_name":         sh["bank_name"],
-        "bank_code":         sh["bank_code"],
-        "external_reference": sh.get("external_reference", ""),
-        "provisioned_at":    now,
+        "sh_account_id":      sh.get("sh_account_id", ""),
+        "sh_account_number":  sh.get("sh_account_number", ""),
+        "sh_account_name":    sh.get("sh_account_name", f"{m.get('business_name', '')} — Primary"),
+        "bank_name":          sh.get("bank_name", "Safe Haven MFB"),
+        "bank_code":          sh.get("bank_code", "090286"),
+        "external_reference": ext_ref,
+        "provisioned_at":     now,
     }
     existing = await db.merchant_accounts.find_one({"merchant_id": merchant_id, "type": "primary"})
     if existing:
@@ -1862,11 +1871,21 @@ async def admin_provision_merchant_account(merchant_id: str, request: Request):
             **acct_update,
             "created_at": now,
         })
+
+    if is_async:
+        return {
+            "message": "Corporate account request accepted by Safe Haven. Account number will be delivered shortly via webhook.",
+            "account_number": "",
+            "account_name": acct_update["sh_account_name"],
+            "bank": acct_update["bank_name"],
+            "pending": True,
+        }
     return {
         "message": "Corporate account provisioned",
         "account_number": sh["sh_account_number"],
         "account_name": sh["sh_account_name"],
         "bank": sh["bank_name"],
+        "pending": False,
     }
 
 
