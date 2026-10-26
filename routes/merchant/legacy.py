@@ -789,7 +789,17 @@ async def get_merchant_account(account_id: str, request: Request):
 # ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
 
 @router.get("/v1/merchant/transactions")
-async def merchant_transactions(request: Request, page: int = 1, limit: int = 20, status: str = "", direction: str = ""):
+async def merchant_transactions(
+    request: Request,
+    page: int = 1,
+    limit: int = 50,
+    status: str = "",
+    direction: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    search: str = "",
+    all_records: bool = False,   # export: fetch all without pagination
+):
     m = await get_current_merchant(request)
     skip = (page - 1) * limit
     filt: dict = {"merchant_id": m["merchant_id"]}
@@ -797,11 +807,49 @@ async def merchant_transactions(request: Request, page: int = 1, limit: int = 20
         filt["status"] = status
     if direction:
         filt["direction"] = direction
+    # Date range (ISO strings or YYYY-MM-DD)
+    if date_from or date_to:
+        date_filt: dict = {}
+        if date_from:
+            date_filt["$gte"] = date_from
+        if date_to:
+            # Include up to end of that day
+            date_filt["$lte"] = date_to + "T23:59:59"
+        filt["created_at"] = date_filt
+    # Text search: narration, description, beneficiary_name, metadata.debit_name
+    if search:
+        search_rx = {"$regex": search, "$options": "i"}
+        filt["$or"] = [
+            {"narration": search_rx},
+            {"description": search_rx},
+            {"beneficiary_name": search_rx},
+            {"metadata.debit_name": search_rx},
+        ]
+    total = await db.merchant_transactions.count_documents(filt)
+    # Aggregate totals (credit / debit) for the filtered set
+    agg = await db.merchant_transactions.aggregate([
+        {"$match": filt},
+        {"$group": {
+            "_id": "$direction",
+            "total": {"$sum": "$amount"},
+        }}
+    ]).to_list(10)
+    total_credit = next((int(x["total"]) for x in agg if x["_id"] == "CREDIT"), 0)
+    total_debit  = next((int(x["total"]) for x in agg if x["_id"] == "DEBIT"),  0)
+
+    fetch_limit = total if all_records else limit
+    fetch_skip  = 0     if all_records else skip
     txns = await db.merchant_transactions.find(
         filt, {"_id": 0}
-    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-    total = await db.merchant_transactions.count_documents(filt)
-    return {"transactions": txns, "total": total, "page": page, "pages": -(-total // limit)}
+    ).sort("created_at", -1).skip(fetch_skip).limit(fetch_limit).to_list(fetch_limit)
+    return {
+        "transactions": txns,
+        "total": total,
+        "page": page,
+        "pages": -(-total // limit),
+        "total_credit_kobo": total_credit,
+        "total_debit_kobo": total_debit,
+    }
 
 
 # ─── KYB ──────────────────────────────────────────────────────────────────────
