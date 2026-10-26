@@ -360,12 +360,15 @@ async def team_login(req: TeamLoginReq, response: Response):
             {"is_system": True}, {"merchant_id": merchant_id}
         ]}
     )
+    # Determine whether the member still needs to set up their PIN
+    needs_pin_setup = not bool(member.get("pin_hash"))
     return {
         **_safe_member(member),
         "merchant": {k: v for k, v in merchant.items()
                      if k not in ("_id", "password_hash", "pin_hash")},
         "role": {"role_id": (role or {}).get("role_id"), "name": (role or {}).get("name")},
         "is_owner": False,
+        "needs_pin_setup": needs_pin_setup,
     }
 
 
@@ -392,6 +395,54 @@ async def team_me(request: Request):
         "permissions": sorted(ctx.permissions),
         "member": ctx.member,
     }
+
+
+# ─── TEAM MEMBER PIN SETUP & VERIFICATION ─────────────────────────────────────
+
+class MemberPinReq(BaseModel):
+    pin: str
+    confirm_pin: Optional[str] = None
+
+@router.post("/v1/merchant/team/set-pin")
+async def team_set_pin(req: MemberPinReq, request: Request):
+    """
+    Called immediately after a team member's first login to set their 4-digit PIN.
+    Requires the member_access cookie (set during team login).
+    Once set, the PIN is required on subsequent logins.
+    """
+    ctx = await get_merchant_context(request)
+    if ctx.is_owner:
+        raise HTTPException(400, "Business owners set their PIN during registration")
+
+    pin = req.pin.strip()
+    if not pin.isdigit() or len(pin) != 4:
+        raise HTTPException(400, "PIN must be exactly 4 digits")
+    if req.confirm_pin is not None and req.confirm_pin != pin:
+        raise HTTPException(400, "PINs do not match")
+
+    member_id = ctx.actor_id
+    await db.merchant_members.update_one(
+        {"member_id": member_id},
+        {"$set": {"pin_hash": hash_password(pin), "pin_set_at": _now()}}
+    )
+    return {"message": "PIN set successfully"}
+
+
+@router.post("/v1/merchant/team/verify-pin")
+async def team_verify_pin(req: MemberPinReq, request: Request):
+    """Verify a team member's PIN. Called after password login to complete authentication."""
+    ctx = await get_merchant_context(request)
+    if ctx.is_owner:
+        raise HTTPException(400, "Use /v1/merchant/verify-pin for business owner PIN")
+
+    member = await db.merchant_members.find_one({"member_id": ctx.actor_id})
+    if not member or not member.get("pin_hash"):
+        raise HTTPException(400, "PIN not set. Please set your PIN first.")
+
+    if not verify_password(req.pin.strip(), member["pin_hash"]):
+        raise HTTPException(401, "Incorrect PIN. Please try again.")
+
+    return {"message": "PIN verified"}
 
 
 # ─── INVITE ────────────────────────────────────────────────────────────────────
@@ -803,10 +854,14 @@ async def create_transfer_request(req: TransferRequestReq, request: Request):
     ctx = await get_merchant_context(request)
     await require_permission(ctx, "transfers.initiate")
 
-    if not verify_password(req.pin, ctx.merchant.get("pin_hash", "")):
-        # For team members, check the merchant owner's pin OR skip pin (team has no pin)
-        # Team members don't have pins - skip pin check
-        if ctx.is_owner:
+    # PIN check: owner uses merchant pin_hash; team member uses their own pin_hash
+    if ctx.is_owner:
+        if not verify_password(req.pin, ctx.merchant.get("pin_hash", "")):
+            raise HTTPException(401, "Invalid PIN")
+    else:
+        member_doc = await db.merchant_members.find_one({"member_id": ctx.actor_id})
+        member_pin_hash = (member_doc or {}).get("pin_hash", "")
+        if member_pin_hash and not verify_password(req.pin, member_pin_hash):
             raise HTTPException(401, "Invalid PIN")
 
     approval_id = f"TAPPR_{secrets.token_hex(6).upper()}"
