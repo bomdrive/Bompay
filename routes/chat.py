@@ -259,7 +259,7 @@ async def public_merchant_fees():
 
 @router.get("/admin/chat/sessions")
 async def admin_list_sessions(request: Request, status: str = "", page: int = 1):
-    from routes.merchant import _get_admin
+    from routes.merchant.legacy import _get_admin
     await _get_admin(request)
     query = {}
     if status:
@@ -283,7 +283,7 @@ async def admin_list_sessions(request: Request, status: str = "", page: int = 1)
 
 @router.get("/admin/chat/sessions/{session_id}/messages")
 async def admin_get_messages(session_id: str, request: Request):
-    from routes.merchant import _get_admin
+    from routes.merchant.legacy import _get_admin
     await _get_admin(request)
     msgs = await db.chat_messages.find(
         {"session_id": session_id}, {"_id": 0}
@@ -298,7 +298,7 @@ async def admin_get_messages(session_id: str, request: Request):
 
 @router.post("/admin/chat/sessions/{session_id}/messages")
 async def admin_send_message(session_id: str, req: SendMessageReq, request: Request):
-    from routes.merchant import _get_admin
+    from routes.merchant.legacy import _get_admin
     admin = await _get_admin(request)
     s = await db.chat_sessions.find_one({"session_id": session_id})
     if not s:
@@ -325,7 +325,7 @@ async def admin_send_message(session_id: str, req: SendMessageReq, request: Requ
 
 @router.put("/admin/chat/sessions/{session_id}/assign")
 async def assign_chat(session_id: str, req: AssignChatReq, request: Request):
-    from routes.merchant import _get_admin
+    from routes.merchant.legacy import _get_admin
     admin = await _get_admin(request)
     now = _now()
     await db.chat_sessions.update_one(
@@ -353,7 +353,7 @@ async def assign_chat(session_id: str, req: AssignChatReq, request: Request):
 
 @router.put("/admin/chat/sessions/{session_id}/resolve")
 async def resolve_chat(session_id: str, request: Request):
-    from routes.merchant import _get_admin
+    from routes.merchant.legacy import _get_admin
     await _get_admin(request)
     now = _now()
     s = await db.chat_sessions.find_one({"session_id": session_id})
