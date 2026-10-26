@@ -23,6 +23,11 @@ from core import (
     send_otp_sms, send_email, _email_html, FRONTEND_URL,
 )
 
+# Import RBAC helpers (lazy-imported inside functions to avoid circular imports at module load)
+def _rbac_ctx():
+    from .context import get_merchant_context, require_permission, merchant_audit
+    return get_merchant_context, require_permission, merchant_audit
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -55,30 +60,14 @@ def _set_merchant_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("merchant_refresh_token", refresh, max_age=2592000, **kw)
 
 async def get_current_merchant(request: Request) -> dict:
-    token = request.cookies.get("merchant_access_token")
-    if not token:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
-    if not token:
-        raise HTTPException(401, "Not authenticated")
-    try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "merchant_access":
-            raise HTTPException(401, "Invalid token")
-        m = await db.merchants.find_one({"merchant_id": payload["sub"]})
-        if not m:
-            raise HTTPException(401, "Merchant not found")
-        if m.get("status") == "suspended":
-            raise HTTPException(403, "Merchant account suspended")
-        m["_id"] = str(m["_id"])
-        m.pop("password_hash", None)
-        m.pop("pin_hash", None)
-        return m
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(401, "Token expired")
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(401, "Invalid token")
+    """
+    Backward-compatible auth resolver.
+    Supports both merchant_access (owner) and member_access (team member) tokens.
+    Returns the merchant document. For permission-aware code use get_merchant_context().
+    """
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    return ctx.merchant
 
 def _safe_merchant(m: dict) -> dict:
     m = {k: v for k, v in m.items()}
@@ -549,8 +538,18 @@ async def merchant_logout(response: Response):
 
 @router.get("/v1/merchant/me")
 async def merchant_me(request: Request):
-    m = await get_current_merchant(request)
-    return m
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    out = {**ctx.merchant}
+    out["_rbac"] = {
+        "actor_id": ctx.actor_id,
+        "actor_email": ctx.actor_email,
+        "actor_name": ctx.actor_name,
+        "is_owner": ctx.is_owner,
+        "permissions": sorted(ctx.permissions),
+        "role_id": ctx.member.get("role_id") if ctx.member else "business_owner",
+    }
+    return out
 
 
 @router.post("/v1/merchant/refresh")
@@ -560,14 +559,31 @@ async def merchant_refresh(request: Request, response: Response):
         raise HTTPException(401, "No refresh token")
     try:
         payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "merchant_refresh":
-            raise HTTPException(401, "Invalid token")
-        m = await db.merchants.find_one({"merchant_id": payload["sub"]})
-        if not m:
-            raise HTTPException(401, "Not found")
-        access, refresh = _merchant_tokens(m["merchant_id"], m["email"])
-        _set_merchant_cookies(response, access, refresh)
-        return {"message": "Refreshed"}
+        token_type = payload.get("type")
+
+        if token_type == "merchant_refresh":
+            m = await db.merchants.find_one({"merchant_id": payload["sub"]})
+            if not m:
+                raise HTTPException(401, "Not found")
+            access, refresh = _merchant_tokens(m["merchant_id"], m["email"])
+            _set_merchant_cookies(response, access, refresh)
+            return {"message": "Refreshed"}
+
+        if token_type == "member_refresh":
+            member_id = payload["sub"]
+            merchant_id = payload.get("merchant_id", "")
+            member = await db.merchant_members.find_one(
+                {"member_id": member_id, "merchant_id": merchant_id, "status": "active"}
+            )
+            if not member:
+                raise HTTPException(401, "Not found or inactive")
+            from .team import _member_token, _member_refresh_token, _set_member_cookies
+            access = _member_token(member_id, merchant_id)
+            new_refresh = _member_refresh_token(member_id, merchant_id)
+            _set_member_cookies(response, access, new_refresh)
+            return {"message": "Refreshed"}
+
+        raise HTTPException(401, "Invalid token")
     except pyjwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
 
@@ -576,7 +592,10 @@ async def merchant_refresh(request: Request, response: Response):
 
 @router.get("/v1/merchant/dashboard")
 async def merchant_dashboard(request: Request):
-    m = await get_current_merchant(request)
+    get_merchant_context, require_permission, merchant_audit = _rbac_ctx()
+    ctx = await get_merchant_context(request)
+    await require_permission(ctx, "dashboard.read")
+    m = ctx.merchant
     mid = m["merchant_id"]
     accounts = await db.merchant_accounts.find({"merchant_id": mid}).to_list(50)
     acct_ids = [a["account_id"] for a in accounts]

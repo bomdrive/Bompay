@@ -83,6 +83,84 @@ async def add_security_headers(request: Request, call_next):
         del response.headers["server"]
     return response
 
+
+# ===== RBAC MIDDLEWARE =====
+@app.middleware("http")
+async def rbac_permission_middleware(request: Request, call_next):
+    """
+    Enforce route-level permissions for team members (member_access tokens).
+    Business owners (merchant_access tokens) pass through immediately.
+    Public routes, admin routes, and non-merchant routes are not affected.
+    """
+    path = request.url.path
+    method = request.method
+
+    # Only enforce on merchant-facing API routes
+    merchant_prefixes = (
+        "/api/v1/merchant/",
+        "/api/v1/stores",
+        "/api/v1/payment-links",
+        "/api/v1/orders",
+        "/api/v1/customers",
+    )
+    if not any(path.startswith(pfx) for pfx in merchant_prefixes):
+        return await call_next(request)
+
+    # Only enforce for non-public routes (public routes have no auth cookie)
+    token = request.cookies.get("merchant_access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        return await call_next(request)  # let the route handler raise 401
+
+    # Only check team member tokens; owners bypass all permission checks
+    try:
+        import jwt as pyjwt
+        from core import JWT_SECRET, JWT_ALGORITHM
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return await call_next(request)  # invalid/expired token — route handler handles it
+
+    if payload.get("type") != "member_access":
+        return await call_next(request)  # business owner — no permission check needed
+
+    # Resolve required permissions for this route
+    from routes.merchant.route_permissions import get_required_permissions
+    required = get_required_permissions(method, path)
+    if not required:
+        return await call_next(request)  # no restriction defined
+
+    # Fetch member's permissions from DB
+    try:
+        member_id = payload.get("sub", "")
+        merchant_id = payload.get("merchant_id", "")
+        member = await db.merchant_members.find_one(
+            {"member_id": member_id, "merchant_id": merchant_id}
+        )
+        if not member or member.get("status") != "active":
+            return JSONResponse(status_code=403, content={"detail": "Team member account not active"})
+
+        role_id = member.get("role_id", "")
+        role = await db.merchant_roles.find_one(
+            {"role_id": role_id, "$or": [
+                {"is_system": True}, {"merchant_id": merchant_id}
+            ]}
+        )
+        member_perms = set(role.get("permissions", [])) if role else set()
+        missing = [p for p in required if p not in member_perms]
+        if missing:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Insufficient permissions: {', '.join(missing)}"}
+            )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(f"[RBAC middleware] Error: {exc}")
+
+    return await call_next(request)
+
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
     msgs = [f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()]
@@ -202,6 +280,50 @@ async def startup():
     await db.otp_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.biometric_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.webauthn_challenges.create_index("expires_at", expireAfterSeconds=0)
+
+    # ── RBAC collections ──────────────────────────────────────────────────────
+    await db.merchant_members.create_index(
+        [("merchant_id", 1), ("email", 1)], unique=True, sparse=True
+    )
+    await db.merchant_members.create_index("member_id", unique=True)
+    await db.merchant_members.create_index([("merchant_id", 1), ("status", 1)])
+    await db.merchant_roles.create_index("role_id", unique=True, sparse=True)
+    await db.merchant_roles.create_index([("merchant_id", 1), ("is_system", 1)])
+    await db.merchant_invitations.create_index("token_hash", unique=True, sparse=True)
+    await db.merchant_invitations.create_index("invitation_id", unique=True)
+    await db.merchant_invitations.create_index([("merchant_id", 1), ("status", 1)])
+    await db.merchant_audit_logs.create_index([("merchant_id", 1), ("created_at", -1)])
+    await db.merchant_transfer_approvals.create_index("approval_id", unique=True)
+    await db.merchant_transfer_approvals.create_index([("merchant_id", 1), ("status", 1)])
+
+    # ── Seed system roles ─────────────────────────────────────────────────────
+    from routes.merchant.permissions import SYSTEM_ROLES
+    now_str = datetime.now(timezone.utc).isoformat()
+    for role_id, rdata in SYSTEM_ROLES.items():
+        existing_role = await db.merchant_roles.find_one({"role_id": role_id, "is_system": True})
+        if not existing_role:
+            await db.merchant_roles.insert_one({
+                "role_id": role_id,
+                "merchant_id": None,
+                "name": rdata["name"],
+                "description": rdata["description"],
+                "permissions": rdata["permissions"],
+                "is_system": True,
+                "protected": rdata.get("protected", False),
+                "created_at": now_str,
+                "updated_at": now_str,
+            })
+        else:
+            # Keep permissions up to date with code
+            await db.merchant_roles.update_one(
+                {"role_id": role_id, "is_system": True},
+                {"$set": {
+                    "permissions": rdata["permissions"],
+                    "name": rdata["name"],
+                    "description": rdata["description"],
+                    "updated_at": now_str,
+                }}
+            )
 
     # Clear legacy WebAuthn credentials registered with wrong RP_ID (old Railway URL)
     # Safe to run repeatedly — only deletes credentials tied to old RP origins

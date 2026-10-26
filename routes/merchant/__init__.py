@@ -11,6 +11,9 @@ from .orders import router as orders_router
 from .payment_links import router as payment_links_router
 from .customers import router as customers_router
 from .discounts import router as discounts_router
+from .team import router as team_router
+from .roles_api import router as roles_router
+from .audit_api import router as audit_router
 
 router = APIRouter()
 router.include_router(_legacy_router)
@@ -20,3 +23,6 @@ router.include_router(orders_router)
 router.include_router(payment_links_router)
 router.include_router(customers_router)
 router.include_router(discounts_router)
+router.include_router(team_router)
+router.include_router(roles_router)
+router.include_router(audit_router)
