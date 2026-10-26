@@ -95,6 +95,21 @@ async def rbac_permission_middleware(request: Request, call_next):
     path = request.url.path
     method = request.method
 
+    # Fully public routes that must never be gated by RBAC — even if a stale
+    # member_access cookie is present (e.g. invite accept, team login, PIN setup)
+    PUBLIC_MERCHANT_PATHS = (
+        "/api/v1/merchant/team/invite/accept",
+        "/api/v1/merchant/team/login",
+        "/api/v1/merchant/team/set-pin",
+        "/api/v1/merchant/team/verify-pin",
+        "/api/v1/merchant/login",
+        "/api/v1/merchant/verify-pin",
+        "/api/v1/merchant/refresh",
+        "/api/v1/merchant/team/invite/info",
+    )
+    if any(path.startswith(p) for p in PUBLIC_MERCHANT_PATHS):
+        return await call_next(request)
+
     # Only enforce on merchant-facing API routes
     merchant_prefixes = (
         "/api/v1/merchant/",

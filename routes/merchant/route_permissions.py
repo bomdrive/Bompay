@@ -79,6 +79,9 @@ ROUTE_PERMISSION_MAP: List[Tuple[str, str, List[str]]] = [
     ("GET",    "/api/v1/merchant/team/members",                      ["team.members.read"]),
     ("PATCH",  "/api/v1/merchant/team/members",                      ["team.members.update"]),
     ("DELETE", "/api/v1/merchant/team/members",                      ["team.members.remove"]),
+    # Team management
+    # NOTE: accept/login/set-pin/verify-pin are PUBLIC — they are bypassed in the
+    # RBAC middleware before this map is consulted.
     ("POST",   "/api/v1/merchant/team/invite",                       ["team.members.invite"]),
     ("GET",    "/api/v1/merchant/team/invitations",                  ["team.members.invite"]),
     ("DELETE", "/api/v1/merchant/team/invitations",                  ["team.members.invite"]),
