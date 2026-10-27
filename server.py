@@ -217,6 +217,7 @@ from routes import (
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
     push, epos, promotions, family, business, cards, merchant, checkout, chat,
+    kyc_liveness,
 )
 
 for mod in [
@@ -224,6 +225,7 @@ for mod in [
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
     push, epos, promotions, family, business, cards, merchant, checkout, chat,
+    kyc_liveness,
 ]:
     app.include_router(mod.router, prefix="/api")
 
