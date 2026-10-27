@@ -117,7 +117,7 @@ async def create_liveness_session(request: Request):
     user = await get_current_user(request)
     uid  = str(user["_id"])
 
-    if user.get("kyc_tier", 0) >= 2:
+    if user.get("kyc_tier", 0) >= 3:
         raise HTTPException(400, "Tier 2 already completed")
     if user.get("kyc_tier", 0) < 1:
         raise HTTPException(400, "Complete Tier 1 first before starting face verification")
@@ -270,7 +270,7 @@ async def complete_liveness_session(session_id: str, request: Request):
         "verification_id":   session["verification_id"],
         "user_id":           uid,
         "session_id":        session_id,
-        "kyc_tier":          2,
+        "kyc_tier":          3,
         "attempt_number":    session.get("attempt_number", 1),
         "challenges":        session["challenges"],
         "challenge_results": results,
@@ -298,7 +298,7 @@ async def complete_liveness_session(session_id: str, request: Request):
     if auto_ok:
         await db.users.update_one(
             {"_id": user["_id"]},
-            {"$set": {"kyc_tier": 2, "kyc_status": "TIER_2_VERIFIED", "kyc_tier2_at": now_ts}},
+            {"$set": {"kyc_tier": 3, "kyc_status": "TIER_3_VERIFIED", "kyc_tier3_at": now_ts}},
         )
         try:
             from routes.admin import _send_tier_approval_email
@@ -476,7 +476,7 @@ async def admin_approve_liveness(verification_id: str, request: Request):
     )
     await db.users.update_one(
         {"_id": ObjectId(doc["user_id"])},
-        {"$set": {"kyc_tier": 2, "kyc_status": "TIER_2_VERIFIED", "kyc_tier2_at": now_ts}},
+            {"$set": {"kyc_tier": 3, "kyc_status": "TIER_3_VERIFIED", "kyc_tier3_at": now_ts}},
     )
     try:
         from routes.admin import _send_tier_approval_email
