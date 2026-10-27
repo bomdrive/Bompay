@@ -118,9 +118,9 @@ async def create_liveness_session(request: Request):
     uid  = str(user["_id"])
 
     if user.get("kyc_tier", 0) >= 3:
-        raise HTTPException(400, "Tier 2 already completed")
-    if user.get("kyc_tier", 0) < 1:
-        raise HTTPException(400, "Complete Tier 1 first before starting face verification")
+        raise HTTPException(400, "Tier 3 already completed")
+    if user.get("kyc_tier", 0) < 2:
+        raise HTTPException(400, "Complete Tier 2 first before starting face verification")
 
     now = datetime.now(timezone.utc)
     # Resume active session if it hasn't expired
