@@ -445,6 +445,77 @@ async def team_verify_pin(req: MemberPinReq, request: Request):
     return {"message": "PIN verified"}
 
 
+# ─── ACCOUNT ACCESS ASSIGNMENT ────────────────────────────────────────────────
+
+class AccountAssignmentReq(BaseModel):
+    assigned_accounts: list  # [] = all accounts; ["acct_id1", ...] = specific accounts
+
+@router.patch("/v1/merchant/team/members/{member_id}/accounts")
+async def assign_member_accounts(member_id: str, req: AccountAssignmentReq, request: Request):
+    """
+    Assign which sub-accounts a team member can access.
+    [] means access to ALL accounts (default).
+    ["acct_id1", "acct_id2"] restricts access to only those accounts.
+    Requires team.members.update permission.
+    """
+    ctx = await get_merchant_context(request)
+    require_permission(ctx, "team.members.update")
+
+    member = await db.merchant_members.find_one({
+        "member_id": member_id, "merchant_id": ctx.merchant_id
+    })
+    if not member:
+        raise HTTPException(404, "Team member not found")
+    if member.get("is_owner"):
+        raise HTTPException(400, "Cannot restrict account access for the business owner")
+
+    # Validate account IDs belong to this merchant
+    if req.assigned_accounts:
+        valid = await db.merchant_accounts.find(
+            {"merchant_id": ctx.merchant_id, "account_id": {"$in": req.assigned_accounts}},
+            {"account_id": 1}
+        ).to_list(50)
+        valid_ids = {a["account_id"] for a in valid}
+        invalid = [a for a in req.assigned_accounts if a not in valid_ids]
+        if invalid:
+            raise HTTPException(400, f"Unknown account IDs: {invalid}")
+
+    await db.merchant_members.update_one(
+        {"member_id": member_id},
+        {"$set": {"assigned_accounts": req.assigned_accounts, "accounts_updated_at": _now()}}
+    )
+    await merchant_audit(ctx, "member.accounts.updated", "merchant_members",
+                         {"member_id": member_id, "assigned_accounts": req.assigned_accounts})
+
+    label = "All accounts" if not req.assigned_accounts else f"{len(req.assigned_accounts)} account(s)"
+    return {"message": f"Account access updated: {label}", "assigned_accounts": req.assigned_accounts}
+
+
+@router.get("/v1/merchant/team/members/{member_id}/accounts")
+async def get_member_accounts(member_id: str, request: Request):
+    """Return the account assignment for a specific team member."""
+    ctx = await get_merchant_context(request)
+    require_permission(ctx, "team.members.update")
+
+    member = await db.merchant_members.find_one({
+        "member_id": member_id, "merchant_id": ctx.merchant_id
+    }, {"_id": 0})
+    if not member:
+        raise HTTPException(404, "Team member not found")
+
+    all_accounts = await db.merchant_accounts.find(
+        {"merchant_id": ctx.merchant_id}, {"_id": 0, "account_id": 1,
+         "name": 1, "type": 1, "sh_account_number": 1, "sh_account_name": 1, "status": 1}
+    ).to_list(50)
+
+    assigned = member.get("assigned_accounts", [])
+    return {
+        "assigned_accounts": assigned,
+        "all_access": len(assigned) == 0,
+        "accounts": all_accounts,
+    }
+
+
 # ─── INVITE ────────────────────────────────────────────────────────────────────
 
 @router.post("/v1/merchant/team/invite")

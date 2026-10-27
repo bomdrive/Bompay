@@ -640,9 +640,21 @@ async def merchant_dashboard(request: Request):
 @router.get("/v1/merchant/accounts")
 async def list_merchant_accounts(request: Request):
     m = await get_current_merchant(request)
-    raw_accounts = await db.merchant_accounts.find(
-        {"merchant_id": m["merchant_id"]}, {"_id": 0}
-    ).to_list(20)
+
+    # For team members, filter to their assigned accounts only
+    account_filter: dict = {"merchant_id": m["merchant_id"]}
+    try:
+        from .context import get_merchant_context
+        ctx = await get_merchant_context(request)
+        if not ctx.is_owner:
+            member = await db.merchant_members.find_one({"member_id": ctx.actor_id})
+            assigned = (member or {}).get("assigned_accounts", [])
+            if assigned:  # non-empty = restricted access
+                account_filter["account_id"] = {"$in": assigned}
+    except Exception:
+        pass  # business owner or context unavailable — show all
+
+    raw_accounts = await db.merchant_accounts.find(account_filter, {"_id": 0}).to_list(20)
 
     # Build response list with live balances included
     result = []
@@ -754,6 +766,20 @@ async def get_merchant_account(account_id: str, request: Request):
     )
     if not acct:
         raise HTTPException(404, "Account not found")
+
+    # For team members, enforce account-level access restriction
+    try:
+        from .context import get_merchant_context
+        ctx = await get_merchant_context(request)
+        if not ctx.is_owner:
+            member = await db.merchant_members.find_one({"member_id": ctx.actor_id})
+            assigned = (member or {}).get("assigned_accounts", [])
+            if assigned and account_id not in assigned:
+                raise HTTPException(403, "You do not have access to this account")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     # Fetch live balance from Safe Haven
     balance = 0.0
     if acct.get("sh_account_number"):
@@ -803,6 +829,18 @@ async def merchant_transactions(
     m = await get_current_merchant(request)
     skip = (page - 1) * limit
     filt: dict = {"merchant_id": m["merchant_id"]}
+
+    # Scope to assigned accounts for team members
+    try:
+        from .context import get_merchant_context
+        ctx = await get_merchant_context(request)
+        if not ctx.is_owner:
+            member = await db.merchant_members.find_one({"member_id": ctx.actor_id})
+            assigned = (member or {}).get("assigned_accounts", [])
+            if assigned:
+                filt["account_id"] = {"$in": assigned}
+    except Exception:
+        pass
     if status:
         filt["status"] = status
     if direction:
