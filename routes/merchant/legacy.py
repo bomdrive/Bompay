@@ -3,7 +3,7 @@ Bompay Merchant / Developer Platform routes
 Prefix: /api/v1/merchant  (merchant-facing)
 Prefix: /api/admin/merchants (admin-facing)
 """
-import os, secrets, uuid, asyncio
+import os, secrets, uuid, asyncio, logging
 from datetime import datetime, timezone, timedelta
 from html import escape as _escape
 from typing import Optional
@@ -1040,6 +1040,53 @@ async def create_dispute(req: DisputeCreate, request: Request):
 
 # ─── SERVICES (Transfer from Dashboard) ──────────────────────────────────────
 
+async def _record_bank_health_event(bank_code: str, bank_name: str, merchant_id: str, txn_ref: str, event_type: str):
+    """Fire-and-forget: record a bank transfer health event (TRANSFER_SUCCESS or TRANSFER_FAILED)."""
+    try:
+        await db.bank_health_events.insert_one({
+            "bank_code": bank_code,
+            "bank_name": bank_name,
+            "merchant_id": merchant_id,
+            "txn_ref": txn_ref,
+            "event_type": event_type,
+            "created_at": now_utc(),
+        })
+    except Exception as e:
+        logger.warning(f"[BankHealth] Failed to record event: {e}")
+
+
+@router.get("/v1/merchant/bank-health")
+async def merchant_bank_health(bank_code: str, request: Request):
+    """Return health status for a specific bank based on recent transfer outcomes."""
+    await get_current_merchant(request)
+    cfg = await db.bank_network_config.find_one({}) or {}
+    threshold = int(cfg.get("failure_threshold", 3))
+    window = int(cfg.get("time_window_hours", 2))
+    mode = cfg.get("mode", "warn")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window)).isoformat()
+    failures = await db.bank_health_events.count_documents({
+        "bank_code": bank_code, "event_type": "TRANSFER_FAILED", "created_at": {"$gte": cutoff}
+    })
+    successes = await db.bank_health_events.count_documents({
+        "bank_code": bank_code, "event_type": "TRANSFER_SUCCESS", "created_at": {"$gte": cutoff}
+    })
+    total = failures + successes
+    health_pct = round(successes / total * 100, 1) if total > 0 else 100.0
+    is_flagged = failures >= threshold
+
+    return {
+        "bank_code": bank_code,
+        "failures": failures,
+        "successes": successes,
+        "health_pct": health_pct,
+        "is_flagged": is_flagged,
+        "mode": mode,
+        "threshold": threshold,
+        "window_hours": window,
+    }
+
+
 @router.post("/v1/merchant/services/transfer")
 async def merchant_transfer(req: MerchantTransfer, request: Request):
     if req.amount <= 0:
@@ -1077,6 +1124,17 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
 
     amount_kobo = int(req.amount * 100)
     txn_ref = f"MTRXN_{secrets.token_hex(8).upper()}"
+
+    # Resolve bank name for health tracking
+    bank_name = req.bank_code
+    try:
+        from core import NIGERIAN_BANKS as _BANKS
+        _b = next((b for b in _BANKS if b.get("code") == req.bank_code), None)
+        if _b:
+            bank_name = _b.get("name", req.bank_code)
+    except Exception:
+        pass
+
     try:
         sh_resp = await call_sh("POST", "/transfers", body={
             "nameEnquiryReference": ne_ref,
@@ -1089,6 +1147,8 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
             "paymentReference": txn_ref,
         })
     except Exception as e:
+        # Record provider failure against this bank
+        asyncio.create_task(_record_bank_health_event(req.bank_code, bank_name, m["merchant_id"], txn_ref, "TRANSFER_FAILED"))
         raise HTTPException(502, f"Transfer failed: {e}")
 
     # Derive status from Safe Haven's actual response — SH returns PENDING for NIP transfers
@@ -1098,11 +1158,14 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
     sh_session = sh_data.get("sessionId") or sh_data.get("transactionReference") or ""
     if sh_status_raw in ("COMPLETED", "SUCCESS", "SUCCESSFUL"):
         txn_status = "success"
+        asyncio.create_task(_record_bank_health_event(req.bank_code, bank_name, m["merchant_id"], txn_ref, "TRANSFER_SUCCESS"))
     elif sh_status_raw in ("FAILED", "FAILURE", "REVERSED", "REJECTED"):
         txn_status = "failed"
+        asyncio.create_task(_record_bank_health_event(req.bank_code, bank_name, m["merchant_id"], txn_ref, "TRANSFER_FAILED"))
     else:
         # PENDING, PROCESSING, or unknown — Safe Haven will confirm via webhook
         txn_status = "pending"
+        asyncio.create_task(_record_bank_health_event(req.bank_code, bank_name, m["merchant_id"], txn_ref, "TRANSFER_SUCCESS"))
     logger.info(f"[MERCHANT] Transfer {txn_ref} SH status={sh_status_raw!r} → recorded as {txn_status}")
 
     txn_doc = {

@@ -874,4 +874,36 @@ async def preview_transfer_fee(amount: float, request: Request):
         "bompay_margin": margin
     }
 
+
+@router.get("/transfers/bank-health")
+async def user_bank_health(bank_code: str, request: Request):
+    """Consumer-facing bank health check based on recent transfer outcomes."""
+    await get_current_user(request)
+    cfg = await db.bank_network_config.find_one({}) or {}
+    threshold = int(cfg.get("failure_threshold", 3))
+    window = int(cfg.get("time_window_hours", 2))
+    mode = cfg.get("mode", "warn")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window)).isoformat()
+    failures = await db.bank_health_events.count_documents({
+        "bank_code": bank_code, "event_type": "TRANSFER_FAILED", "created_at": {"$gte": cutoff}
+    })
+    successes = await db.bank_health_events.count_documents({
+        "bank_code": bank_code, "event_type": "TRANSFER_SUCCESS", "created_at": {"$gte": cutoff}
+    })
+    total = failures + successes
+    health_pct = round(successes / total * 100, 1) if total > 0 else 100.0
+    is_flagged = failures >= threshold
+
+    return {
+        "bank_code": bank_code,
+        "failures": failures,
+        "successes": successes,
+        "health_pct": health_pct,
+        "is_flagged": is_flagged,
+        "mode": mode,
+        "threshold": threshold,
+        "window_hours": window,
+    }
+
 # ===== CDH PLANS & VALIDATION =====

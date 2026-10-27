@@ -5317,3 +5317,111 @@ async def admin_mark_settlement_failed(settlement_id: str, request: Request):
             {"$set": {"status": "settlement_failed", "updated_at": now_ts}}
         )
     return {"ok": True, "status": "failed", "settlement_id": settlement_id}
+
+
+# ─── TRANSFER NETWORK CHECKER ─────────────────────────────────────────────────
+
+@router.get("/admin/bank-network/config")
+async def get_bank_network_config(request: Request):
+    """Get current bank network monitoring configuration."""
+    await get_admin_user(request)
+    cfg = await db.bank_network_config.find_one({}) or {}
+    cfg.pop("_id", None)
+    return {
+        "mode": cfg.get("mode", "warn"),
+        "failure_threshold": cfg.get("failure_threshold", 3),
+        "time_window_hours": cfg.get("time_window_hours", 2),
+        "updated_at": cfg.get("updated_at", ""),
+    }
+
+
+@router.put("/admin/bank-network/config")
+async def update_bank_network_config(request: Request):
+    """Update bank network monitoring configuration."""
+    await get_admin_user(request)
+    body = await request.json()
+    mode = body.get("mode", "warn")
+    if mode not in ("warn", "block"):
+        raise HTTPException(400, "mode must be 'warn' or 'block'")
+    threshold = int(body.get("failure_threshold", 3))
+    window = int(body.get("time_window_hours", 2))
+    if threshold < 1 or threshold > 50:
+        raise HTTPException(400, "failure_threshold must be between 1 and 50")
+    if window < 1 or window > 168:
+        raise HTTPException(400, "time_window_hours must be between 1 and 168")
+    await db.bank_network_config.update_one(
+        {},
+        {"$set": {
+            "mode": mode,
+            "failure_threshold": threshold,
+            "time_window_hours": window,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True
+    )
+    return {"ok": True, "mode": mode, "failure_threshold": threshold, "time_window_hours": window}
+
+
+@router.get("/admin/bank-network/stats")
+async def get_bank_network_stats(request: Request, hours: int = 24):
+    """Get transfer health stats for all banks within a given window."""
+    await get_admin_user(request)
+    if hours < 1 or hours > 720:
+        hours = 24
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    cfg = await db.bank_network_config.find_one({}) or {}
+    threshold = int(cfg.get("failure_threshold", 3))
+    window = int(cfg.get("time_window_hours", 2))
+    mode = cfg.get("mode", "warn")
+    window_cutoff = (datetime.now(timezone.utc) - timedelta(hours=window)).isoformat()
+
+    pipeline = [
+        {"$match": {"created_at": {"$gte": cutoff}}},
+        {"$group": {
+            "_id": "$bank_code",
+            "bank_name": {"$first": "$bank_name"},
+            "total_failures_window": {"$sum": {
+                "$cond": [{"$and": [
+                    {"$eq": ["$event_type", "TRANSFER_FAILED"]},
+                    {"$gte": ["$created_at", window_cutoff]}
+                ]}, 1, 0]
+            }},
+            "total_failures": {"$sum": {"$cond": [{"$eq": ["$event_type", "TRANSFER_FAILED"]}, 1, 0]}},
+            "total_successes": {"$sum": {"$cond": [{"$eq": ["$event_type", "TRANSFER_SUCCESS"]}, 1, 0]}},
+            "last_event": {"$max": "$created_at"},
+        }}
+    ]
+    results = await db.bank_health_events.aggregate(pipeline).to_list(500)
+
+    banks = []
+    for r in results:
+        total = r["total_failures"] + r["total_successes"]
+        health_pct = round(r["total_successes"] / total * 100, 1) if total > 0 else 100.0
+        banks.append({
+            "bank_code": r["_id"],
+            "bank_name": r.get("bank_name") or r["_id"],
+            "failures_in_window": r["total_failures_window"],
+            "total_failures": r["total_failures"],
+            "total_successes": r["total_successes"],
+            "total_transfers": total,
+            "health_pct": health_pct,
+            "is_flagged": r["total_failures_window"] >= threshold,
+            "last_event": r.get("last_event", ""),
+        })
+
+    banks.sort(key=lambda x: (-x["failures_in_window"], x["bank_name"]))
+    return {
+        "banks": banks,
+        "config": {"mode": mode, "failure_threshold": threshold, "time_window_hours": window},
+        "window_hours": hours,
+    }
+
+
+@router.delete("/admin/bank-network/clear-events")
+async def clear_bank_health_events(request: Request, bank_code: str = ""):
+    """Clear bank health events (for testing/reset). If bank_code given, clears only that bank."""
+    await get_admin_user(request)
+    query = {"bank_code": bank_code} if bank_code else {}
+    result = await db.bank_health_events.delete_many(query)
+    return {"ok": True, "deleted": result.deleted_count}
