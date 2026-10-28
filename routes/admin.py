@@ -368,6 +368,85 @@ async def admin_blocked_users(request: Request):
         })
     return {"blocked_users": blocked, "total": len(blocked)}
 
+@router.get("/admin/fraud/overview")
+async def admin_fraud_overview(request: Request):
+    """Fraud & Risk dashboard overview stats."""
+    await get_admin_user(request)
+    now = datetime.now(timezone.utc)
+    today    = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    open_alerts        = await db.fraud_alerts.count_documents({"status": "OPEN"})
+    blocked_users      = await db.users.count_documents({"status": "SUSPENDED"})
+    open_disputes      = await db.disputes.count_documents({"status": {"$in": ["submitted", "under_review"]}})
+    total_disputes     = await db.disputes.count_documents({})
+    resolved_disp      = await db.disputes.count_documents({"status": "resolved"})
+    auto_blocked_today = await db.fraud_alerts.count_documents({"auto_blocked": True, "created_at": {"$gte": today}})
+    risk_queue_size    = await db.risk_assessments.count_documents({"score": {"$gte": 50}, "reviewed": False})
+
+    band_dist: dict = {"low": 0, "moderate": 0, "high": 0, "critical": 0}
+    async for row in db.risk_assessments.aggregate([
+        {"$match": {"created_at": {"$gte": week_ago}}},
+        {"$group": {"_id": "$band", "count": {"$sum": 1}}},
+    ]):
+        if row["_id"] in band_dist:
+            band_dist[row["_id"]] = row["count"]
+    total_assessed = sum(band_dist.values())
+
+    recent_alerts_raw = await db.fraud_alerts.find({"status": "OPEN"}).sort("created_at", -1).to_list(5)
+    recent_alerts = []
+    for a in recent_alerts_raw:
+        a["_id"] = str(a["_id"])
+        if a.get("user_id"):
+            try:
+                u = await db.users.find_one({"_id": ObjectId(a["user_id"])}, {"first_name":1,"last_name":1,"phone":1})
+                if u:
+                    a["user_name"]  = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+                    a["user_phone"] = u.get("phone", "")
+            except Exception:
+                pass
+        recent_alerts.append(a)
+
+    recent_disputes_raw = await db.disputes.find(
+        {"status": {"$in": ["submitted","under_review"]}}).sort("created_at", -1).to_list(5)
+    recent_disputes = [{**d, "_id": str(d["_id"])} for d in recent_disputes_raw]
+
+    # Reversal stats (graceful — collection may not exist yet)
+    try:
+        pending_rev_count = await db.reversal_records.count_documents({"status": "pending_review"})
+        pending_rev_agg = await db.reversal_records.aggregate([
+            {"$match": {"status": "pending_review"}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}}},
+        ]).to_list(1)
+        pending_rev_amount = pending_rev_agg[0]["total"] if pending_rev_agg else 0
+        resolved_this_week = await db.reversal_records.count_documents({
+            "status": {"$in": ["manual_refund", "retry", "write_off"]},
+            "updated_at": {"$gte": week_ago},
+        })
+    except Exception:
+        pending_rev_count = 0; pending_rev_amount = 0; resolved_this_week = 0
+
+    return {
+        "stats": {
+            "open_alerts":          open_alerts,
+            "blocked_users":        blocked_users,
+            "open_disputes":        open_disputes,
+            "total_disputes":       total_disputes,
+            "resolved_disputes":    resolved_disp,
+            "auto_blocked_today":   auto_blocked_today,
+            "risk_queue_size":      risk_queue_size,
+            "total_assessed_week":  total_assessed,
+        },
+        "risk_band_distribution": band_dist,
+        "recent_alerts":          recent_alerts,
+        "recent_disputes":        recent_disputes,
+        "reversal_stats": {
+            "pending_count":       pending_rev_count,
+            "amount_at_risk_kobo": pending_rev_amount,
+            "resolved_this_week":  resolved_this_week,
+        },
+    }
+
 @router.post("/admin/fraud/bulk-block")
 async def admin_bulk_block(request: Request):
     admin = await get_admin_user(request)
