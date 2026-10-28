@@ -20,7 +20,7 @@ from core import (
     call_cdh, call_pg, get_service_provider, get_sh_vas_cat_id,
     CDH_AIRTIME_NETWORK_IDS, CDH_ELECTRICITY_DISCO_IDS, CDH_DATA_PLANS, CDH_CABLE_PLANS,
     PG_DISCO_SLUGS, get_service_bucket_account, NIGERIAN_BANKS, SAFEHAVEN_OWN_BANK_CODE,
-    send_otp_sms, send_email, _email_html, FRONTEND_URL,
+    send_otp_sms, send_email, _email_html, FRONTEND_URL, get_rewards_config,
 )
 
 # Import RBAC helpers (lazy-imported inside functions to avoid circular imports at module load)
@@ -1107,6 +1107,8 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
         })
         account_name = ne.get("data", {}).get("accountName") or ne.get("accountName", "Unknown")
         ne_ref = ne.get("data", {}).get("sessionId") or f"NEQ{secrets.token_hex(8).upper()}"
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Name enquiry failed: {e}")
 
@@ -1146,8 +1148,9 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
             "narration": req.narration or "Merchant Transfer",
             "paymentReference": txn_ref,
         })
+    except HTTPException:
+        raise
     except Exception as e:
-        # Record provider failure against this bank
         asyncio.create_task(_record_bank_health_event(req.bank_code, bank_name, m["merchant_id"], txn_ref, "TRANSFER_FAILED"))
         raise HTTPException(502, f"Transfer failed: {e}")
 
@@ -1354,6 +1357,7 @@ async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
         m.get("mode", "sandbox"),
         {"network": req.network, "phone": req.phone_number, "provider_ref": pref, "provider": provider}
     )
+    asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "AIRTIME", f"{req.network} airtime"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "network": req.network, "phone": req.phone_number}
 
@@ -1408,6 +1412,7 @@ async def merchant_buy_data(req: MerchantDataReq, request: Request):
         m.get("mode", "sandbox"),
         {"network": req.network, "phone": req.phone_number, "plan_id": req.plan_id, "provider_ref": pref, "provider": provider}
     )
+    asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "DATA", f"{req.network} data"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "network": req.network, "phone": req.phone_number, "plan_id": req.plan_id}
 
@@ -1496,6 +1501,7 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
         except Exception as sms_err:
             logger.warning(f"[MERCHANT ELEC SMS] {sms_err}")
 
+    asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "ELECTRICITY", f"{req.disco} electricity"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "token": token, "units": units, "meter_number": req.meter_number}
 
@@ -1551,6 +1557,7 @@ async def merchant_pay_cable(req: MerchantCableReq, request: Request):
         {"provider": req.provider, "smartcard": req.smartcard_number,
          "package_id": req.package_id, "provider_ref": pref}
     )
+    asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "CABLE_TV", f"{req.provider} cable TV"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "provider": req.provider, "smartcard": req.smartcard_number}
 
@@ -2301,3 +2308,109 @@ async def admin_respond_dispute(dispute_id: str, request: Request):
         {"$set": {"admin_response": body.get("response", ""), "status": body.get("status", "under_review"), "updated_at": now_utc()}}
     )
     return {"message": "Response sent"}
+
+
+# ─── MERCHANT REWARDS ─────────────────────────────────────────────────────────
+
+async def _credit_merchant_cashback_bg(merchant_id: str, amount_naira: float, txn_type: str, description: str):
+    """Mirror of consumer _credit_cashback_bg but for the merchants collection."""
+    try:
+        cfg = await get_rewards_config()
+        if not cfg.get("cashback_enabled"):
+            return
+        rate_key = {
+            "AIRTIME": "airtime_cashback_pct", "DATA": "data_cashback_pct",
+            "ELECTRICITY": "electricity_cashback_pct", "CABLE_TV": "cable_cashback_pct",
+        }.get(txn_type)
+        if not rate_key:
+            return
+        rate = cfg.get(rate_key, 1.0)
+        cashback_naira = min(round(amount_naira * rate / 100, 2), cfg.get("max_cashback_per_txn_naira", 500))
+        if cashback_naira < 0.01:
+            return
+        cashback_kobo = int(cashback_naira * 100)
+        await db.merchants.update_one(
+            {"merchant_id": merchant_id},
+            {"$inc": {"cashback_balance": cashback_kobo}}
+        )
+        await db.cashback_history.insert_one({
+            "merchant_id": merchant_id, "amount_kobo": cashback_kobo, "type": txn_type,
+            "description": description, "cashback_naira": cashback_naira,
+            "created_at": now_utc()
+        })
+    except Exception as e:
+        logger.warning(f"Merchant cashback credit failed: {e}")
+
+
+@router.get("/v1/merchant/rewards")
+async def get_merchant_rewards(request: Request):
+    m = await get_current_merchant(request)
+    full = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
+    cashback_kobo = (full or {}).get("cashback_balance", 0)
+    referral_kobo = (full or {}).get("referral_balance", 0)
+    referral_code = (full or {}).get("referral_code", "")
+    # Auto-generate referral code if missing
+    if not referral_code:
+        referral_code = f"BIZ{secrets.token_hex(4).upper()}"
+        await db.merchants.update_one(
+            {"merchant_id": m["merchant_id"]},
+            {"$set": {"referral_code": referral_code}}
+        )
+    cfg = await get_rewards_config()
+    cashback_hist = await db.cashback_history.find(
+        {"merchant_id": m["merchant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(20)
+    return {
+        "cashback_balance": round(cashback_kobo / 100, 2),
+        "referral_balance": round(referral_kobo / 100, 2),
+        "referral_code": referral_code,
+        "cashback_history": cashback_hist,
+        "config": {
+            "cashback_enabled": cfg.get("cashback_enabled", True),
+            "airtime_cashback_pct": cfg.get("airtime_cashback_pct", 1.5),
+            "data_cashback_pct": cfg.get("data_cashback_pct", 1.5),
+            "electricity_cashback_pct": cfg.get("electricity_cashback_pct", 1.0),
+            "cable_cashback_pct": cfg.get("cable_cashback_pct", 1.0),
+        }
+    }
+
+
+@router.post("/v1/merchant/rewards/withdraw-cashback")
+async def merchant_withdraw_cashback(request: Request):
+    m = await get_current_merchant(request)
+    full = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
+    kobo = (full or {}).get("cashback_balance", 0)
+    if kobo < 100:
+        raise HTTPException(400, "Minimum withdrawal is ₦1.00")
+    naira = round(kobo / 100, 2)
+    txn_ref = f"CBW_{secrets.token_hex(8).upper()}"
+    await db.merchants.update_one({"merchant_id": m["merchant_id"]}, {"$set": {"cashback_balance": 0}})
+    await db.cashback_history.insert_one({
+        "merchant_id": m["merchant_id"], "amount_kobo": -kobo, "type": "WITHDRAWAL",
+        "description": "Cashback withdrawn", "cashback_naira": -naira,
+        "created_at": now_utc()
+    })
+    await db.merchant_transactions.insert_one({
+        "merchant_id": m["merchant_id"], "transaction_id": txn_ref, "type": "CASHBACK_WITHDRAWAL",
+        "direction": "CREDIT", "amount": kobo, "status": "completed",
+        "description": f"Cashback withdrawal — ₦{naira:,.2f}", "created_at": now_utc()
+    })
+    return {"message": f"₦{naira:,.2f} applied to your next bill!", "amount": naira}
+
+
+@router.post("/v1/merchant/rewards/withdraw-referral")
+async def merchant_withdraw_referral(request: Request):
+    m = await get_current_merchant(request)
+    full = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
+    kobo = (full or {}).get("referral_balance", 0)
+    if kobo < 100:
+        raise HTTPException(400, "Minimum withdrawal is ₦1.00")
+    naira = round(kobo / 100, 2)
+    txn_ref = f"RFW_{secrets.token_hex(8).upper()}"
+    await db.merchants.update_one({"merchant_id": m["merchant_id"]}, {"$set": {"referral_balance": 0}})
+    await db.merchant_transactions.insert_one({
+        "merchant_id": m["merchant_id"], "transaction_id": txn_ref, "type": "REFERRAL_WITHDRAWAL",
+        "direction": "CREDIT", "amount": kobo, "status": "completed",
+        "description": f"Referral bonus withdrawal — ₦{naira:,.2f}", "created_at": now_utc()
+    })
+    return {"message": f"₦{naira:,.2f} applied to your account!", "amount": naira}
