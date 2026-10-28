@@ -426,6 +426,19 @@ async def fraud_overview(request: Request):
         "risk_band_distribution": band_dist,
         "recent_alerts": recent_alerts,
         "recent_disputes": recent_disputes,
+        "reversal_stats": {
+            "pending_count": await db.reversal_records.count_documents({"status": "pending_review"}),
+            "amount_at_risk_kobo": (
+                (await db.reversal_records.aggregate([
+                    {"$match": {"status": "pending_review"}},
+                    {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}}},
+                ]).to_list(1) or [{}])[0].get("total", 0)
+            ),
+            "resolved_this_week": await db.reversal_records.count_documents({
+                "status": {"$in": ["manual_refund", "retry", "write_off"]},
+                "updated_at": {"$gte": week_ago},
+            }),
+        },
     }
 
 
