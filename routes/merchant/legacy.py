@@ -22,6 +22,7 @@ from core import (
     PG_DISCO_SLUGS, get_service_bucket_account, NIGERIAN_BANKS, SAFEHAVEN_OWN_BANK_CODE,
     send_otp_sms, send_email, _email_html, FRONTEND_URL, get_rewards_config,
     send_merchant_alert,
+    calculate_fee, get_nip_fee, calculate_stamp_duty,
 )
 
 # Import RBAC helpers (lazy-imported inside functions to avoid circular imports at module load)
@@ -33,6 +34,38 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 router = APIRouter()
+
+
+# ─── MERCHANT FEE HELPERS ─────────────────────────────────────────────────────
+
+async def _collect_merchant_fee_bg(
+    merchant_sh_acct: str, fee_ngn: float, txn_id: str, bucket_category: str
+) -> None:
+    """Fire-and-forget: sweep BOMPAY fee from merchant SH account → fee bucket.
+    Mirrors _vas_sweep_to_bucket_bg for merchant accounts.
+    Failure is logged but never blocks the completed service."""
+    if fee_ngn <= 0:
+        return
+    try:
+        bucket = await get_service_bucket_account(bucket_category)
+        if not bucket:
+            acct_doc = await db.charge_accounts.find_one({"category": f"{bucket_category}_FEES"})
+            bucket = (acct_doc or {}).get("sh_account_number", "")
+        if not bucket or not merchant_sh_acct:
+            logger.warning(f"[MerchFee] No bucket for {bucket_category} — fee skipped txn={txn_id}")
+            return
+        await call_sh("POST", "/transfers", body={
+            "debitAccountNumber": merchant_sh_acct,
+            "beneficiaryBankCode": SAFEHAVEN_OWN_BANK_CODE,
+            "beneficiaryAccountNumber": bucket,
+            "amount": fee_ngn,
+            "saveBeneficiary": False,
+            "narration": f"BMPAY {bucket_category} fee",
+            "paymentReference": f"MFEE_{txn_id}",
+        })
+        logger.info(f"[MerchFee] ✅ Collected ₦{fee_ngn:.2f} {bucket_category} fee txn={txn_id}")
+    except Exception as e:
+        logger.warning(f"[MerchFee] ⚠️ Fee sweep failed txn={txn_id}: {e}")
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "")
 
 
@@ -1192,6 +1225,14 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
     amount_kobo = int(req.amount * 100)
     txn_ref = f"MTRXN_{secrets.token_hex(8).upper()}"
 
+    # ── Calculate BOMPAY fee (same model as user app) ──────────────────────────
+    bompay_fee   = await calculate_fee("TRANSFER", req.amount)
+    sh_nip_fee   = await get_nip_fee(req.amount)
+    stamp_duty   = await calculate_stamp_duty(req.amount)
+    # BOMPAY margin: the portion above raw NIP fee; SH collects NIP from merchant's account
+    bompay_margin = round(max(bompay_fee - sh_nip_fee, 0.0), 2)
+    fee_kobo = int(bompay_margin * 100)
+
     # Resolve bank name for health tracking
     bank_name = req.bank_code
     try:
@@ -1243,6 +1284,8 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
         "type": "TRANSFER",
         "direction": "DEBIT",
         "amount": amount_kobo,
+        "fee": fee_kobo,
+        "stamp_duty": int(stamp_duty * 100),
         "currency": "NGN",
         "status": txn_status,
         "sh_session_id": sh_session,
@@ -1268,11 +1311,54 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
             "amount": req.amount, "beneficiary": account_name,
             "account": req.account_number, "bank": bank_name, "ref": txn_ref,
         }))
+        # ── Collect BOMPAY margin (fire-and-forget, same as user app) ──────────
+        if bompay_margin > 0:
+            asyncio.create_task(_collect_merchant_fee_bg(
+                acct["sh_account_number"], bompay_margin, txn_ref, "TRANSFER"
+            ))
     return {"message": "Transfer initiated", "transaction": txn_doc, "beneficiary_name": account_name,
-            "sh_status": sh_status_raw, "sh_session_id": sh_session}
+            "sh_status": sh_status_raw, "sh_session_id": sh_session,
+            "fee": bompay_fee, "stamp_duty": stamp_duty, "total": req.amount + bompay_fee + stamp_duty}
 
 
 # ─── NAME ENQUIRY & BANKS (merchant-auth wrappers) ────────────────────────────
+
+@router.get("/v1/merchant/transfers/fee-preview")
+async def merchant_transfer_fee_preview(amount: float, request: Request):
+    """Return itemised fee breakdown for a merchant bank transfer — mirrors /api/transfers/fee-preview."""
+    await get_current_merchant(request)
+    if amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    bompay_fee   = await calculate_fee("TRANSFER", amount)
+    sh_nip_fee   = await get_nip_fee(amount)
+    stamp_duty   = await calculate_stamp_duty(amount)
+    # Bompay margin = bompay_fee − sh_nip_fee (SH collects the raw NIP fee; we collect only our margin)
+    bompay_margin = round(max(bompay_fee - sh_nip_fee, 0.0), 2)
+    return {
+        "amount":         amount,
+        "fee":            bompay_fee,          # alias for frontend compatibility
+        "bompay_fee":     bompay_fee,
+        "sh_nip_fee":     sh_nip_fee,
+        "stamp_duty":     stamp_duty,
+        "bompay_margin":  bompay_margin,
+        "total":          round(amount + bompay_fee + stamp_duty, 2),
+    }
+
+
+@router.get("/v1/merchant/services/fee-preview")
+async def merchant_vas_fee_preview(service: str, amount: float, request: Request):
+    """Return the BOMPAY service fee for a given VAS type and amount."""
+    await get_current_merchant(request)
+    if amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    svc_map = {"AIRTIME": "AIRTIME", "DATA": "DATA",
+               "ELECTRICITY": "ELECTRICITY", "CABLE": "CABLE_TV", "CABLE_TV": "CABLE_TV"}
+    svc = svc_map.get(service.upper())
+    if not svc:
+        raise HTTPException(400, f"Unknown service: {service}")
+    fee = await calculate_fee(svc, amount)
+    return {"service": svc, "amount": amount, "fee": fee, "total": round(amount + fee, 2)}
+
 
 @router.get("/v1/merchant/services/banks")
 async def merchant_banks(request: Request):
@@ -1340,11 +1426,11 @@ async def _get_merch_acct_for_vas(merchant_id: str, account_id: Optional[str]) -
 
 async def _record_merch_vas_txn(merchant_id: str, account_id: str, txn_id: str,
                                   vas_type: str, amount_kobo: int, status: str,
-                                  mode: str, metadata: dict) -> dict:
+                                  mode: str, metadata: dict, fee_kobo: int = 0) -> dict:
     doc = {
         "transaction_id": txn_id, "merchant_id": merchant_id,
         "account_id": account_id, "type": vas_type, "direction": "DEBIT",
-        "amount": amount_kobo, "currency": "NGN", "status": status, "mode": mode,
+        "amount": amount_kobo, "fee": fee_kobo, "currency": "NGN", "status": status, "mode": mode,
         "created_at": now_utc(), "metadata": metadata,
     }
     await db.merchant_transactions.insert_one(doc)
@@ -1398,6 +1484,8 @@ async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
     acct = await _get_merch_acct_for_vas(m["merchant_id"], req.from_account_id)
     txn_ref = f"MVAS_{secrets.token_hex(8).upper()}"
     amt = int(req.amount * 100)
+    fee_ngn  = await calculate_fee("AIRTIME", req.amount)
+    fee_kobo = int(fee_ngn * 100)
 
     provider = await get_service_provider("AIRTIME")
     pref = txn_ref
@@ -1432,13 +1520,17 @@ async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
     txn = await _record_merch_vas_txn(
         m["merchant_id"], acct["account_id"], txn_ref, "AIRTIME", amt, "success",
         m.get("mode", "sandbox"),
-        {"network": req.network, "phone": req.phone_number, "provider_ref": pref, "provider": provider}
+        {"network": req.network, "phone": req.phone_number, "provider_ref": pref, "provider": provider},
+        fee_kobo=fee_kobo,
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "AIRTIME", f"{req.network} airtime"))
     asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_AIRTIME", {
         "amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_ref,
     }))
+    if fee_ngn > 0:
+        asyncio.create_task(_collect_merchant_fee_bg(acct["sh_account_number"], fee_ngn, txn_ref, "VAS"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
+            "fee": fee_ngn, "total": req.amount + fee_ngn,
             "network": req.network, "phone": req.phone_number}
 
 
@@ -1456,6 +1548,8 @@ async def merchant_buy_data(req: MerchantDataReq, request: Request):
     acct = await _get_merch_acct_for_vas(m["merchant_id"], req.from_account_id)
     txn_ref = f"MVAS_{secrets.token_hex(8).upper()}"
     amt = int(req.amount * 100)
+    fee_ngn  = await calculate_fee("DATA", req.amount)
+    fee_kobo = int(fee_ngn * 100)
 
     provider = await get_service_provider("DATA")
     pref = txn_ref
@@ -1490,14 +1584,18 @@ async def merchant_buy_data(req: MerchantDataReq, request: Request):
     await _record_merch_vas_txn(
         m["merchant_id"], acct["account_id"], txn_ref, "DATA", amt, "success",
         m.get("mode", "sandbox"),
-        {"network": req.network, "phone": req.phone_number, "plan_id": req.plan_id, "provider_ref": pref, "provider": provider}
+        {"network": req.network, "phone": req.phone_number, "plan_id": req.plan_id, "provider_ref": pref, "provider": provider},
+        fee_kobo=fee_kobo,
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "DATA", f"{req.network} data"))
     asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_DATA", {
         "amount": req.amount, "network": req.network, "phone": req.phone_number,
         "plan": req.plan_id, "ref": txn_ref,
     }))
+    if fee_ngn > 0:
+        asyncio.create_task(_collect_merchant_fee_bg(acct["sh_account_number"], fee_ngn, txn_ref, "VAS"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
+            "fee": fee_ngn, "total": req.amount + fee_ngn,
             "network": req.network, "phone": req.phone_number, "plan_id": req.plan_id}
 
 
@@ -1517,6 +1615,8 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
     acct = await _get_merch_acct_for_vas(m["merchant_id"], req.from_account_id)
     txn_ref = f"MVAS_{secrets.token_hex(8).upper()}"
     amt = int(req.amount * 100)
+    fee_ngn  = await calculate_fee("ELECTRICITY", req.amount)
+    fee_kobo = int(fee_ngn * 100)
 
     provider = await get_service_provider("ELECTRICITY")
     pref = txn_ref
@@ -1566,7 +1666,8 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
         m["merchant_id"], acct["account_id"], txn_ref, "ELECTRICITY", amt, "success",
         m.get("mode", "sandbox"),
         {"disco": req.disco, "meter": req.meter_number, "token": token, "units": units,
-         "provider_ref": pref, "provider": provider}
+         "provider_ref": pref, "provider": provider},
+        fee_kobo=fee_kobo,
     )
 
     # Send electricity token SMS to customer (non-blocking)
@@ -1590,7 +1691,10 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
         "amount": req.amount, "meter": req.meter_number, "disco": req.disco,
         "token": token, "units": units or "N/A", "ref": txn_ref,
     }))
+    if fee_ngn > 0:
+        asyncio.create_task(_collect_merchant_fee_bg(acct["sh_account_number"], fee_ngn, txn_ref, "VAS"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
+            "fee": fee_ngn, "total": req.amount + fee_ngn,
             "token": token, "units": units, "meter_number": req.meter_number}
 
 
@@ -1608,6 +1712,8 @@ async def merchant_pay_cable(req: MerchantCableReq, request: Request):
     acct = await _get_merch_acct_for_vas(m["merchant_id"], req.from_account_id)
     txn_ref = f"MVAS_{secrets.token_hex(8).upper()}"
     amt = int(req.amount * 100)
+    fee_ngn  = await calculate_fee("CABLE_TV", req.amount)
+    fee_kobo = int(fee_ngn * 100)
 
     provider = await get_service_provider("CABLE")
     pref = txn_ref
@@ -1643,14 +1749,18 @@ async def merchant_pay_cable(req: MerchantCableReq, request: Request):
         m["merchant_id"], acct["account_id"], txn_ref, "CABLE", amt, "success",
         m.get("mode", "sandbox"),
         {"provider": req.provider, "smartcard": req.smartcard_number,
-         "package_id": req.package_id, "provider_ref": pref}
+         "package_id": req.package_id, "provider_ref": pref},
+        fee_kobo=fee_kobo,
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "CABLE_TV", f"{req.provider} cable TV"))
     asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_CABLE", {
         "amount": req.amount, "provider": req.provider,
         "smartcard": req.smartcard_number, "ref": txn_ref,
     }))
+    if fee_ngn > 0:
+        asyncio.create_task(_collect_merchant_fee_bg(acct["sh_account_number"], fee_ngn, txn_ref, "VAS"))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
+            "fee": fee_ngn, "total": req.amount + fee_ngn,
             "provider": req.provider, "smartcard": req.smartcard_number}
 
 
