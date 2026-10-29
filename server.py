@@ -32,8 +32,72 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).parent
 
+_API_DESCRIPTION = """
+## Bompay — Nigerian Financial Super-App & Merchant Services Platform
+
+BOMPAY provides virtual accounts, bank transfers, bill payments, hosted checkout, and a full 
+commerce suite for merchants in Nigeria.
+
+---
+
+### Authentication
+Bompay uses **cookie-based JWT authentication**. Every protected endpoint expects one of the 
+following cookies to be present in the request:
+
+| Cookie | Scope |
+|---|---|
+| `access_token` | Consumer user endpoints (`/api/auth/*`, `/api/transfers/*`, etc.) |
+| `merchant_access_token` | Merchant dashboard endpoints (`/api/v1/merchant/*`) |
+| `access_token` (admin role) | Admin console endpoints (`/api/admin/*`) |
+
+To authenticate from a REST client, first call the relevant login endpoint and capture the 
+`Set-Cookie` header, then replay the cookie on subsequent requests.
+
+---
+
+### Base URLs
+| Environment | Base URL |
+|---|---|
+| Production | `https://bompay.app` |
+| Preview | `https://bompay-ledger.preview.emergentagent.com` |
+
+---
+
+### Amounts
+All monetary amounts are expressed in **kobo** (1 NGN = 100 kobo) as integers.  
+Never use floating-point values for money fields.
+"""
+
+_OPENAPI_TAGS = [
+    {"name": "Auth",          "description": "Consumer user registration, login, token refresh, MFA"},
+    {"name": "Wallet",        "description": "Virtual accounts, balances, funding, account management"},
+    {"name": "Transfers",     "description": "Bank transfers, name-enquiry, beneficiaries, bank health"},
+    {"name": "Transactions",  "description": "Transaction history, receipts, disputes"},
+    {"name": "VAS",           "description": "Value-Added Services — airtime, data, electricity, cable TV"},
+    {"name": "Merchant",      "description": "Merchant auth, dashboard, settings, team members, KYB"},
+    {"name": "Checkout",      "description": "Hosted checkout sessions and payment processing"},
+    {"name": "Storefront",    "description": "E-commerce stores, products, inventory, orders"},
+    {"name": "Payment Links", "description": "Fixed, variable, and invoice payment links"},
+    {"name": "Fraud",         "description": "Risk assessment, consumer disputes, velocity rules"},
+    {"name": "KYC",           "description": "Identity verification (BVN/NIN/Gov ID) and face liveness"},
+    {"name": "Admin",         "description": "Admin-only platform management, KYB decisions, fee rules"},
+    {"name": "Notifications", "description": "Push subscriptions and in-app notification feeds"},
+    {"name": "Webhooks",      "description": "Webhook endpoint management and delivery logs"},
+    {"name": "Support",       "description": "Customer support tickets, live chat sessions"},
+    {"name": "ePOS",          "description": "Electronic Point-of-Sale activation and QR payments"},
+    {"name": "Savings",       "description": "Savings plans and goals"},
+    {"name": "Rewards",       "description": "Cashback, referral rewards, points redemption"},
+    {"name": "Cards",         "description": "Virtual card issuance and management"},
+    {"name": "Blog",          "description": "Public blog posts and articles"},
+    {"name": "Health",        "description": "Service health and readiness checks"},
+]
+
 app = FastAPI(
-    title="Bompay API", version="1.0.0",
+    title="Bompay API",
+    version="1.0.0",
+    description=_API_DESCRIPTION,
+    contact={"name": "Bompay Developer Support", "url": "https://bompay.app/developers", "email": "developers@bompay.app"},
+    license_info={"name": "Proprietary", "url": "https://bompay.app/legal"},
     docs_url=None, redoc_url=None, openapi_url=None,  # disabled — protected endpoints below
 )
 api_router = APIRouter(prefix="/api")
@@ -181,6 +245,41 @@ async def validation_handler(request: Request, exc: RequestValidationError):
     msgs = [f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": "; ".join(msgs)})
 
+# ===== CUSTOM OPENAPI SCHEMA =====
+from fastapi.openapi.utils import get_openapi
+
+def _build_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        contact=app.contact,
+        license_info=app.license_info,
+        routes=app.routes,
+        tags=_OPENAPI_TAGS,
+    )
+    schema.setdefault("components", {})
+    schema["components"]["securitySchemes"] = {
+        "UserCookie": {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "access_token",
+            "description": "JWT issued on consumer login (`POST /api/auth/login`)",
+        },
+        "MerchantCookie": {
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "merchant_access_token",
+            "description": "JWT issued on merchant login (`POST /api/v1/merchant/login`)",
+        },
+    }
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = _build_openapi
+
 # ===== PROTECTED API DOCS (admin only) =====
 ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "false").lower() == "true"
 
@@ -220,14 +319,37 @@ from routes import (
     kyc_liveness, fraud,
 )
 
-for mod in [
-    auth, wallet, transfers, transactions, vas,
-    savings, loans, rewards, notifications, ajo,
-    admin, webhooks, blog, support, cron,
-    push, epos, promotions, family, business, cards, merchant, checkout, chat,
-    kyc_liveness, fraud,
-]:
-    app.include_router(mod.router, prefix="/api")
+_router_tags: dict = {
+    auth:         ["Auth"],
+    wallet:       ["Wallet"],
+    transfers:    ["Transfers"],
+    transactions: ["Transactions"],
+    vas:          ["VAS"],
+    savings:      ["Savings"],
+    loans:        ["Savings"],
+    rewards:      ["Rewards"],
+    notifications:["Notifications"],
+    ajo:          ["Savings"],
+    admin:        ["Admin"],
+    webhooks:     ["Webhooks"],
+    blog:         ["Blog"],
+    support:      ["Support"],
+    cron:         ["Health"],
+    push:         ["Notifications"],
+    epos:         ["ePOS"],
+    promotions:   ["Rewards"],
+    family:       ["Wallet"],
+    business:     ["Merchant"],
+    cards:        ["Cards"],
+    merchant:     ["Merchant"],
+    checkout:     ["Checkout"],
+    chat:         ["Support"],
+    kyc_liveness: ["KYC"],
+    fraud:        ["Fraud"],
+}
+
+for mod in _router_tags:
+    app.include_router(mod.router, prefix="/api", tags=_router_tags[mod])
 
 # ===== HEALTH CHECK =====
 @app.get("/api/health")
