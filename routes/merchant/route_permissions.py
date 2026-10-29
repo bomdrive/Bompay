@@ -72,6 +72,11 @@ ROUTE_PERMISSION_MAP: List[Tuple[str, str, List[str]]] = [
     # Logs
     ("GET",    "/api/v1/merchant/logs",                              ["developer.logs.read"]),
 
+    # Settings — PIN and password change are allowed for any authenticated member
+    # (more specific entries must come BEFORE the general /settings prefix)
+    ("PUT",    "/api/v1/merchant/settings/pin",                      []),
+    ("PUT",    "/api/v1/merchant/settings/password",                 []),
+
     # Settings
     ("PUT",    "/api/v1/merchant/settings",                          ["settings.update"]),
 
