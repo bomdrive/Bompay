@@ -12,7 +12,7 @@ import cloudinary
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.errors import RateLimitExceeded
@@ -283,29 +283,140 @@ app.openapi = _build_openapi
 # ===== PROTECTED API DOCS (admin only) =====
 ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "false").lower() == "true"
 
+_DOCS_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bompay API — Admin Sign In</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#0B1F3A;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  .card{background:#fff;border-radius:16px;padding:40px 36px;width:100%;max-width:380px;
+        box-shadow:0 24px 64px rgba(0,0,0,.35)}
+  .logo{display:flex;align-items:center;gap:10px;margin-bottom:28px}
+  .logo-icon{width:38px;height:38px;background:#1240AB;border-radius:10px;display:flex;
+             align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:16px}
+  .logo-text{font-size:17px;font-weight:700;color:#0B1F3A}
+  .logo-sub{font-size:11px;color:#64748B;margin-top:1px}
+  h1{font-size:20px;font-weight:700;color:#0B1F3A;margin-bottom:6px}
+  p{font-size:13px;color:#64748B;margin-bottom:28px}
+  label{display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;letter-spacing:.4px}
+  input{width:100%;padding:12px 14px;border:1.5px solid #E5E7EB;border-radius:10px;
+        font-size:14px;color:#111;outline:none;transition:border-color .15s}
+  input:focus{border-color:#1240AB}
+  .field{margin-bottom:18px}
+  .btn{width:100%;padding:13px;background:#1240AB;color:#fff;border:none;border-radius:10px;
+       font-size:15px;font-weight:700;cursor:pointer;margin-top:8px;transition:background .15s}
+  .btn:hover{background:#0f3590}
+  .btn:disabled{background:#93a8d6;cursor:not-allowed}
+  .err{background:#FEF2F2;color:#B91C1C;border:1px solid #FECACA;border-radius:8px;
+       padding:10px 14px;font-size:13px;margin-top:14px;display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">B</div>
+    <div>
+      <div class="logo-text">Bompay API</div>
+      <div class="logo-sub">Admin access required</div>
+    </div>
+  </div>
+  <h1>Sign in to continue</h1>
+  <p>Use your Bompay admin credentials to access the API documentation.</p>
+  <form id="f">
+    <div class="field">
+      <label for="email">EMAIL ADDRESS</label>
+      <input id="email" type="email" placeholder="admin@bompay.app" autocomplete="username" required>
+    </div>
+    <div class="field">
+      <label for="pass">PASSWORD</label>
+      <input id="pass" type="password" placeholder="Enter your password" autocomplete="current-password" required>
+    </div>
+    <button class="btn" id="btn" type="submit">Sign In</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<script>
+document.getElementById('f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('err');
+  btn.disabled = true; btn.textContent = 'Signing in…'; err.style.display = 'none';
+  try {
+    const res = await fetch('/api/auth/login', {
+      method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email: document.getElementById('email').value,
+                            password: document.getElementById('pass').value})
+    });
+    const data = await res.json();
+    if (res.ok && data.user && data.user.role === 'admin') {
+      window.location.href = '/api/docs';
+    } else if (res.ok && data.user && data.user.role !== 'admin') {
+      err.textContent = 'Access denied — admin account required.';
+      err.style.display = 'block';
+    } else {
+      err.textContent = data.detail || 'Invalid email or password.';
+      err.style.display = 'block';
+    }
+  } catch(ex) {
+    err.textContent = 'Network error. Please try again.';
+    err.style.display = 'block';
+  }
+  btn.disabled = false; btn.textContent = 'Sign In';
+});
+</script>
+</body>
+</html>"""
+
+
+@app.get("/api/docs/login", include_in_schema=False)
+async def docs_login_page(request: Request):
+    if not ENABLE_DOCS:
+        raise HTTPException(404, "Not found")
+    # If already authenticated as admin, redirect straight to docs
+    try:
+        user = await get_current_user(request)
+        if user.get("role") == "admin":
+            return RedirectResponse("/api/docs")
+    except Exception:
+        pass
+    return HTMLResponse(_DOCS_LOGIN_HTML)
+
 @app.get("/api/docs", include_in_schema=False)
 async def admin_swagger(request: Request):
     if not ENABLE_DOCS:
         raise HTTPException(404, "Not found")
-    user = await get_current_user(request)
+    try:
+        user = await get_current_user(request)
+    except Exception:
+        return RedirectResponse("/api/docs/login")
     if user.get("role") != "admin":
-        raise HTTPException(403, "Admin access required")
+        return RedirectResponse("/api/docs/login")
     return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Bompay API Docs")
 
 @app.get("/api/redoc", include_in_schema=False)
 async def admin_redoc(request: Request):
     if not ENABLE_DOCS:
         raise HTTPException(404, "Not found")
-    user = await get_current_user(request)
+    try:
+        user = await get_current_user(request)
+    except Exception:
+        return RedirectResponse("/api/docs/login")
     if user.get("role") != "admin":
-        raise HTTPException(403, "Admin access required")
+        return RedirectResponse("/api/docs/login")
     return get_redoc_html(openapi_url="/api/openapi.json", title="Bompay API ReDoc")
 
 @app.get("/api/openapi.json", include_in_schema=False)
 async def admin_openapi(request: Request):
     if not ENABLE_DOCS:
         raise HTTPException(404, "Not found")
-    user = await get_current_user(request)
+    try:
+        user = await get_current_user(request)
+    except Exception:
+        raise HTTPException(401, "Not authenticated")
     if user.get("role") != "admin":
         raise HTTPException(403, "Admin access required")
     return JSONResponse(app.openapi())
