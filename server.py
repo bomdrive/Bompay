@@ -352,9 +352,9 @@ document.getElementById('f').addEventListener('submit', async function(e){
                             password: document.getElementById('pass').value})
     });
     const data = await res.json();
-    if (res.ok && data.user && data.user.role === 'admin') {
+    if (res.ok && data.role === 'admin') {
       window.location.href = '/api/docs';
-    } else if (res.ok && data.user && data.user.role !== 'admin') {
+    } else if (res.ok && data.role && data.role !== 'admin') {
       err.textContent = 'Access denied — admin account required.';
       err.style.display = 'block';
     } else {
