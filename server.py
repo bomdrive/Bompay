@@ -217,7 +217,7 @@ from routes import (
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
     push, epos, promotions, family, business, cards, merchant, checkout, chat,
-    kyc_liveness,
+    kyc_liveness, fraud,
 )
 
 for mod in [
@@ -225,7 +225,7 @@ for mod in [
     savings, loans, rewards, notifications, ajo,
     admin, webhooks, blog, support, cron,
     push, epos, promotions, family, business, cards, merchant, checkout, chat,
-    kyc_liveness,
+    kyc_liveness, fraud,
 ]:
     app.include_router(mod.router, prefix="/api")
 
@@ -297,6 +297,22 @@ async def startup():
     await db.otp_sessions.create_index("expires_at", expireAfterSeconds=0)
     await db.biometric_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.webauthn_challenges.create_index("expires_at", expireAfterSeconds=0)
+
+    # ── Fraud & Risk collections ──────────────────────────────────────────────
+    await db.risk_assessments.create_index([("user_id", 1), ("created_at", -1)])
+    await db.risk_assessments.create_index([("score", -1)])
+    await db.risk_assessments.create_index("transaction_id", sparse=True)
+    await db.disputes.create_index("dispute_id", unique=True)
+    await db.disputes.create_index([("user_id", 1), ("created_at", -1)])
+    await db.disputes.create_index([("status", 1), ("created_at", -1)])
+    await db.fraud_rules.create_index("rule_id", unique=True)
+    await db.reversal_records.create_index("transaction_id", unique=True, sparse=True)
+    await db.reversal_records.create_index([("status", 1), ("created_at", -1)])
+    await db.revoked_devices.create_index([("user_id", 1), ("device_id", 1)], unique=True)
+
+    # Seed default fraud rules if none exist
+    from routes.fraud import seed_default_rules
+    await seed_default_rules()
 
     # ── RBAC collections ──────────────────────────────────────────────────────
     await db.merchant_members.create_index(

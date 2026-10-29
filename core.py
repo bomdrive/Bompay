@@ -3113,3 +3113,187 @@ async def _run_sms_billing(run_id: str):
                 logger.warning(f"[SMS Billing] SH transfer failed for user {uid}: {e}")
         billed += 1
     logger.info(f"[SMS Billing] run_id={run_id} billed {billed} users for {billing_month}")
+
+
+# ===== MERCHANT SMS ALERT HELPER =====
+
+def _build_merchant_alert_email(biz_name: str, event_type: str, metadata: dict, sms_body: str) -> str:
+    title = event_type.replace("MERCHANT_", "").replace("_", " ").title()
+    rows = "".join(
+        f'<tr><td style="padding:6px 12px;color:#555;font-size:13px">{k.replace("_"," ").title()}</td>'
+        f'<td style="padding:6px 12px;font-weight:600;font-size:13px">{v}</td></tr>'
+        for k, v in metadata.items() if v and k not in ("ref", "provider")
+    )
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#fff">
+      <div style="background:#0B1F3A;padding:24px 32px">
+        <h1 style="color:#fff;font-size:18px;margin:0">BOMPAY Business Alert</h1>
+        <p style="color:rgba(255,255,255,.6);font-size:13px;margin:4px 0 0">{biz_name}</p>
+      </div>
+      <div style="padding:28px 32px">
+        <p style="font-size:15px;font-weight:700;color:#0B1F3A;margin:0 0 16px">{title} Successful</p>
+        <table style="width:100%;border-collapse:collapse;border:1px solid #E2E8F0;border-radius:8px;overflow:hidden">
+          {rows}
+          <tr style="background:#F8FAFC">
+            <td style="padding:6px 12px;color:#555;font-size:13px">Reference</td>
+            <td style="padding:6px 12px;font-weight:600;font-size:13px;font-family:monospace">{metadata.get("ref","")}</td>
+          </tr>
+        </table>
+        <p style="font-size:12px;color:#94A3B8;margin:20px 0 0">
+          You received this because your business has alert notifications enabled. 
+          Manage preferences in the Bompay Business app under Profile → Notifications.
+        </p>
+      </div>
+    </div>"""
+
+
+async def send_merchant_alert(merchant_id: str, event_type: str, metadata: dict) -> None:
+    """Send SMS and email alerts to a merchant's configured notification contacts.
+    Logs each SMS to sms_logs with entity_type='merchant' for billing. Never raises."""
+    try:
+        settings = await db.merchant_notification_settings.find_one({"merchant_id": merchant_id})
+        if not settings:
+            return
+
+        _MERCH_TEMPLATES = {
+            "MERCHANT_AIRTIME": lambda m: f"BOMPAY Biz: NGN{m.get('amount',0):,.0f} {m.get('network','')} airtime to {m.get('phone','')} successful. Ref: {m.get('ref','')}",
+            "MERCHANT_DATA":    lambda m: f"BOMPAY Biz: {m.get('plan','')} data for {m.get('phone','')} on {m.get('network','')} successful. Ref: {m.get('ref','')}",
+            "MERCHANT_ELECTRICITY": lambda m: (
+                f"BOMPAY Biz: NGN{m.get('amount',0):,.0f} electricity. Token: {m.get('token','')} | {m.get('units','')} units | Meter: {m.get('meter','')}. Ref: {m.get('ref','')}"
+                if m.get("token") and m["token"] not in ("", "N/A")
+                else f"BOMPAY Biz: NGN{m.get('amount',0):,.0f} electricity paid for Meter {m.get('meter','')}, {m.get('disco','')}. Token pending. Ref: {m.get('ref','')}"
+            ),
+            "MERCHANT_CABLE":    lambda m: f"BOMPAY Biz: NGN{m.get('amount',0):,.0f} {m.get('provider','')} cable paid for smartcard {m.get('smartcard','')}. Ref: {m.get('ref','')}",
+            "MERCHANT_TRANSFER": lambda m: f"BOMPAY Biz: NGN{m.get('amount',0):,.0f} transferred to {m.get('beneficiary','')} ({m.get('account','')}/{m.get('bank','')}). Ref: {m.get('ref','')}",
+        }
+        fn = _MERCH_TEMPLATES.get(event_type)
+        if not fn:
+            return
+        body = fn(metadata)
+        if not body:
+            return
+
+        # ── SMS ──────────────────────────────────────────────────────────────────
+        if settings.get("sms_enabled", True) and settings.get("phones"):
+            active_provider = await get_sms_provider()
+            for phone_raw in settings["phones"][:5]:
+                phone = phone_raw.strip()
+                if phone.startswith("0"):
+                    phone = "+234" + phone[1:]
+                elif not phone.startswith("+"):
+                    phone = "+234" + phone
+                log_id = str(uuid.uuid4())
+                await db.sms_logs.insert_one({
+                    "log_id": log_id, "merchant_id": merchant_id, "entity_type": "merchant",
+                    "phone": phone, "event_type": event_type, "body": body,
+                    "status": "SENDING", "billed": False, "provider": active_provider,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+                try:
+                    if active_provider == "BULKSMSLIVE":
+                        result = await _send_via_bulksms(phone, body)
+                    elif active_provider == "STROWALLET":
+                        result = await _send_via_strowallet_sms(phone, body)
+                    elif active_provider == "TERMII":
+                        result = await _send_via_termii(phone, body, channel="dnd")
+                    else:
+                        result = await _send_via_sendora(phone, body)
+                    await db.sms_logs.update_one({"log_id": log_id}, {"$set": {
+                        "status": "SENT" if result.get("ok") else "FAILED",
+                        "provider_ref": result.get("ref"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }})
+                except Exception as exc:
+                    await db.sms_logs.update_one({"log_id": log_id}, {"$set": {
+                        "status": "FAILED", "error": str(exc),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }})
+
+        # ── Email ─────────────────────────────────────────────────────────────────
+        if settings.get("email_enabled", True) and settings.get("emails"):
+            subject = f"BOMPAY Business — {event_type.replace('MERCHANT_','').replace('_',' ').title()} Alert"
+            merch_doc = await db.merchants.find_one({"merchant_id": merchant_id}, {"business_name": 1})
+            biz_name = (merch_doc or {}).get("business_name", "Your Business")
+            html_body = _build_merchant_alert_email(biz_name, event_type, metadata, body)
+            for email in settings["emails"][:5]:
+                asyncio.create_task(send_email(to=email, subject=subject, html=html_body))
+
+    except Exception as exc:
+        logger.error(f"[MERCHANT ALERT] {merchant_id} {event_type}: {exc}")
+
+
+# ===== MERCHANT SMS BILLING HELPER =====
+
+async def _run_merchant_sms_billing(run_id: str):
+    """Debit each merchant's primary SH account for their monthly SMS usage."""
+    cfg = await get_sms_config()
+    unit_cost = float(cfg.get("merchant_sms_cost_ngn", cfg.get("unit_cost_ngn", 4.0)))
+    acct_doc  = await db.charge_accounts.find_one({"category": "SMS_CHARGES"})
+    sh_charge_acct = (acct_doc or {}).get("sh_account_number", "")
+    now = datetime.now(timezone.utc)
+    billing_month = now.strftime("%Y-%m")
+    month_start   = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    pipeline = [
+        {"$match": {"entity_type": "merchant", "status": "SENT",
+                    "billed": {"$ne": True}, "created_at": {"$gte": month_start}}},
+        {"$group": {"_id": "$merchant_id", "count": {"$sum": 1}}},
+    ]
+    merchant_usage = await db.sms_logs.aggregate(pipeline).to_list(1000)
+
+    billed = 0
+    for usage in merchant_usage:
+        merchant_id = usage["_id"]
+        sms_count   = usage["count"]
+        if not merchant_id:
+            continue
+        idem = f"merch-sms-{billing_month}-{merchant_id}"
+        if await db.merchant_transactions.find_one({"idempotency_key": idem}):
+            continue
+
+        charge_ngn  = round(sms_count * unit_cost, 2)
+        charge_kobo = int(charge_ngn * 100)
+
+        primary_acct = await db.merchant_accounts.find_one(
+            {"merchant_id": merchant_id, "type": "primary"},
+            {"sh_account_number": 1, "account_id": 1}
+        )
+        if not primary_acct or not primary_acct.get("sh_account_number"):
+            logger.warning(f"[Merchant SMS Billing] No primary SH account for {merchant_id}")
+            continue
+        if not sh_charge_acct:
+            logger.warning("[Merchant SMS Billing] No SMS_CHARGES charge account set in admin")
+            continue
+
+        txn_id = f"MSMSB{secrets.token_hex(10).upper()}"
+        try:
+            await call_sh("POST", "/transfers", body={
+                "debitAccountNumber": primary_acct["sh_account_number"],
+                "beneficiaryBankCode": "090286",
+                "beneficiaryAccountNumber": sh_charge_acct,
+                "amount": charge_ngn,
+                "saveBeneficiary": False,
+                "narration": f"BOMPAY Merchant SMS charges {billing_month}",
+                "paymentReference": txn_id,
+            })
+        except Exception as exc:
+            logger.warning(f"[Merchant SMS Billing] SH transfer failed for {merchant_id}: {exc}")
+            continue
+
+        await db.merchant_transactions.insert_one({
+            "transaction_id": txn_id, "idempotency_key": idem, "merchant_id": merchant_id,
+            "type": "SMS_CHARGE", "direction": "DEBIT", "amount": charge_kobo, "currency": "NGN",
+            "status": "success",
+            "description": f"SMS notification charges — {billing_month} ({sms_count} messages)",
+            "metadata": {"billing_month": billing_month, "sms_count": sms_count,
+                         "unit_cost": unit_cost, "run_id": run_id},
+            "created_at": now.isoformat(),
+        })
+        await db.sms_logs.update_many(
+            {"entity_type": "merchant", "merchant_id": merchant_id,
+             "status": "SENT", "billed": {"$ne": True}, "created_at": {"$gte": month_start}},
+            {"$set": {"billed": True, "billing_run_id": run_id}},
+        )
+        billed += 1
+
+    logger.info(f"[Merchant SMS Billing] run_id={run_id} billed {billed} merchants for {billing_month}")

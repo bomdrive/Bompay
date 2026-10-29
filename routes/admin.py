@@ -77,6 +77,7 @@ from core import (  # noqa: F401,F403,F405
     ResendSettingsReq,
     CloudinarySettingsReq,
     _run_sms_billing,
+    _run_merchant_sms_billing,
 )
 
 import ledger as pg_ledger
@@ -5352,6 +5353,32 @@ async def admin_settle(settlement_id: str, request: Request):
                 {"$set": {"status": "settled", "updated_at": settled_ts}}
             )
 
+        # Email merchant
+        merch = await db.merchants.find_one({"merchant_id": doc.get("merchant_id", "")}, {"email": 1, "business_name": 1})
+        if merch and merch.get("email"):
+            biz_name = (doc.get("business_name") or merch.get("business_name") or "Your Business")
+            asyncio.create_task(send_email(
+                to=merch["email"],
+                subject=f"BOMPAY: Payout of ₦{amount_ngn:,.2f} is on its way",
+                html=f"""<div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px 24px;background:#F8FAFC;border-radius:16px">
+                  <div style="background:#064BCB;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
+                    <h2 style="color:#fff;margin:0;font-size:20px">Payout Initiated</h2>
+                  </div>
+                  <p style="color:#334155">Hi <b>{biz_name}</b>,</p>
+                  <p style="color:#334155">Your settlement payout has been processed and is on its way to your account.</p>
+                  <table style="width:100%;background:#fff;border-radius:12px;padding:16px;border-collapse:collapse;margin:16px 0">
+                    <tr><td style="padding:8px;color:#64748B;font-size:14px">Amount</td>
+                        <td style="padding:8px;font-weight:bold;color:#064BCB;font-size:16px">₦{amount_ngn:,.2f}</td></tr>
+                    <tr><td style="padding:8px;color:#64748B;font-size:14px">Reference</td>
+                        <td style="padding:8px;font-family:monospace;color:#334155">{txn_ref}</td></tr>
+                    <tr><td style="padding:8px;color:#64748B;font-size:14px">Settlement ID</td>
+                        <td style="padding:8px;font-family:monospace;color:#334155">{settlement_id}</td></tr>
+                  </table>
+                  <p style="color:#64748B;font-size:13px">Funds typically reflect within 1–2 business hours depending on your bank.</p>
+                  <p style="color:#94A3B8;font-size:12px;margin-top:24px">BOMPAY Business</p>
+                </div>""",
+            ))
+
         logger.info(f"[SETTLEMENT] {settlement_id} settled ₦{amount_ngn:.2f} → {merchant_account} ref={txn_ref} by {admin_email}")
         return {"ok": True, "status": "settled", "settlement_id": settlement_id, "transfer_reference": txn_ref}
 
@@ -5367,6 +5394,23 @@ async def admin_settle(settlement_id: str, request: Request):
                 {"metadata.session_id": doc["checkout_session_id"]},
                 {"$set": {"status": "settlement_failed", "updated_at": fail_ts}}
             )
+        # Email merchant on failure
+        merch = await db.merchants.find_one({"merchant_id": doc.get("merchant_id", "")}, {"email": 1, "business_name": 1})
+        if merch and merch.get("email"):
+            biz_name = (doc.get("business_name") or merch.get("business_name") or "Your Business")
+            asyncio.create_task(send_email(
+                to=merch["email"],
+                subject=f"BOMPAY: Payout of ₦{amount_ngn:,.2f} could not be processed",
+                html=f"""<div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px 24px;background:#F8FAFC;border-radius:16px">
+                  <div style="background:#DC2626;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
+                    <h2 style="color:#fff;margin:0;font-size:20px">Payout Failed</h2>
+                  </div>
+                  <p style="color:#334155">Hi <b>{biz_name}</b>,</p>
+                  <p style="color:#334155">Unfortunately your settlement payout of <b>₦{amount_ngn:,.2f}</b> (ref: {settlement_id}) could not be processed at this time. Our team has been notified and will resolve this shortly.</p>
+                  <p style="color:#64748B;font-size:13px">If you have questions, please contact BOMPAY support with your settlement ID: <b>{settlement_id}</b>.</p>
+                  <p style="color:#94A3B8;font-size:12px;margin-top:24px">BOMPAY Business</p>
+                </div>""",
+            ))
         logger.error(f"[SETTLEMENT] {settlement_id} FAILED: {err}")
         raise HTTPException(500, f"Settlement transfer failed: {err}")
 
@@ -5395,6 +5439,25 @@ async def admin_mark_settlement_failed(settlement_id: str, request: Request):
             {"metadata.session_id": doc["checkout_session_id"]},
             {"$set": {"status": "settlement_failed", "updated_at": now_ts}}
         )
+    # Email merchant
+    merch = await db.merchants.find_one({"merchant_id": doc.get("merchant_id", "")}, {"email": 1, "business_name": 1})
+    if merch and merch.get("email"):
+        biz_name = (doc.get("business_name") or merch.get("business_name") or "Your Business")
+        net_ngn = doc.get("net_amount_kobo", 0) / 100
+        asyncio.create_task(send_email(
+            to=merch["email"],
+            subject=f"BOMPAY: Action required — payout of ₦{net_ngn:,.2f} on hold",
+            html=f"""<div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px 24px;background:#F8FAFC;border-radius:16px">
+              <div style="background:#B45309;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
+                <h2 style="color:#fff;margin:0;font-size:20px">Payout On Hold</h2>
+              </div>
+              <p style="color:#334155">Hi <b>{biz_name}</b>,</p>
+              <p style="color:#334155">Your settlement payout of <b>₦{net_ngn:,.2f}</b> (ref: {settlement_id}) has been placed on hold.</p>
+              <p style="color:#64748B;font-size:13px">Reason: {reason}</p>
+              <p style="color:#64748B;font-size:13px">Our team is reviewing this and will be in touch. Please contact BOMPAY support with your settlement ID: <b>{settlement_id}</b>.</p>
+              <p style="color:#94A3B8;font-size:12px;margin-top:24px">BOMPAY Business</p>
+            </div>""",
+        ))
     return {"ok": True, "status": "failed", "settlement_id": settlement_id}
 
 
@@ -5504,3 +5567,398 @@ async def clear_bank_health_events(request: Request, bank_code: str = ""):
     query = {"bank_code": bank_code} if bank_code else {}
     result = await db.bank_health_events.delete_many(query)
     return {"ok": True, "deleted": result.deleted_count}
+
+
+# ─── MERCHANT SMS BILLING ─────────────────────────────────────────────────────
+
+@router.get("/admin/merchant-sms-usage")
+async def admin_merchant_sms_usage(request: Request, month: str = ""):
+    """Return per-merchant SMS usage for billing month (default = current month)."""
+    await get_admin_user(request)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    billing_month = month or now.strftime("%Y-%m")
+    month_start = billing_month + "-01T00:00:00"
+
+    cfg = await get_sms_config()
+    unit_cost = float(cfg.get("merchant_sms_cost_ngn", cfg.get("unit_cost_ngn", 4.0)))
+
+    pipeline = [
+        {"$match": {"entity_type": "merchant", "created_at": {"$gte": month_start}}},
+        {"$group": {
+            "_id": "$merchant_id",
+            "total": {"$sum": 1},
+            "sent": {"$sum": {"$cond": [{"$eq": ["$status", "SENT"]}, 1, 0]}},
+            "failed": {"$sum": {"$cond": [{"$eq": ["$status", "FAILED"]}, 1, 0]}},
+            "billed": {"$sum": {"$cond": ["$billed", 1, 0]}},
+        }},
+    ]
+    rows = await db.sms_logs.aggregate(pipeline).to_list(1000)
+
+    merchant_ids = [r["_id"] for r in rows if r["_id"]]
+    merch_docs = {
+        m["merchant_id"]: m
+        for m in await db.merchants.find(
+            {"merchant_id": {"$in": merchant_ids}}, {"merchant_id": 1, "business_name": 1, "email": 1}
+        ).to_list(1000)
+    }
+
+    result = []
+    for r in rows:
+        mid = r["_id"]
+        if not mid:
+            continue
+        biz = merch_docs.get(mid, {})
+        unbilled = r["sent"] - r["billed"]
+        result.append({
+            "merchant_id": mid,
+            "business_name": biz.get("business_name", mid),
+            "email": biz.get("email", ""),
+            "total_sms": r["total"],
+            "sent": r["sent"],
+            "failed": r["failed"],
+            "billed": r["billed"],
+            "unbilled": max(unbilled, 0),
+            "estimated_charge_ngn": round(max(unbilled, 0) * unit_cost, 2),
+        })
+
+    result.sort(key=lambda x: -x["unbilled"])
+    return {
+        "month": billing_month,
+        "unit_cost_ngn": unit_cost,
+        "merchants": result,
+        "total_unbilled": sum(r["unbilled"] for r in result),
+        "total_estimated_charge_ngn": round(sum(r["estimated_charge_ngn"] for r in result), 2),
+    }
+
+
+@router.get("/admin/platform-sms-usage")
+async def admin_platform_sms_usage(request: Request, month: str = ""):
+    """Return platform-wide SMS usage (both consumer users AND merchants) for billing month."""
+    await get_admin_user(request)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    billing_month = month or now.strftime("%Y-%m")
+    month_start = billing_month + "-01T00:00:00"
+
+    cfg = await get_sms_config()
+    unit_cost = float(cfg.get("unit_cost_ngn", 4.0))
+    merchant_unit_cost = float(cfg.get("merchant_sms_cost_ngn", unit_cost))
+
+    # ── Consumer users ──────────────────────────────────────────────────────
+    user_pipeline = [
+        {"$match": {"entity_type": {"$ne": "merchant"}, "user_id": {"$exists": True},
+                    "created_at": {"$gte": month_start}}},
+        {"$group": {
+            "_id": "$user_id",
+            "total": {"$sum": 1},
+            "sent":   {"$sum": {"$cond": [{"$eq": ["$status", "SENT"]}, 1, 0]}},
+            "failed": {"$sum": {"$cond": [{"$eq": ["$status", "FAILED"]}, 1, 0]}},
+            "billed": {"$sum": {"$cond": ["$billed", 1, 0]}},
+        }},
+    ]
+    user_rows = await db.sms_logs.aggregate(user_pipeline).to_list(5000)
+
+    user_ids = [r["_id"] for r in user_rows if r["_id"]]
+    user_docs = {
+        str(u["_id"]): u
+        for u in await db.users.find(
+            {"_id": {"$in": [__import__("bson").ObjectId(uid) for uid in user_ids if __import__("bson").ObjectId.is_valid(uid)]}},
+            {"first_name": 1, "last_name": 1, "email": 1}
+        ).to_list(5000)
+    }
+
+    users_result = []
+    for r in user_rows:
+        uid = str(r["_id"]) if r["_id"] else None
+        if not uid:
+            continue
+        u = user_docs.get(uid, {})
+        unbilled = r["sent"] - r["billed"]
+        full_name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or uid
+        users_result.append({
+            "entity_type": "user",
+            "id": uid,
+            "name": full_name,
+            "email": u.get("email", ""),
+            "total_sms": r["total"],
+            "sent": r["sent"],
+            "failed": r["failed"],
+            "billed": r["billed"],
+            "unbilled": max(unbilled, 0),
+            "estimated_charge_ngn": round(max(unbilled, 0) * unit_cost, 2),
+        })
+
+    # ── Merchants ───────────────────────────────────────────────────────────
+    merch_pipeline = [
+        {"$match": {"entity_type": "merchant", "created_at": {"$gte": month_start}}},
+        {"$group": {
+            "_id": "$merchant_id",
+            "total": {"$sum": 1},
+            "sent":   {"$sum": {"$cond": [{"$eq": ["$status", "SENT"]}, 1, 0]}},
+            "failed": {"$sum": {"$cond": [{"$eq": ["$status", "FAILED"]}, 1, 0]}},
+            "billed": {"$sum": {"$cond": ["$billed", 1, 0]}},
+        }},
+    ]
+    merch_rows = await db.sms_logs.aggregate(merch_pipeline).to_list(1000)
+
+    merch_ids = [r["_id"] for r in merch_rows if r["_id"]]
+    merch_docs = {
+        m["merchant_id"]: m
+        for m in await db.merchants.find(
+            {"merchant_id": {"$in": merch_ids}}, {"merchant_id": 1, "business_name": 1, "email": 1}
+        ).to_list(1000)
+    }
+
+    merchants_result = []
+    for r in merch_rows:
+        mid = r["_id"]
+        if not mid:
+            continue
+        biz = merch_docs.get(mid, {})
+        unbilled = r["sent"] - r["billed"]
+        merchants_result.append({
+            "entity_type": "merchant",
+            "id": mid,
+            "name": biz.get("business_name", mid),
+            "email": biz.get("email", ""),
+            "total_sms": r["total"],
+            "sent": r["sent"],
+            "failed": r["failed"],
+            "billed": r["billed"],
+            "unbilled": max(unbilled, 0),
+            "estimated_charge_ngn": round(max(unbilled, 0) * merchant_unit_cost, 2),
+        })
+
+    all_rows = users_result + merchants_result
+    all_rows.sort(key=lambda x: -x["unbilled"])
+
+    total_unbilled = sum(r["unbilled"] for r in all_rows)
+    total_charge = round(sum(r["estimated_charge_ngn"] for r in all_rows), 2)
+
+    return {
+        "month": billing_month,
+        "unit_cost_ngn": unit_cost,
+        "merchant_unit_cost_ngn": merchant_unit_cost,
+        "rows": all_rows,
+        "users_count": len(users_result),
+        "merchants_count": len(merchants_result),
+        "total_unbilled": total_unbilled,
+        "total_estimated_charge_ngn": total_charge,
+    }
+
+
+@router.put("/admin/platform-sms-charge-config")
+async def admin_set_platform_sms_charge(request: Request):
+    """Set per-SMS cost for platform-wide billing (user rate + merchant rate)."""
+    await get_admin_user(request)
+    body = await request.json()
+    user_cost = float(body.get("unit_cost_ngn", 0))
+    merch_cost = float(body.get("merchant_sms_cost_ngn", user_cost))
+    if user_cost < 0 or merch_cost < 0:
+        raise HTTPException(400, "Cost must be >= 0")
+    await db.settings.update_one(
+        {"key": "sms_config"},
+        {"$set": {"unit_cost_ngn": user_cost, "merchant_sms_cost_ngn": merch_cost}},
+        upsert=True,
+    )
+    return {"message": "Platform SMS cost updated", "unit_cost_ngn": user_cost, "merchant_sms_cost_ngn": merch_cost}
+
+
+@router.post("/admin/platform-sms-billing/run")
+async def admin_run_platform_sms_billing(request: Request, bg: BackgroundTasks):
+    """Trigger a platform-wide SMS billing run (debits both consumers and merchants)."""
+    await get_admin_user(request)
+    import secrets as _sec
+    run_id = f"PLTSMSRUN_{_sec.token_hex(6).upper()}"
+    bg.add_task(_run_sms_billing, run_id)
+    bg.add_task(_run_merchant_sms_billing, run_id)
+    return {"message": "Platform SMS billing run started", "run_id": run_id}
+
+
+@router.get("/admin/platform-sms-billing/preview")
+async def admin_preview_platform_sms_billing(request: Request, month: str = ""):
+    """Dry-run preview: show exactly which accounts will be charged, skipped, or already billed."""
+    await get_admin_user(request)
+    from datetime import datetime, timezone
+    import bson
+    now = datetime.now(timezone.utc)
+    billing_month = month or now.strftime("%Y-%m")
+    month_start = billing_month + "-01T00:00:00"
+
+    cfg = await get_sms_config()
+    unit_cost = float(cfg.get("unit_cost_ngn", 4.0))
+    merchant_unit_cost = float(cfg.get("merchant_sms_cost_ngn", unit_cost))
+
+    items = []
+
+    # ── Consumer users ──────────────────────────────────────────────────────
+    user_pipeline = [
+        {"$match": {"entity_type": {"$ne": "merchant"}, "user_id": {"$exists": True},
+                    "created_at": {"$gte": month_start}}},
+        {"$group": {
+            "_id": "$user_id",
+            "sent":   {"$sum": {"$cond": [{"$eq": ["$status", "SENT"]}, 1, 0]}},
+            "billed_count": {"$sum": {"$cond": ["$billed", 1, 0]}},
+        }},
+    ]
+    user_rows = await db.sms_logs.aggregate(user_pipeline).to_list(5000)
+
+    user_ids_valid = [r["_id"] for r in user_rows if r["_id"] and bson.ObjectId.is_valid(r["_id"])]
+    user_docs = {
+        str(u["_id"]): u
+        for u in await db.users.find(
+            {"_id": {"$in": [bson.ObjectId(uid) for uid in user_ids_valid]}},
+            {"first_name": 1, "last_name": 1, "email": 1}
+        ).to_list(5000)
+    }
+    wallet_docs = {
+        w["user_id"]: w
+        for w in await db.wallets.find(
+            {"user_id": {"$in": [r["_id"] for r in user_rows if r["_id"]]}},
+            {"user_id": 1, "available_balance": 1}
+        ).to_list(5000)
+    }
+
+    for r in user_rows:
+        uid = str(r["_id"]) if r["_id"] else None
+        if not uid:
+            continue
+        unbilled = r["sent"] - r["billed_count"]
+        if unbilled <= 0:
+            continue
+        charge_ngn = round(unbilled * unit_cost, 2)
+        charge_kobo = int(charge_ngn * 100)
+        u = user_docs.get(uid, {})
+        name = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or uid
+        w = wallet_docs.get(uid)
+        balance_kobo = w["available_balance"] if w else 0
+        balance_ngn = balance_kobo / 100
+
+        already_billed = bool(await db.transactions.find_one(
+            {"idempotency_key": f"sms-billing-{billing_month}-{uid}"}
+        ))
+        if already_billed:
+            outcome = "already_billed"
+        elif not w:
+            outcome = "no_wallet"
+        elif balance_kobo < charge_kobo:
+            outcome = "insufficient_balance"
+        else:
+            outcome = "will_charge"
+
+        items.append({
+            "entity_type": "user",
+            "id": uid,
+            "name": name,
+            "email": u.get("email", ""),
+            "unbilled_sms": unbilled,
+            "charge_ngn": charge_ngn,
+            "balance_ngn": round(balance_ngn, 2),
+            "outcome": outcome,
+        })
+
+    # ── Merchants ───────────────────────────────────────────────────────────
+    merch_pipeline = [
+        {"$match": {"entity_type": "merchant", "created_at": {"$gte": month_start}}},
+        {"$group": {
+            "_id": "$merchant_id",
+            "sent":         {"$sum": {"$cond": [{"$eq": ["$status", "SENT"]}, 1, 0]}},
+            "billed_count": {"$sum": {"$cond": ["$billed", 1, 0]}},
+        }},
+    ]
+    merch_rows = await db.sms_logs.aggregate(merch_pipeline).to_list(1000)
+
+    merch_ids = [r["_id"] for r in merch_rows if r["_id"]]
+    merch_docs = {
+        m["merchant_id"]: m
+        for m in await db.merchants.find(
+            {"merchant_id": {"$in": merch_ids}}, {"merchant_id": 1, "business_name": 1, "email": 1}
+        ).to_list(1000)
+    }
+    # Check which merchants have a primary SH account
+    primary_accts = {
+        a["merchant_id"]: a
+        for a in await db.merchant_accounts.find(
+            {"merchant_id": {"$in": merch_ids}, "type": "primary"},
+            {"merchant_id": 1, "sh_account_number": 1}
+        ).to_list(1000)
+    }
+
+    for r in merch_rows:
+        mid = r["_id"]
+        if not mid:
+            continue
+        unbilled = r["sent"] - r["billed_count"]
+        if unbilled <= 0:
+            continue
+        charge_ngn = round(unbilled * merchant_unit_cost, 2)
+        biz = merch_docs.get(mid, {})
+        already_billed = bool(await db.merchant_transactions.find_one(
+            {"idempotency_key": f"merch-sms-{billing_month}-{mid}"}
+        ))
+        has_account = bool(primary_accts.get(mid, {}).get("sh_account_number"))
+        if already_billed:
+            outcome = "already_billed"
+        elif not has_account:
+            outcome = "no_account"
+        else:
+            outcome = "will_charge"   # SH balance checked at billing time
+
+        items.append({
+            "entity_type": "merchant",
+            "id": mid,
+            "name": biz.get("business_name", mid),
+            "email": biz.get("email", ""),
+            "unbilled_sms": unbilled,
+            "charge_ngn": charge_ngn,
+            "balance_ngn": None,          # SH balance not pre-fetched in preview
+            "outcome": outcome,
+        })
+
+    items.sort(key=lambda x: (x["outcome"] != "will_charge", -x["charge_ngn"]))
+
+    summary = {
+        "will_charge":          sum(1 for i in items if i["outcome"] == "will_charge"),
+        "insufficient_balance": sum(1 for i in items if i["outcome"] == "insufficient_balance"),
+        "no_account":           sum(1 for i in items if i["outcome"] == "no_account"),
+        "no_wallet":            sum(1 for i in items if i["outcome"] == "no_wallet"),
+        "already_billed":       sum(1 for i in items if i["outcome"] == "already_billed"),
+        "total_charge_ngn":     round(
+            sum(i["charge_ngn"] for i in items if i["outcome"] == "will_charge"), 2
+        ),
+    }
+
+    return {
+        "month": billing_month,
+        "unit_cost_ngn": unit_cost,
+        "merchant_unit_cost_ngn": merchant_unit_cost,
+        "items": items,
+        "summary": summary,
+    }
+
+
+@router.put("/admin/merchant-sms-charge-config")
+async def admin_set_merchant_sms_charge(request: Request):
+    """Set per-SMS cost for merchant billing."""
+    await get_admin_user(request)
+    body = await request.json()
+    cost = float(body.get("merchant_sms_cost_ngn", 0))
+    if cost < 0:
+        raise HTTPException(400, "Cost must be >= 0")
+    await db.settings.update_one(
+        {"key": "sms_config"},
+        {"$set": {"merchant_sms_cost_ngn": cost}},
+        upsert=True,
+    )
+    return {"message": "Merchant SMS cost updated", "merchant_sms_cost_ngn": cost}
+
+
+@router.post("/admin/merchant-sms-billing/run")
+async def admin_run_merchant_sms_billing(request: Request, bg: BackgroundTasks):
+    """Trigger a merchant SMS billing run (debits primary SH account)."""
+    await get_admin_user(request)
+    import secrets as _sec
+    run_id = f"MSMSBRUN_{_sec.token_hex(6).upper()}"
+    bg.add_task(_run_merchant_sms_billing, run_id)
+    return {"message": "Merchant SMS billing run started", "run_id": run_id}

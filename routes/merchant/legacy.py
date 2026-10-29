@@ -3,7 +3,7 @@ Bompay Merchant / Developer Platform routes
 Prefix: /api/v1/merchant  (merchant-facing)
 Prefix: /api/admin/merchants (admin-facing)
 """
-import os, secrets, uuid, asyncio, logging
+import os, secrets, uuid, asyncio, logging, base64, json as _json
 from datetime import datetime, timezone, timedelta
 from html import escape as _escape
 from typing import Optional
@@ -21,6 +21,7 @@ from core import (
     CDH_AIRTIME_NETWORK_IDS, CDH_ELECTRICITY_DISCO_IDS, CDH_DATA_PLANS, CDH_CABLE_PLANS,
     PG_DISCO_SLUGS, get_service_bucket_account, NIGERIAN_BANKS, SAFEHAVEN_OWN_BANK_CODE,
     send_otp_sms, send_email, _email_html, FRONTEND_URL, get_rewards_config,
+    send_merchant_alert,
 )
 
 # Import RBAC helpers (lazy-imported inside functions to avoid circular imports at module load)
@@ -68,6 +69,22 @@ async def get_current_merchant(request: Request) -> dict:
     from .context import get_merchant_context as _get_ctx
     ctx = await _get_ctx(request)
     return ctx.merchant
+
+
+async def _verify_actor_pin(ctx, pin: str) -> None:
+    """Raise 401/400 if pin doesn't match the authenticated actor's PIN hash.
+    Owners → merchants.pin_hash; team members → merchant_members.pin_hash."""
+    if ctx.is_owner:
+        raw = await db.merchants.find_one({"merchant_id": ctx.merchant_id}, {"pin_hash": 1})
+        pin_hash = (raw or {}).get("pin_hash", "")
+        if not pin_hash or not verify_password(pin, pin_hash):
+            raise HTTPException(401, "Invalid PIN")
+    else:
+        member = await db.merchant_members.find_one({"member_id": ctx.actor_id}, {"pin_hash": 1})
+        if not member or not member.get("pin_hash"):
+            raise HTTPException(400, "PIN not configured. Please set your PIN first.")
+        if not verify_password(pin, member["pin_hash"]):
+            raise HTTPException(401, "Invalid PIN")
 
 def _safe_merchant(m: dict) -> dict:
     m = {k: v for k, v in m.items()}
@@ -1087,6 +1104,54 @@ async def merchant_bank_health(bank_code: str, request: Request):
     }
 
 
+
+# ─── SAVED BENEFICIARIES ──────────────────────────────────────────────────────
+
+class BeneficiaryIn(BaseModel):
+    account_number: str
+    bank_code: str
+    bank_name: str
+    account_name: str
+    nickname: Optional[str] = None
+
+@router.get("/v1/merchant/beneficiaries")
+async def list_beneficiaries(request: Request):
+    m = await get_current_merchant(request)
+    bens = await db.merchant_beneficiaries.find(
+        {"merchant_id": m["merchant_id"]}, {"_id": 0}
+    ).sort("used_count", -1).to_list(50)
+    return {"beneficiaries": bens}
+
+@router.post("/v1/merchant/beneficiaries")
+async def save_beneficiary(req: BeneficiaryIn, request: Request):
+    m = await get_current_merchant(request)
+    existing = await db.merchant_beneficiaries.find_one({
+        "merchant_id": m["merchant_id"], "account_number": req.account_number, "bank_code": req.bank_code
+    })
+    if existing:
+        await db.merchant_beneficiaries.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {"account_name": req.account_name, "nickname": req.nickname, "updated_at": now_utc()},
+             "$inc": {"used_count": 1}}
+        )
+        return {"message": "Beneficiary updated"}
+    await db.merchant_beneficiaries.insert_one({
+        "merchant_id": m["merchant_id"], "account_number": req.account_number,
+        "bank_code": req.bank_code, "bank_name": req.bank_name,
+        "account_name": req.account_name, "nickname": req.nickname,
+        "used_count": 1, "created_at": now_utc(), "updated_at": now_utc()
+    })
+    return {"message": "Beneficiary saved"}
+
+@router.delete("/v1/merchant/beneficiaries/{account_number}")
+async def delete_beneficiary(account_number: str, request: Request):
+    m = await get_current_merchant(request)
+    await db.merchant_beneficiaries.delete_one(
+        {"merchant_id": m["merchant_id"], "account_number": account_number}
+    )
+    return {"message": "Removed"}
+
+
 @router.post("/v1/merchant/services/transfer")
 async def merchant_transfer(req: MerchantTransfer, request: Request):
     if req.amount <= 0:
@@ -1094,10 +1159,10 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
     if req.amount < 100:
         raise HTTPException(400, "Minimum transfer amount is ₦100")
 
-    m = await get_current_merchant(request)
-    raw_merch = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw_merch["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    m = ctx.merchant
+    await _verify_actor_pin(ctx, req.pin)
 
     # Name enquiry
     try:
@@ -1183,14 +1248,26 @@ async def merchant_transfer(req: MerchantTransfer, request: Request):
         "sh_session_id": sh_session,
         "beneficiary_account": req.account_number,
         "beneficiary_name": account_name,
-        "beneficiary_bank": req.bank_code,
+        "beneficiary_bank": bank_name,
+        "beneficiary_bank_code": req.bank_code,
         "narration": req.narration,
+        "description": f"Transfer to {account_name}",
+        "metadata": {
+            "beneficiary_name": account_name,
+            "beneficiary_account_number": req.account_number,
+            "beneficiary_bank": bank_name,
+        },
         "mode": m.get("mode", "sandbox"),
         "provider_response": str(sh_resp)[:500],
         "created_at": now_utc(),
     }
     await db.merchant_transactions.insert_one(txn_doc)
     txn_doc.pop("_id", None)
+    if txn_status in ("success", "pending"):
+        asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_TRANSFER", {
+            "amount": req.amount, "beneficiary": account_name,
+            "account": req.account_number, "bank": bank_name, "ref": txn_ref,
+        }))
     return {"message": "Transfer initiated", "transaction": txn_doc, "beneficiary_name": account_name,
             "sh_status": sh_status_raw, "sh_session_id": sh_session}
 
@@ -1309,10 +1386,10 @@ async def merchant_validate_meter(req: MerchantMeterValidate, request: Request):
 
 @router.post("/v1/merchant/services/airtime")
 async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
-    m = await get_current_merchant(request)
-    raw_merch = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw_merch["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    m = ctx.merchant
+    await _verify_actor_pin(ctx, req.pin)
     if req.amount <= 0:
         raise HTTPException(400, "Amount must be greater than zero")
     if req.amount < 50 or req.amount > 50000:
@@ -1358,6 +1435,9 @@ async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
         {"network": req.network, "phone": req.phone_number, "provider_ref": pref, "provider": provider}
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "AIRTIME", f"{req.network} airtime"))
+    asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_AIRTIME", {
+        "amount": req.amount, "network": req.network, "phone": req.phone_number, "ref": txn_ref,
+    }))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "network": req.network, "phone": req.phone_number}
 
@@ -1366,10 +1446,10 @@ async def merchant_buy_airtime(req: MerchantAirtimeReq, request: Request):
 
 @router.post("/v1/merchant/services/data")
 async def merchant_buy_data(req: MerchantDataReq, request: Request):
-    m = await get_current_merchant(request)
-    raw_merch = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw_merch["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    m = ctx.merchant
+    await _verify_actor_pin(ctx, req.pin)
     if req.amount <= 0:
         raise HTTPException(400, "Amount must be greater than zero")
 
@@ -1413,6 +1493,10 @@ async def merchant_buy_data(req: MerchantDataReq, request: Request):
         {"network": req.network, "phone": req.phone_number, "plan_id": req.plan_id, "provider_ref": pref, "provider": provider}
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "DATA", f"{req.network} data"))
+    asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_DATA", {
+        "amount": req.amount, "network": req.network, "phone": req.phone_number,
+        "plan": req.plan_id, "ref": txn_ref,
+    }))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "network": req.network, "phone": req.phone_number, "plan_id": req.plan_id}
 
@@ -1421,10 +1505,10 @@ async def merchant_buy_data(req: MerchantDataReq, request: Request):
 
 @router.post("/v1/merchant/services/electricity")
 async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request):
-    m = await get_current_merchant(request)
-    raw_merch = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw_merch["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    m = ctx.merchant
+    await _verify_actor_pin(ctx, req.pin)
     if req.amount <= 0:
         raise HTTPException(400, "Amount must be greater than zero")
     if req.amount < 1000:
@@ -1486,7 +1570,7 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
     )
 
     # Send electricity token SMS to customer (non-blocking)
-    phone = raw_merch.get("phone", "")
+    phone = m.get("phone", "")
     if phone and token and token != "N/A":
         sms_body = (
             f"Bompay Electricity Token\n"
@@ -1502,6 +1586,10 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
             logger.warning(f"[MERCHANT ELEC SMS] {sms_err}")
 
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "ELECTRICITY", f"{req.disco} electricity"))
+    asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_ELECTRICITY", {
+        "amount": req.amount, "meter": req.meter_number, "disco": req.disco,
+        "token": token, "units": units or "N/A", "ref": txn_ref,
+    }))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "token": token, "units": units, "meter_number": req.meter_number}
 
@@ -1510,10 +1598,10 @@ async def merchant_pay_electricity(req: MerchantElectricityReq, request: Request
 
 @router.post("/v1/merchant/services/cable")
 async def merchant_pay_cable(req: MerchantCableReq, request: Request):
-    m = await get_current_merchant(request)
-    raw_merch = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw_merch["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    m = ctx.merchant
+    await _verify_actor_pin(ctx, req.pin)
     if req.amount <= 0:
         raise HTTPException(400, "Amount must be greater than zero")
 
@@ -1558,8 +1646,110 @@ async def merchant_pay_cable(req: MerchantCableReq, request: Request):
          "package_id": req.package_id, "provider_ref": pref}
     )
     asyncio.create_task(_credit_merchant_cashback_bg(m["merchant_id"], req.amount, "CABLE_TV", f"{req.provider} cable TV"))
+    asyncio.create_task(send_merchant_alert(m["merchant_id"], "MERCHANT_CABLE", {
+        "amount": req.amount, "provider": req.provider,
+        "smartcard": req.smartcard_number, "ref": txn_ref,
+    }))
     return {"transaction_id": txn_ref, "status": "success", "amount": req.amount,
             "provider": req.provider, "smartcard": req.smartcard_number}
+
+
+# ─── NOTIFICATION SETTINGS ────────────────────────────────────────────────────
+
+class NotifToggle(BaseModel):
+    sms_enabled: Optional[bool] = None
+    email_enabled: Optional[bool] = None
+
+class AddContactItem(BaseModel):
+    value: str  # phone number or email
+
+@router.get("/v1/merchant/notification-settings")
+async def get_notification_settings(request: Request):
+    m = await get_current_merchant(request)
+    doc = await db.merchant_notification_settings.find_one({"merchant_id": m["merchant_id"]})
+    if not doc:
+        return {"merchant_id": m["merchant_id"], "phones": [], "emails": [],
+                "sms_enabled": True, "email_enabled": True}
+    doc.pop("_id", None)
+    return doc
+
+@router.put("/v1/merchant/notification-settings")
+async def update_notification_settings(req: NotifToggle, request: Request):
+    m = await get_current_merchant(request)
+    update = {}
+    if req.sms_enabled is not None:
+        update["sms_enabled"] = req.sms_enabled
+    if req.email_enabled is not None:
+        update["email_enabled"] = req.email_enabled
+    if not update:
+        raise HTTPException(400, "Nothing to update")
+    await db.merchant_notification_settings.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$set": {**update, "updated_at": now_utc()},
+         "$setOnInsert": {"merchant_id": m["merchant_id"], "phones": [], "emails": [], "created_at": now_utc()}},
+        upsert=True
+    )
+    return {"message": "Settings updated"}
+
+@router.post("/v1/merchant/notification-settings/phones")
+async def add_notification_phone(req: AddContactItem, request: Request):
+    m = await get_current_merchant(request)
+    phone = req.value.strip()
+    if not phone:
+        raise HTTPException(400, "Phone number is required")
+    doc = await db.merchant_notification_settings.find_one({"merchant_id": m["merchant_id"]})
+    phones = (doc or {}).get("phones", [])
+    if phone in phones:
+        return {"message": "Already added", "phones": phones}
+    if len(phones) >= 5:
+        raise HTTPException(400, "Maximum 5 phone numbers allowed")
+    await db.merchant_notification_settings.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$addToSet": {"phones": phone}, "$set": {"updated_at": now_utc()},
+         "$setOnInsert": {"merchant_id": m["merchant_id"], "emails": [],
+                          "sms_enabled": True, "email_enabled": True, "created_at": now_utc()}},
+        upsert=True
+    )
+    return {"message": "Phone added", "phones": phones + [phone]}
+
+@router.delete("/v1/merchant/notification-settings/phones/{phone}")
+async def remove_notification_phone(phone: str, request: Request):
+    m = await get_current_merchant(request)
+    await db.merchant_notification_settings.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$pull": {"phones": phone}, "$set": {"updated_at": now_utc()}}
+    )
+    return {"message": "Phone removed"}
+
+@router.post("/v1/merchant/notification-settings/emails")
+async def add_notification_email(req: AddContactItem, request: Request):
+    m = await get_current_merchant(request)
+    email = req.value.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Valid email is required")
+    doc = await db.merchant_notification_settings.find_one({"merchant_id": m["merchant_id"]})
+    emails = (doc or {}).get("emails", [])
+    if email in emails:
+        return {"message": "Already added", "emails": emails}
+    if len(emails) >= 5:
+        raise HTTPException(400, "Maximum 5 email addresses allowed")
+    await db.merchant_notification_settings.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$addToSet": {"emails": email}, "$set": {"updated_at": now_utc()},
+         "$setOnInsert": {"merchant_id": m["merchant_id"], "phones": [],
+                          "sms_enabled": True, "email_enabled": True, "created_at": now_utc()}},
+        upsert=True
+    )
+    return {"message": "Email added", "emails": emails + [email]}
+
+@router.delete("/v1/merchant/notification-settings/emails/{email}")
+async def remove_notification_email(email: str, request: Request):
+    m = await get_current_merchant(request)
+    await db.merchant_notification_settings.update_one(
+        {"merchant_id": m["merchant_id"]},
+        {"$pull": {"emails": email}, "$set": {"updated_at": now_utc()}}
+    )
+    return {"message": "Email removed"}
 
 
 # ─── SETTINGS ─────────────────────────────────────────────────────────────────
@@ -1570,7 +1760,7 @@ class UpdateProfile(BaseModel):
     phone: Optional[str] = None
 
 class ChangePin(BaseModel):
-    old_pin: str
+    current_pin: str
     new_pin: str
 
 class ChangePassword(BaseModel):
@@ -1582,12 +1772,11 @@ class VerifyPin(BaseModel):
 
 @router.post("/v1/merchant/verify-pin")
 async def verify_merchant_pin(req: VerifyPin, request: Request):
-    """Verify PIN for already-authenticated merchant (2-step login step 2)."""
-    m = await get_current_merchant(request)
-    raw = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.pin, raw["pin_hash"]):
-        raise HTTPException(401, "Invalid PIN")
-    return {"message": "PIN verified", "merchant_id": m["merchant_id"]}
+    """Verify PIN for the authenticated actor (owner or team member)."""
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
+    await _verify_actor_pin(ctx, req.pin)
+    return {"message": "PIN verified", "merchant_id": ctx.merchant_id}
 
 
 @router.post("/v1/merchant/kyb/upload")
@@ -1703,14 +1892,28 @@ async def update_profile(req: UpdateProfile, request: Request):
 
 @router.put("/v1/merchant/settings/pin")
 async def change_pin(req: ChangePin, request: Request):
-    m = await get_current_merchant(request)
-    raw = await db.merchants.find_one({"merchant_id": m["merchant_id"]})
-    if not verify_password(req.old_pin, raw["pin_hash"]):
-        raise HTTPException(400, "Old PIN is incorrect")
+    from .context import get_merchant_context as _get_ctx
+    ctx = await _get_ctx(request)
     if len(req.new_pin) != 4 or not req.new_pin.isdigit():
         raise HTTPException(400, "New PIN must be 4 digits")
-    await db.merchants.update_one({"merchant_id": m["merchant_id"]},
-        {"$set": {"pin_hash": hash_password(req.new_pin), "updated_at": now_utc()}})
+    if ctx.is_owner:
+        raw = await db.merchants.find_one({"merchant_id": ctx.merchant_id}, {"pin_hash": 1})
+        if not verify_password(req.current_pin, (raw or {}).get("pin_hash", "")):
+            raise HTTPException(400, "Current PIN is incorrect")
+        await db.merchants.update_one(
+            {"merchant_id": ctx.merchant_id},
+            {"$set": {"pin_hash": hash_password(req.new_pin), "updated_at": now_utc()}}
+        )
+    else:
+        member = await db.merchant_members.find_one({"member_id": ctx.actor_id}, {"pin_hash": 1})
+        if not member or not member.get("pin_hash"):
+            raise HTTPException(400, "PIN not set. Please set your PIN first.")
+        if not verify_password(req.current_pin, member["pin_hash"]):
+            raise HTTPException(400, "Current PIN is incorrect")
+        await db.merchant_members.update_one(
+            {"member_id": ctx.actor_id},
+            {"$set": {"pin_hash": hash_password(req.new_pin), "updated_at": now_utc()}}
+        )
     return {"message": "PIN updated"}
 
 @router.put("/v1/merchant/settings/password")
@@ -1724,7 +1927,231 @@ async def change_password(req: ChangePassword, request: Request):
     return {"message": "Password updated"}
 
 
-# ─── ADMIN: MERCHANT PANEL ────────────────────────────────────────────────────
+
+# ─── WEBAUTHN / BIOMETRIC LOCK ────────────────────────────────────────────────
+
+from webauthn import (
+    generate_registration_options,
+    verify_registration_response,
+    generate_authentication_options,
+    verify_authentication_response,
+    options_to_json,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    UserVerificationRequirement,
+    AuthenticatorAttachment,
+    ResidentKeyRequirement,
+    PublicKeyCredentialDescriptor,
+)
+
+def _webauthn_rp(request: Request):
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "localhost")
+    host_no_port = host.split(":")[0]
+    proto = request.headers.get("x-forwarded-proto", "https")
+    origin = f"{proto}://{host}"
+    return host_no_port, origin
+
+@router.get("/v1/merchant/webauthn/has-credential")
+async def webauthn_has_credential(request: Request):
+    """Return whether the merchant has a registered biometric credential."""
+    m = await get_current_merchant(request)
+    cred = await db.merchant_webauthn_credentials.find_one({"merchant_id": m["merchant_id"]})
+    return {"has_credential": bool(cred)}
+
+@router.get("/v1/merchant/webauthn/register-options")
+async def webauthn_register_options(request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    rp_id, _origin = _webauthn_rp(request)
+    opts = generate_registration_options(
+        rp_id=rp_id,
+        rp_name="Bompay Business",
+        user_id=mid.encode()[:64],
+        user_name=m.get("email", mid),
+        user_display_name=m.get("business_name", "Merchant"),
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+            user_verification=UserVerificationRequirement.REQUIRED,
+            resident_key=ResidentKeyRequirement.REQUIRED,
+        ),
+    )
+    challenge_b64 = base64.b64encode(opts.challenge).decode()
+    await db.merchant_webauthn_challenges.replace_one(
+        {"merchant_id": mid, "type": "registration"},
+        {"merchant_id": mid, "type": "registration",
+         "challenge": challenge_b64, "created_at": now_utc()},
+        upsert=True,
+    )
+    return _json.loads(options_to_json(opts))
+
+@router.post("/v1/merchant/webauthn/register")
+async def webauthn_register(body: dict, request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    rp_id, origin = _webauthn_rp(request)
+    row = await db.merchant_webauthn_challenges.find_one(
+        {"merchant_id": mid, "type": "registration"})
+    if not row:
+        raise HTTPException(400, "No pending registration challenge")
+    challenge_bytes = base64.b64decode(row["challenge"])
+    try:
+        v = verify_registration_response(
+            credential=body,
+            expected_challenge=challenge_bytes,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"Registration failed: {exc}")
+    await db.merchant_webauthn_credentials.replace_one(
+        {"merchant_id": mid},
+        {
+            "merchant_id": mid,
+            "credential_id": base64.b64encode(v.credential_id).decode(),
+            "public_key": base64.b64encode(v.credential_public_key).decode(),
+            "sign_count": v.sign_count,
+            "rp_id": rp_id,
+            "created_at": now_utc(),
+        },
+        upsert=True,
+    )
+    await db.merchant_webauthn_challenges.delete_one(
+        {"merchant_id": mid, "type": "registration"})
+    return {"success": True}
+
+@router.get("/v1/merchant/webauthn/auth-options")
+async def webauthn_auth_options(request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    rp_id, _origin = _webauthn_rp(request)
+    cred_doc = await db.merchant_webauthn_credentials.find_one({"merchant_id": mid})
+    allow_creds = (
+        [PublicKeyCredentialDescriptor(
+            id=base64.b64decode(cred_doc["credential_id"]))]
+        if cred_doc else []
+    )
+    opts = generate_authentication_options(
+        rp_id=rp_id,
+        allow_credentials=allow_creds,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    challenge_b64 = base64.b64encode(opts.challenge).decode()
+    await db.merchant_webauthn_challenges.replace_one(
+        {"merchant_id": mid, "type": "authentication"},
+        {"merchant_id": mid, "type": "authentication",
+         "challenge": challenge_b64, "created_at": now_utc()},
+        upsert=True,
+    )
+    return _json.loads(options_to_json(opts))
+
+@router.post("/v1/merchant/webauthn/authenticate")
+async def webauthn_authenticate(body: dict, request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    rp_id, origin = _webauthn_rp(request)
+    row = await db.merchant_webauthn_challenges.find_one(
+        {"merchant_id": mid, "type": "authentication"})
+    if not row:
+        raise HTTPException(400, "No pending authentication challenge")
+    cred_doc = await db.merchant_webauthn_credentials.find_one({"merchant_id": mid})
+    if not cred_doc:
+        raise HTTPException(400, "No biometric registered for this account")
+    challenge_bytes = base64.b64decode(row["challenge"])
+    try:
+        v = verify_authentication_response(
+            credential=body,
+            expected_challenge=challenge_bytes,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
+            credential_public_key=base64.b64decode(cred_doc["public_key"]),
+            credential_current_sign_count=cred_doc["sign_count"],
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        raise HTTPException(401, f"Authentication failed: {exc}")
+    await db.merchant_webauthn_credentials.update_one(
+        {"merchant_id": mid},
+        {"$set": {"sign_count": v.new_sign_count}})
+    await db.merchant_webauthn_challenges.delete_one(
+        {"merchant_id": mid, "type": "authentication"})
+    return {"success": True, "unlocked": True}
+
+@router.post("/v1/merchant/webauthn/public-auth-options")
+async def webauthn_public_auth_options(body: dict, request: Request):
+    """Public endpoint (no session required): get WebAuthn auth options for login page."""
+    email = (body.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(400, "email required")
+    m = await db.merchants.find_one({"email": email})
+    rp_id, _ = _webauthn_rp(request)
+    allow_creds = []
+    store_id = None
+    if m:
+        cred_doc = await db.merchant_webauthn_credentials.find_one({"merchant_id": m["merchant_id"]})
+        if cred_doc:
+            allow_creds = [PublicKeyCredentialDescriptor(id=base64.b64decode(cred_doc["credential_id"]))]
+            store_id = m["merchant_id"]
+    opts = generate_authentication_options(
+        rp_id=rp_id,
+        allow_credentials=allow_creds,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    challenge_b64 = base64.b64encode(opts.challenge).decode()
+    if store_id:
+        await db.merchant_webauthn_challenges.replace_one(
+            {"merchant_id": store_id, "type": "public_auth"},
+            {"merchant_id": store_id, "type": "public_auth",
+             "challenge": challenge_b64, "created_at": now_utc()},
+            upsert=True,
+        )
+    return _json.loads(options_to_json(opts))
+
+
+@router.post("/v1/merchant/webauthn/public-login")
+async def webauthn_public_login(body: dict, request: Request, response: Response):
+    """Public endpoint (no session required): complete biometric login."""
+    email = (body.pop("email", "") or "").lower().strip()
+    if not email:
+        raise HTTPException(400, "email required")
+    m = await db.merchants.find_one({"email": email})
+    if not m:
+        raise HTTPException(401, "Authentication failed")
+    mid = m["merchant_id"]
+    rp_id, origin = _webauthn_rp(request)
+    row = await db.merchant_webauthn_challenges.find_one(
+        {"merchant_id": mid, "type": "public_auth"})
+    if not row:
+        raise HTTPException(400, "No pending challenge. Restart biometric login.")
+    cred_doc = await db.merchant_webauthn_credentials.find_one({"merchant_id": mid})
+    if not cred_doc:
+        raise HTTPException(401, "No biometric registered for this account")
+    challenge_bytes = base64.b64decode(row["challenge"])
+    try:
+        v = verify_authentication_response(
+            credential=body,
+            expected_challenge=challenge_bytes,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
+            credential_public_key=base64.b64decode(cred_doc["public_key"]),
+            credential_current_sign_count=cred_doc["sign_count"],
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        raise HTTPException(401, f"Biometric verification failed: {exc}")
+    await db.merchant_webauthn_credentials.update_one(
+        {"merchant_id": mid}, {"$set": {"sign_count": v.new_sign_count}})
+    await db.merchant_webauthn_challenges.delete_one(
+        {"merchant_id": mid, "type": "public_auth"})
+    access, refresh = _merchant_tokens(mid, email)
+    _set_merchant_cookies(response, access, refresh)
+    return _safe_merchant(m)
+    """Remove a merchant's registered biometric credential."""
+    m = await get_current_merchant(request)
+    await db.merchant_webauthn_credentials.delete_one(
+        {"merchant_id": m["merchant_id"]})
+    return {"success": True}
 
 @router.get("/admin/merchants")
 async def admin_list_merchants(request: Request, page: int = 1, status: str = "", search: str = ""):
@@ -2414,3 +2841,194 @@ async def merchant_withdraw_referral(request: Request):
         "description": f"Referral bonus withdrawal — ₦{naira:,.2f}", "created_at": now_utc()
     })
     return {"message": f"₦{naira:,.2f} applied to your account!", "amount": naira}
+
+
+# ─── MERCHANT ePOS ────────────────────────────────────────────────────────────
+# All endpoints under /v1/merchant/epos/* use merchant auth
+
+class MerchantEposActivateReq(BaseModel):
+    business_name: str
+    business_type: str = "retail"
+
+class MerchantEposPaymentReq(BaseModel):
+    amount: float
+    note: str = ""
+
+
+@router.get("/v1/merchant/epos/status")
+async def merchant_epos_status(request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    acct = await db.epos_accounts.find_one({"merchant_id": mid}, {"_id": 0})
+    if not acct:
+        return {"activated": False}
+    # today's stats
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    agg = await db.epos_transactions.aggregate([
+        {"$match": {"merchant_id": mid, "status": "COMPLETED", "created_at": {"$gte": today}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}, "count": {"$sum": 1}}}
+    ]).to_list(1)
+    today_kobo  = (agg[0]["total"]  if agg else 0)
+    today_count = (agg[0]["count"]  if agg else 0)
+    return {
+        "activated":            True,
+        "account":              acct,
+        "today_received_naira": round(today_kobo / 100, 2),
+        "today_count":          today_count,
+        "total_received":       (await db.epos_transactions.aggregate([
+            {"$match": {"merchant_id": mid, "status": "COMPLETED"}},
+            {"$group": {"_id": None, "t": {"$sum": "$amount_kobo"}}}
+        ]).to_list(1) or [{"t": 0}])[0]["t"] / 100,
+    }
+
+
+@router.post("/v1/merchant/epos/activate")
+async def merchant_epos_activate(req: MerchantEposActivateReq, request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    biz_name = req.business_name.strip() or m.get("business_name", "My Business")
+    await db.epos_accounts.update_one(
+        {"merchant_id": mid},
+        {"$set": {
+            "merchant_id":   mid,
+            "business_name": biz_name,
+            "business_type": req.business_type,
+            "status":        "ACTIVE",
+            "activated_at":  now_utc(),
+        }},
+        upsert=True
+    )
+    return {"message": "e-POS activated!", "activated": True}
+
+
+@router.post("/v1/merchant/epos/request-payment")
+async def merchant_epos_request_payment(req: MerchantEposPaymentReq, request: Request):
+    m = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    acct = await db.epos_accounts.find_one({"merchant_id": mid})
+    if not acct:
+        raise HTTPException(400, "Activate e-POS first")
+    if req.amount < 1:
+        raise HTTPException(400, "Minimum amount is ₦1.00")
+    ref        = f"MEPOS-{secrets.token_hex(6).upper()}"
+    amount_kobo = int(req.amount * 100)
+    # Build QR value: encodes merchant account number + ref for Bompay customer app
+    accounts = await db.merchant_accounts.find({"merchant_id": mid}, {"_id": 0}).to_list(5)
+    primary  = next((a for a in accounts if a.get("is_primary")), accounts[0] if accounts else {})
+    qr_data  = (
+        f"bompay://epos/pay?merchant_id={mid}"
+        f"&reference={ref}"
+        f"&amount={amount_kobo}"
+        f"&business_name={acct['business_name'].replace(' ', '+')}"
+    )
+    await db.epos_transactions.insert_one({
+        "merchant_id":   mid,
+        "reference":     ref,
+        "amount_kobo":   amount_kobo,
+        "note":          req.note,
+        "status":        "PENDING",
+        "created_at":    now_utc(),
+        "business_name": acct["business_name"],
+    })
+    return {
+        "reference":    ref,
+        "amount":       req.amount,
+        "qr_data":      qr_data,
+        "merchant_name": acct["business_name"],
+        "account_number": primary.get("sh_account_number") or primary.get("account_number"),
+        "bank_name":    primary.get("bank_name", "Bompay"),
+    }
+
+
+@router.get("/v1/merchant/epos/check/{reference}")
+async def merchant_epos_check(reference: str, request: Request):
+    m   = await get_current_merchant(request)
+    txn = await db.epos_transactions.find_one(
+        {"merchant_id": m["merchant_id"], "reference": reference},
+        {"_id": 0, "status": 1, "completed_at": 1, "amount_kobo": 1}
+    )
+    if not txn:
+        raise HTTPException(404, "Transaction not found")
+    return txn
+
+
+@router.post("/v1/merchant/epos/complete/{reference}")
+async def merchant_epos_complete(reference: str, request: Request):
+    m   = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    txn = await db.epos_transactions.find_one({"merchant_id": mid, "reference": reference})
+    if not txn:
+        raise HTTPException(404, "Transaction not found")
+    if txn.get("status") == "COMPLETED":
+        return {"message": "Already completed"}
+    amount_kobo = txn.get("amount_kobo", 0)
+    await db.epos_transactions.update_one(
+        {"merchant_id": mid, "reference": reference},
+        {"$set": {"status": "COMPLETED", "channel": "MANUAL", "completed_at": now_utc()}}
+    )
+    # Credit merchant wallet (via merchant_transactions for record-keeping)
+    await db.merchant_transactions.insert_one({
+        "merchant_id":   mid,
+        "transaction_id": f"MEPOS_{reference}",
+        "type":          "EPOS_RECEIPT",
+        "direction":     "CREDIT",
+        "amount":        amount_kobo,
+        "status":        "completed",
+        "description":   f"ePOS cash/manual — {txn.get('note', 'Payment')}",
+        "created_at":    now_utc(),
+    })
+    return {"message": "Marked as completed", "amount": round(amount_kobo / 100, 2)}
+
+
+@router.get("/v1/merchant/epos/transactions")
+async def merchant_epos_transactions(request: Request, page: int = 1, limit: int = 20):
+    m   = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    skip = (page - 1) * limit
+    txns = await db.epos_transactions.find(
+        {"merchant_id": mid}, {"_id": 0}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total = await db.epos_transactions.count_documents({"merchant_id": mid})
+    return {"transactions": txns, "total": total, "pages": -(-total // limit)}
+
+
+@router.get("/v1/merchant/epos/reports")
+async def merchant_epos_reports(request: Request):
+    m   = await get_current_merchant(request)
+    mid = m["merchant_id"]
+    now_dt = datetime.now(timezone.utc)
+
+    # Daily (last 7 days)
+    daily = []
+    for i in range(6, -1, -1):
+        day   = now_dt - timedelta(days=i)
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        end   = day.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+        agg   = await db.epos_transactions.aggregate([
+            {"$match": {"merchant_id": mid, "status": "COMPLETED",
+                        "created_at": {"$gte": start, "$lte": end}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}, "count": {"$sum": 1}}}
+        ]).to_list(1)
+        daily.append({
+            "label":  day.strftime("%a"),
+            "amount": round((agg[0]["total"] if agg else 0) / 100, 2),
+            "count":  agg[0]["count"] if agg else 0,
+        })
+
+    # Weekly (last 4 weeks)
+    weekly = []
+    for i in range(3, -1, -1):
+        week_end   = now_dt - timedelta(weeks=i)
+        week_start = week_end - timedelta(weeks=1)
+        agg = await db.epos_transactions.aggregate([
+            {"$match": {"merchant_id": mid, "status": "COMPLETED",
+                        "created_at": {"$gte": week_start.isoformat(), "$lte": week_end.isoformat()}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount_kobo"}, "count": {"$sum": 1}}}
+        ]).to_list(1)
+        weekly.append({
+            "label":  f"Wk {4 - i}",
+            "amount": round((agg[0]["total"] if agg else 0) / 100, 2),
+            "count":  agg[0]["count"] if agg else 0,
+        })
+
+    return {"daily": daily, "weekly": weekly}

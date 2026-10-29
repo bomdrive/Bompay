@@ -223,7 +223,7 @@ async def send_money(request: Request, req: TransferReq):
             remaining = max(0, daily_limit * 100 - daily_used_kobo)
             raise HTTPException(403, f"Daily transfer limit reached. Tier {user_tier} limit: ₦{daily_limit:,}/day. Remaining today: ₦{(remaining/100):,.2f}. Upgrade your account tier to increase.")
 
-    # ─── Fraud: rapid-transaction & high-value check ───
+    # ─── Enhanced risk scoring (populates risk_assessments / risk queue) ───
     fraud_signals = await fraud_check_user(str(user["_id"]), int(req.amount * 100))
     if "RAPID_TRANSACTIONS" in fraud_signals:
         await auto_block_user(str(user["_id"]), "RAPID_TRANSACTIONS", fraud_signals,
@@ -237,6 +237,19 @@ async def send_money(request: Request, req: TransferReq):
             "metadata": {"bank_code": req.bank_code, "account_number": req.account_number, "amount_ngn": req.amount},
             "created_at": datetime.now(timezone.utc).isoformat()
         })
+
+    # Velocity + 0-100 scoring — blocks critical-risk transfers
+    try:
+        from routes.fraud import assess_transaction_risk
+        _risk = await assess_transaction_risk(str(user["_id"]), int(req.amount * 100), "BANK_TRANSFER", None)
+        if _risk.get("decision") == "block":
+            raise HTTPException(403,
+                f"Transaction blocked by fraud prevention (risk score: {_risk['score']}/100). "
+                "Please contact BOMPAY support if you believe this is an error.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass   # Risk engine failure must not block legitimate transfers
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=100)).isoformat()
     dup = await db.transactions.find_one({
         "user_id": user["_id"],
@@ -433,28 +446,85 @@ async def lookup_bompay_user(q: str, request: Request):
 
 @router.get("/transfers/recent")
 async def get_recent_transfers(request: Request, limit: int = 5):
-    """Return the user's most recent completed outgoing transfers for quick-repeat."""
+    """Return the user's most recent completed outgoing transfers — deduplicated by account_number."""
     user = await get_current_user(request)
     txns = await db.transactions.find({
         "user_id": user["_id"],
         "type": {"$in": ["BANK_TRANSFER", "BOMPAY_INTERNAL_TRANSFER"]},
         "direction": "DEBIT",
         "status": "COMPLETED"
-    }).sort("created_at", -1).limit(limit).to_list(limit)
+    }).sort("created_at", -1).limit(50).to_list(50)
+
+    seen = set()
     result = []
     for txn in txns:
         meta = txn.get("metadata", {})
+        acct = meta.get("account_number", meta.get("sh_account_number", ""))
+        if acct and acct in seen:
+            continue
+        if acct:
+            seen.add(acct)
         result.append({
             "transaction_id": txn["transaction_id"],
             "beneficiary_name": meta.get("beneficiary_name", txn.get("description", "").replace("Transfer to ", "")),
             "bank_code": meta.get("bank_code", ""),
             "bank_name": meta.get("bank_name", ""),
-            "account_number": meta.get("account_number", meta.get("sh_account_number", "")),
+            "account_number": acct,
             "amount": txn["amount"] / 100,
             "type": txn["type"],
             "created_at": txn["created_at"]
         })
+        if len(result) >= limit:
+            break
     return result
+
+# ─── User Saved Beneficiaries ──────────────────────────────────────────────
+
+class UserBeneficiaryIn(BaseModel):
+    account_number: str
+    bank_code: str
+    bank_name: str
+    account_name: str
+    nickname: str | None = None
+
+@router.get("/transfers/beneficiaries")
+async def list_user_beneficiaries(request: Request):
+    user = await get_current_user(request)
+    bens = await db.user_beneficiaries.find(
+        {"user_id": str(user["_id"])}, {"_id": 0}
+    ).sort("used_count", -1).to_list(50)
+    return {"beneficiaries": bens}
+
+@router.post("/transfers/beneficiaries")
+async def save_user_beneficiary(req: UserBeneficiaryIn, request: Request):
+    user = await get_current_user(request)
+    uid = str(user["_id"])
+    existing = await db.user_beneficiaries.find_one(
+        {"user_id": uid, "account_number": req.account_number, "bank_code": req.bank_code}
+    )
+    ts = datetime.now(timezone.utc).isoformat()
+    if existing:
+        await db.user_beneficiaries.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {"account_name": req.account_name, "nickname": req.nickname, "updated_at": ts},
+             "$inc": {"used_count": 1}}
+        )
+        return {"message": "Beneficiary updated"}
+    await db.user_beneficiaries.insert_one({
+        "user_id": uid, "account_number": req.account_number,
+        "bank_code": req.bank_code, "bank_name": req.bank_name,
+        "account_name": req.account_name, "nickname": req.nickname,
+        "used_count": 1, "created_at": ts, "updated_at": ts
+    })
+    return {"message": "Beneficiary saved"}
+
+@router.delete("/transfers/beneficiaries/{account_number}")
+async def delete_user_beneficiary(account_number: str, request: Request):
+    user = await get_current_user(request)
+    await db.user_beneficiaries.delete_one(
+        {"user_id": str(user["_id"]), "account_number": account_number}
+    )
+    return {"message": "Removed"}
 
 # ─── Scheduled Transfers ───────────────────────────────────────────────────
 
