@@ -40,6 +40,7 @@ from core import (  # noqa: F401,F403,F405
     _send_via_sendora, _send_via_bulksms,
     _get_client_ip, _parse_ua,
 )
+from routes.deposit_refund import process_deposit_refund
 from core import (  # noqa: F401,F403,F405
     # constants
     JWT_SECRET, JWT_ALGORITHM, ADMIN_EMAIL, ADMIN_PASSWORD,
@@ -307,6 +308,20 @@ async def safehaven_webhook(request: Request):
                         asyncio.create_task(_complete_epos_txn_bg(wallet["user_id"], amt_kobo, "BANK"))
                         # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
                         asyncio.create_task(_track_nip_inward_cost(txn_id, wallet["user_id"], amount))
+                        # ── Deposit Refund: silently credit SafeHaven charge back to user ──
+                        async def _do_user_refund():
+                            charge = await calculate_nip_inward_commission(amount)
+                            uname = f"{(user_doc or {}).get('first_name','')} {(user_doc or {}).get('last_name','')}".strip()
+                            await process_deposit_refund(
+                                txn_id=txn_id,
+                                user_id=wallet["user_id"],
+                                customer_type="user",
+                                deposit_amount_ngn=amount,
+                                charge_amount_ngn=charge,
+                                customer_name=uname,
+                                customer_account=credit_acct_num,
+                            )
+                        asyncio.create_task(_do_user_refund())
                     else:
                         logger.info(f"[SH-WEBHOOK] NIP refund credit silently applied for user {wallet['user_id']} — no alert sent")
 
@@ -479,6 +494,20 @@ async def safehaven_webhook(request: Request):
                                         except Exception as ex:
                                             logger.warning(f"[SH-WEBHOOK] merchant credit email failed: {ex}")
                                     asyncio.create_task(_merch_credit_email())
+                                    # ── Deposit Refund for merchant ──
+                                    async def _do_merchant_refund(m_id=merchant_id, m_name=bname, t_id=txn_id, amt=amount, acct=credit_acct_num):
+                                        charge = await calculate_nip_inward_commission(amt)
+                                        await process_deposit_refund(
+                                            txn_id=t_id,
+                                            user_id="",
+                                            customer_type="business",
+                                            deposit_amount_ngn=amt,
+                                            charge_amount_ngn=charge,
+                                            customer_name=m_name,
+                                            customer_account=acct,
+                                            merchant_id=m_id,
+                                        )
+                                    asyncio.create_task(_do_merchant_refund())
                             else:
                                 logger.info(f"[SH-WEBHOOK] merchant credit duplicate skipped session_id={session_id}")
                         else:

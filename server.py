@@ -429,6 +429,7 @@ from routes import (
     push, epos, promotions, family, business, cards, merchant, checkout, chat,
     kyc_liveness, fraud,
 )
+from routes.deposit_refund import router as deposit_refund_router
 
 _router_tags: dict = {
     auth:         ["Auth"],
@@ -461,6 +462,8 @@ _router_tags: dict = {
 
 for mod in _router_tags:
     app.include_router(mod.router, prefix="/api", tags=_router_tags[mod])
+
+app.include_router(deposit_refund_router, prefix="/api", tags=["Deposit Refund"])
 
 # ===== HEALTH CHECK =====
 @app.get("/api/health")
