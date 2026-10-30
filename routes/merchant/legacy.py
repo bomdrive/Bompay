@@ -742,7 +742,8 @@ async def list_merchant_accounts(request: Request):
                 )
             except Exception as e:
                 logger.warning(f"[MERCHANT] Balance fetch for {acct.get('account_id')}: {e}")
-        result.append({**acct, "balance_ngn": bal})
+        refund_credit = float(acct.get("refund_credit_kobo", 0)) / 100
+        result.append({**acct, "balance_ngn": bal + refund_credit})
 
     return {"accounts": result}
 
