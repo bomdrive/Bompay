@@ -867,9 +867,6 @@ async def get_merchant_account(account_id: str, request: Request):
             )
         except Exception as e:
             logger.warning(f"[MERCHANT] Balance fetch failed for account {account_id}: {e}")
-    # Add any silent deposit refund credits accumulated locally
-    refund_credit = float(acct.get("refund_credit_kobo", 0)) / 100
-    balance = balance + refund_credit
     txns = await db.merchant_transactions.find(
         {"merchant_id": m["merchant_id"], "account_id": account_id},
         {"_id": 0}

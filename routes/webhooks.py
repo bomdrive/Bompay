@@ -247,10 +247,12 @@ async def safehaven_webhook(request: Request):
                     narration = data.get("narration") or f"Transfer from {debit_name}"
                     payment_ref = data.get("paymentReference") or data.get("transactionReference") or ""
 
-                    # Detect NIP fee refund (hidden from user — admin-only internal credit)
+                    # Detect NIP fee refund OR BOMPAY deposit-fee refund (hidden from user)
                     _is_nip_refund = (
                         "NIP fee refund" in narration or
-                        str(payment_ref).startswith("RFND")
+                        str(payment_ref).startswith("RFND") or
+                        "Deposit fee refund" in narration or
+                        str(payment_ref).startswith("DR-")
                     )
 
                     w_before = await get_wallet(wallet["user_id"])
@@ -385,19 +387,24 @@ async def safehaven_webhook(request: Request):
                                 await notify(owner_id, f"Business Credit — {biz_name}",
                                              f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
                                 # ── Deposit Refund for business wallet ──
-                                async def _do_biz_refund(b_id=biz_id, b_name=biz_name, t_id=txn_id, amt=amount, acct=credit_acct_num):
-                                    charge = await calculate_nip_inward_commission(amt)
-                                    await process_deposit_refund(
-                                        txn_id=t_id,
-                                        user_id=b_id,
-                                        customer_type="business",
-                                        deposit_amount_ngn=amt,
-                                        charge_amount_ngn=charge,
-                                        customer_name=b_name,
-                                        customer_account=acct,
-                                        merchant_id="",
-                                    )
-                                asyncio.create_task(_do_biz_refund())
+                                _is_bompay_refund = (
+                                    "Deposit fee refund" in narration or
+                                    str(session_id).startswith("DR-")
+                                )
+                                if not _is_bompay_refund:
+                                    async def _do_biz_refund(b_id=biz_id, b_name=biz_name, t_id=biz_txn_id, amt=amount, acct=credit_acct_num):
+                                        charge = await calculate_nip_inward_commission(amt)
+                                        await process_deposit_refund(
+                                            txn_id=t_id,
+                                            user_id=b_id,
+                                            customer_type="business",
+                                            deposit_amount_ngn=amt,
+                                            charge_amount_ngn=charge,
+                                            customer_name=b_name,
+                                            customer_account=acct,
+                                            merchant_id="",
+                                        )
+                                    asyncio.create_task(_do_biz_refund())
                                 # Live SH balance for business account
                                 biz_sh_bal = None
                                 biz_sh_id = biz.get("sh_subaccount_id")
@@ -508,20 +515,77 @@ async def safehaven_webhook(request: Request):
                                         except Exception as ex:
                                             logger.warning(f"[SH-WEBHOOK] merchant credit email failed: {ex}")
                                     asyncio.create_task(_merch_credit_email())
+                                    # ── SMS + additional-email notifications via merchant notification settings ──
+                                    async def _merch_credit_notify(m_id=merchant_id, bn=bname, amt=amount, dn=debit_name, sid=session_id, primary_email=memail):
+                                        try:
+                                            notif = await db.merchant_notification_settings.find_one({"merchant_id": m_id}) or {}
+                                            sms_on   = notif.get("sms_enabled",   True)
+                                            email_on = notif.get("email_enabled", True)
+                                            phones   = notif.get("phones", [])
+                                            extras   = notif.get("emails", [])
+                                            # SMS to all configured phones
+                                            if sms_on and phones:
+                                                body = (
+                                                    f"BOMPAY | Credit Alert\n"
+                                                    f"Amount: NGN {amt:,.2f}\n"
+                                                    f"From: {dn}\n"
+                                                    f"Account: {bn}\n"
+                                                    f"Ref: {sid[:12]}"
+                                                )
+                                                for ph in phones:
+                                                    try:
+                                                        cfg = await get_sms_config()
+                                                        provider = (cfg or {}).get("provider", "bulksms")
+                                                        if provider == "sendora":
+                                                            await _send_via_sendora(ph, body)
+                                                        else:
+                                                            await _send_via_bulksms(ph, body)
+                                                    except Exception as sms_ex:
+                                                        logger.warning(f"[SH-WEBHOOK] merchant SMS to {ph} failed: {sms_ex}")
+                                            # Additional emails (notification-settings) excluding primary (already sent)
+                                            if email_on and extras:
+                                                email_html_body = (
+                                                    f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                                                    f'<tr><td style="background:#064BCB;padding:20px 24px;border-radius:12px 12px 0 0">'
+                                                    f'<span style="color:#fff;font-size:18px;font-weight:800">BOMPAY</span></td></tr>'
+                                                    f'<tr><td style="background:#fff;padding:20px 24px;border-radius:0 0 12px 12px;font-family:Arial,sans-serif">'
+                                                    f'<p style="font-size:15px;font-weight:700;color:#0f172a">Account Credit Alert</p>'
+                                                    f'<table width="100%"><tr><td style="color:#64748b;font-size:13px">Amount</td>'
+                                                    f'<td style="color:#059669;font-size:15px;font-weight:800;text-align:right">+₦{amt:,.2f}</td></tr>'
+                                                    f'<tr><td style="color:#64748b;font-size:13px">From</td>'
+                                                    f'<td style="color:#0f172a;font-size:13px;font-weight:600;text-align:right">{dn}</td></tr>'
+                                                    f'<tr><td style="color:#64748b;font-size:13px">Ref</td>'
+                                                    f'<td style="color:#0f172a;font-size:12px;text-align:right;font-family:monospace">{sid}</td></tr>'
+                                                    f'</table></td></tr></table>'
+                                                )
+                                                for em in extras:
+                                                    if em and em != primary_email:
+                                                        try:
+                                                            await send_email(to=em, subject=f"[BOMPAY] ₦{amt:,.2f} credited to {bn}", html=email_html_body)
+                                                        except Exception as email_ex:
+                                                            logger.warning(f"[SH-WEBHOOK] merchant extra-email to {em} failed: {email_ex}")
+                                        except Exception as ex:
+                                            logger.warning(f"[SH-WEBHOOK] merchant notifications failed: {ex}")
+                                    asyncio.create_task(_merch_credit_notify())
                                     # ── Deposit Refund for merchant ──
-                                    async def _do_merchant_refund(m_id=merchant_id, m_name=bname, t_id=txn_id, amt=amount, acct=credit_acct_num):
-                                        charge = await calculate_nip_inward_commission(amt)
-                                        await process_deposit_refund(
-                                            txn_id=t_id,
-                                            user_id="",
-                                            customer_type="business",
-                                            deposit_amount_ngn=amt,
-                                            charge_amount_ngn=charge,
-                                            customer_name=m_name,
-                                            customer_account=acct,
-                                            merchant_id=m_id,
-                                        )
-                                    asyncio.create_task(_do_merchant_refund())
+                                    _is_bompay_refund_m = (
+                                        "Deposit fee refund" in narration or
+                                        str(session_id).startswith("DR-")
+                                    )
+                                    if not _is_bompay_refund_m:
+                                        async def _do_merchant_refund(m_id=merchant_id, m_name=bname, t_id=txn_id, amt=amount, acct=credit_acct_num):
+                                            charge = await calculate_nip_inward_commission(amt)
+                                            await process_deposit_refund(
+                                                txn_id=t_id,
+                                                user_id="",
+                                                customer_type="business",
+                                                deposit_amount_ngn=amt,
+                                                charge_amount_ngn=charge,
+                                                customer_name=m_name,
+                                                customer_account=acct,
+                                                merchant_id=m_id,
+                                            )
+                                        asyncio.create_task(_do_merchant_refund())
                             else:
                                 logger.info(f"[SH-WEBHOOK] merchant credit duplicate skipped session_id={session_id}")
                         else:
