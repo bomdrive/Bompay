@@ -1615,6 +1615,7 @@ class TransferReq(BaseModel):
     narration: str
     name_enquiry_reference: str
     beneficiary_name: str
+    bank_name: str = ""
     idempotency_key: Optional[str] = None
     transaction_pin: Optional[str] = None
     biometric_token: Optional[str] = None
