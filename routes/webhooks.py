@@ -311,8 +311,9 @@ async def safehaven_webhook(request: Request):
                         # ── Track NIP Inward Commission (absorbed by Bompay, NOT deducted from user) ──
                         asyncio.create_task(_track_nip_inward_cost(txn_id, wallet["user_id"], amount))
                         # ── Deposit Refund: silently credit SafeHaven charge back to user ──
-                        async def _do_user_refund():
-                            charge = await calculate_nip_inward_commission(amount)
+                        _sh_fee_user = float(data.get("fees", 0) or 0)
+                        async def _do_user_refund(_fee=_sh_fee_user):
+                            charge = _fee if _fee > 0 else await calculate_nip_inward_commission(amount)
                             uname = f"{(user_doc or {}).get('first_name','')} {(user_doc or {}).get('last_name','')}".strip()
                             await process_deposit_refund(
                                 txn_id=txn_id,
@@ -392,8 +393,9 @@ async def safehaven_webhook(request: Request):
                                     str(session_id).startswith("DR-")
                                 )
                                 if not _is_bompay_refund:
-                                    async def _do_biz_refund(b_id=biz_id, b_name=biz_name, t_id=biz_txn_id, amt=amount, acct=credit_acct_num):
-                                        charge = await calculate_nip_inward_commission(amt)
+                                    _sh_fee_biz = float(data.get("fees", 0) or 0)
+                                    async def _do_biz_refund(b_id=biz_id, b_name=biz_name, t_id=biz_txn_id, amt=amount, acct=credit_acct_num, _fee=_sh_fee_biz):
+                                        charge = _fee if _fee > 0 else await calculate_nip_inward_commission(amt)
                                         await process_deposit_refund(
                                             txn_id=t_id,
                                             user_id=b_id,
@@ -573,8 +575,9 @@ async def safehaven_webhook(request: Request):
                                         str(session_id).startswith("DR-")
                                     )
                                     if not _is_bompay_refund_m:
-                                        async def _do_merchant_refund(m_id=merchant_id, m_name=bname, t_id=txn_id, amt=amount, acct=credit_acct_num):
-                                            charge = await calculate_nip_inward_commission(amt)
+                                        _sh_fee_merch = float(data.get("fees", 0) or 0)
+                                        async def _do_merchant_refund(m_id=merchant_id, m_name=bname, t_id=txn_id, amt=amount, acct=credit_acct_num, _fee=_sh_fee_merch):
+                                            charge = _fee if _fee > 0 else await calculate_nip_inward_commission(amt)
                                             await process_deposit_refund(
                                                 txn_id=t_id,
                                                 user_id="",
