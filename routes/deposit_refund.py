@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from database import db
-from core import get_admin_user, calculate_nip_inward_commission, sh_internal_transfer
+from core import get_admin_user, calculate_nip_inward_commission, sh_internal_transfer, call_sh, SAFEHAVEN_OWN_BANK_CODE
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -153,8 +153,8 @@ async def process_deposit_refund(
     else:
         # Business / merchant — split by whether we have a real merchant_id
         if merchant_id:
-            # BOMPAY Business App merchant — real SafeHaven internal transfer
-            # Their balance is live from SafeHaven; the transfer credits their account directly.
+            # BOMPAY Business App merchant — real SafeHaven internal transfer.
+            # SafeHaven requires a name enquiry step first to get nameEnquiryReference.
             if not source_acct:
                 failure_reason = "Source account not configured in admin settings"
                 logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
@@ -162,34 +162,51 @@ async def process_deposit_refund(
                 failure_reason = "Merchant SafeHaven account number unavailable"
                 logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
             else:
+                # Step A: name enquiry → nameEnquiryReference
+                ne_ref = ""
                 try:
-                    sh_resp = await sh_internal_transfer(
-                        from_account_number=source_acct,
-                        to_account_number=customer_account,
-                        amount_ngn=refund_ngn,
-                        narration=f"Deposit fee refund {refund_id}",
-                        ref=refund_id,
-                    )
-                    # call_sh raises HTTPException on provider errors;
-                    # reaching here means the transfer was accepted.
-                    resp_data = (sh_resp or {}).get("data") or {}
-                    sh_ref = (
-                        resp_data.get("paymentReference") or
-                        resp_data.get("sessionId") or
-                        (sh_resp or {}).get("paymentReference") or
-                        (sh_resp or {}).get("sessionId") or ""
-                    )
-                    credit_ok = True
-                    logger.info(
-                        f"[DepositRefund] SafeHaven transfer OK refund_id={refund_id} "
-                        f"₦{refund_ngn:.2f} {source_acct}→{customer_account} sh_ref={sh_ref}"
-                    )
-                except HTTPException as he:
-                    failure_reason = f"SafeHaven rejected: {he.detail}"
-                    logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
+                    ne = await call_sh("POST", "/transfers/name-enquiry", body={
+                        "accountNumber": customer_account,
+                        "bankCode": SAFEHAVEN_OWN_BANK_CODE,
+                    })
+                    ne_data = (ne.get("data") or ne) or {}
+                    ne_ref = ne_data.get("nameEnquiryReference") or ne_data.get("sessionId") or ""
+                    if not ne_ref:
+                        failure_reason = "SafeHaven name enquiry returned empty reference"
+                        logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
                 except Exception as ex:
-                    failure_reason = str(ex)
-                    logger.error(f"[DepositRefund] SafeHaven transfer failed refund_id={refund_id}: {ex}")
+                    failure_reason = f"SafeHaven name enquiry failed: {ex}"
+                    logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
+
+                # Step B: transfer (only if name enquiry succeeded)
+                if ne_ref:
+                    try:
+                        sh_resp = await sh_internal_transfer(
+                            from_account_number=source_acct,
+                            to_account_number=customer_account,
+                            amount_ngn=refund_ngn,
+                            narration=f"Deposit fee refund {refund_id}",
+                            ref=refund_id,
+                            name_enquiry_ref=ne_ref,
+                        )
+                        resp_data = (sh_resp or {}).get("data") or {}
+                        sh_ref = (
+                            resp_data.get("paymentReference") or
+                            resp_data.get("sessionId") or
+                            (sh_resp or {}).get("paymentReference") or
+                            (sh_resp or {}).get("sessionId") or ""
+                        )
+                        credit_ok = True
+                        logger.info(
+                            f"[DepositRefund] SafeHaven transfer OK refund_id={refund_id} "
+                            f"₦{refund_ngn:.2f} {source_acct}→{customer_account} sh_ref={sh_ref}"
+                        )
+                    except HTTPException as he:
+                        failure_reason = f"SafeHaven transfer failed: {he.detail}"
+                        logger.warning(f"[DepositRefund] {failure_reason} refund_id={refund_id}")
+                    except Exception as ex:
+                        failure_reason = str(ex)
+                        logger.error(f"[DepositRefund] SafeHaven transfer error refund_id={refund_id}: {ex}")
         else:
             # Business wallet user (db.businesses) — local balance update.
             # A SafeHaven transfer would trigger a recursive webhook refund cycle.
