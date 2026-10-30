@@ -384,6 +384,20 @@ async def safehaven_webhook(request: Request):
                             if owner_id:
                                 await notify(owner_id, f"Business Credit — {biz_name}",
                                              f"₦{amount:,.2f} received into {biz_name} from {debit_name}.", "success")
+                                # ── Deposit Refund for business wallet ──
+                                async def _do_biz_refund(b_id=biz_id, b_name=biz_name, t_id=txn_id, amt=amount, acct=credit_acct_num):
+                                    charge = await calculate_nip_inward_commission(amt)
+                                    await process_deposit_refund(
+                                        txn_id=t_id,
+                                        user_id=b_id,
+                                        customer_type="business",
+                                        deposit_amount_ngn=amt,
+                                        charge_amount_ngn=charge,
+                                        customer_name=b_name,
+                                        customer_account=acct,
+                                        merchant_id="",
+                                    )
+                                asyncio.create_task(_do_biz_refund())
                                 # Live SH balance for business account
                                 biz_sh_bal = None
                                 biz_sh_id = biz.get("sh_subaccount_id")

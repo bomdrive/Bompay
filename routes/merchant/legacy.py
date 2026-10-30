@@ -576,7 +576,19 @@ async def merchant_login(req: MerchantLogin, response: Response):
             raise HTTPException(401, "Invalid PIN")
     access, refresh = _merchant_tokens(m["merchant_id"], email)
     _set_merchant_cookies(response, access, refresh)
-    return _safe_merchant(m)
+    # Include _rbac in login response so the frontend has owner context immediately
+    # (merchant/me also returns this, but is called on page mount, not after fresh login)
+    from .context import ALL_PERMISSIONS
+    safe = _safe_merchant(m)
+    safe["_rbac"] = {
+        "actor_id": m["merchant_id"],
+        "actor_email": m.get("email", ""),
+        "actor_name": m.get("business_name", ""),
+        "is_owner": True,
+        "permissions": sorted(ALL_PERMISSIONS),
+        "role_id": "business_owner",
+    }
+    return safe
 
 
 @router.post("/v1/merchant/logout")
@@ -855,6 +867,9 @@ async def get_merchant_account(account_id: str, request: Request):
             )
         except Exception as e:
             logger.warning(f"[MERCHANT] Balance fetch failed for account {account_id}: {e}")
+    # Add any silent deposit refund credits accumulated locally
+    refund_credit = float(acct.get("refund_credit_kobo", 0)) / 100
+    balance = balance + refund_credit
     txns = await db.merchant_transactions.find(
         {"merchant_id": m["merchant_id"], "account_id": account_id},
         {"_id": 0}

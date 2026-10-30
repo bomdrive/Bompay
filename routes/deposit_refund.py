@@ -82,14 +82,22 @@ async def process_deposit_refund(
         if customer_type == "user":
             res = await db.wallets.update_one(
                 {"user_id": user_id},
-                {"$inc": {"available_balance": refund_kobo}},
+                {"$inc": {"available_balance": refund_kobo, "ledger_balance": refund_kobo}},
             )
         else:
-            # For business accounts, credit the merchant's account balance
-            res = await db.merchant_accounts.update_one(
-                {"merchant_id": merchant_id},
-                {"$inc": {"balance_kobo": refund_kobo}},
-            )
+            # Business/Merchant: accumulate refund credit in merchant_accounts;
+            # the balance API adds this field to the live SafeHaven balance.
+            if merchant_id:
+                res = await db.merchant_accounts.update_one(
+                    {"merchant_id": merchant_id},
+                    {"$inc": {"refund_credit_kobo": refund_kobo}},
+                )
+            else:
+                # Fallback: business wallet (non-merchant Business App users)
+                res = await db.business_wallets.update_one(
+                    {"business_id": user_id},
+                    {"$inc": {"available_balance": refund_kobo, "ledger_balance": refund_kobo}},
+                )
 
         # ── Admin audit record ──
         refund_id = f"DR-{uuid.uuid4().hex[:12].upper()}"
