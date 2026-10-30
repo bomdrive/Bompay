@@ -263,8 +263,11 @@ async def safehaven_webhook(request: Request):
                         "description": narration,
                         "provider_reference": session_id,
                         "metadata": {"event_type": event_type,
-                                     "debit_account": data.get("debitAccountNumber"),
-                                     "debit_name": debit_name},
+                                     "debit_account": data.get("debitAccountNumber") or "",
+                                     "debit_name": debit_name,
+                                     "debit_bank": (data.get("debitBankName") or
+                                                    data.get("originatorBankName") or
+                                                    data.get("debitBankCode") or "")},
                         "balance_before_kobo": bal_before,
                         "balance_after_kobo": bal_before + amt_kobo,
                         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -348,8 +351,11 @@ async def safehaven_webhook(request: Request):
                                 "description": narration,
                                 "provider_reference": session_id,
                                 "metadata": {"event_type": event_type,
-                                             "debit_account": data.get("debitAccountNumber"),
-                                             "debit_name": debit_name},
+                                             "debit_account": data.get("debitAccountNumber") or "",
+                                             "debit_name": debit_name,
+                                             "debit_bank": (data.get("debitBankName") or
+                                                            data.get("originatorBankName") or
+                                                            data.get("debitBankCode") or "")},
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                             })
@@ -430,8 +436,11 @@ async def safehaven_webhook(request: Request):
                                     "provider_reference": session_id,
                                     "metadata": {
                                         "event_type": event_type,
-                                        "debit_account": data.get("debitAccountNumber"),
+                                        "debit_account": data.get("debitAccountNumber") or "",
                                         "debit_name": debit_name,
+                                        "debit_bank": (data.get("debitBankName") or
+                                                       data.get("originatorBankName") or
+                                                       data.get("debitBankCode") or ""),
                                         "credit_account": credit_acct_num,
                                     },
                                     "created_at": datetime.now(timezone.utc).isoformat(),
