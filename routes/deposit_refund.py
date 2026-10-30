@@ -154,17 +154,19 @@ async def process_deposit_refund(
         # Business / merchant — split by whether we have a real merchant_id
         if merchant_id:
             # BOMPAY Business App merchant — silent local balance credit.
-            # We update refund_credit_kobo on the merchant account (shown in live balance).
-            # NO SafeHaven transfer: a real transfer would appear on their statement and
-            # could trigger SMS/email notifications to the merchant.
+            # Filter by BOTH merchant_id AND sh_account_number to target the exact
+            # account that received the deposit (merchant may have multiple accounts).
             try:
+                filter_q = {"merchant_id": merchant_id}
+                if customer_account:
+                    filter_q["sh_account_number"] = customer_account
                 res = await db.merchant_accounts.update_one(
-                    {"merchant_id": merchant_id},
+                    filter_q,
                     {"$inc": {"refund_credit_kobo": refund_kobo}},
                 )
                 credit_ok = res.matched_count > 0
                 if not credit_ok:
-                    failure_reason = f"Merchant account not found (merchant_id={merchant_id})"
+                    failure_reason = f"Merchant account not found (merchant_id={merchant_id}, sh_acct={customer_account})"
                     logger.warning(f"[DepositRefund] {failure_reason}")
             except Exception as ex:
                 failure_reason = str(ex)
