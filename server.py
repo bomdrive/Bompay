@@ -430,6 +430,13 @@ from routes import (
     kyc_liveness, fraud,
 )
 from routes.deposit_refund import router as deposit_refund_router
+from routes.investors.auth import router as investor_auth_router, seed_investor_admin
+from routes.investors.enquiries import router as investor_enquiries_router
+from routes.investors.content import router as investor_content_router, seed_investor_content
+from routes.investors.exports import router as investor_exports_router
+from routes.investors.documents import router as investor_documents_router
+from routes.investors.invitations import router as investor_invitations_router
+from routes.investors.nda import router as investor_nda_router
 
 _router_tags: dict = {
     auth:         ["Auth"],
@@ -464,6 +471,13 @@ for mod in _router_tags:
     app.include_router(mod.router, prefix="/api", tags=_router_tags[mod])
 
 app.include_router(deposit_refund_router, prefix="/api", tags=["Deposit Refund"])
+app.include_router(investor_auth_router, prefix="/api", tags=["Investors"])
+app.include_router(investor_enquiries_router, prefix="/api", tags=["Investors"])
+app.include_router(investor_content_router, prefix="/api", tags=["Investors"])
+app.include_router(investor_exports_router, prefix="/api", tags=["Investor Exports"])
+app.include_router(investor_documents_router, prefix="/api", tags=["Investor Data Room"])
+app.include_router(investor_invitations_router, prefix="/api", tags=["Investor Invitations"])
+app.include_router(investor_nda_router, prefix="/api", tags=["Investor NDA"])
 
 # ===== HEALTH CHECK =====
 @app.get("/api/health")
@@ -867,6 +881,21 @@ async def startup():
         await seed_blogs()
     except Exception as e:
         logger.error(f"[Blog] Seed failed: {e}")
+
+    # Seed investor portal content
+    try:
+        await seed_investor_admin()
+        await seed_investor_content()
+    except Exception as e:
+        logger.error(f"[InvestorPortal] Seed failed: {e}")
+
+    # Seed investor data room documents (runs in background so startup isn't blocked)
+    try:
+        from routes.investors.seed_documents import seed_investor_dataroom
+        import asyncio as _asyncio
+        _asyncio.create_task(seed_investor_dataroom())
+    except Exception as e:
+        logger.error(f"[DataRoom Seed] Failed to schedule: {e}")
 
 
 @app.on_event("shutdown")
